@@ -5,7 +5,7 @@ use redis::aio::ConnectionManager;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::anthropic::types::{CacheControl, Message, SystemMessage, Tool};
 use crate::token;
@@ -13,6 +13,7 @@ use crate::token;
 /// 全局 Redis 连接管理器
 static REDIS_CONN: OnceLock<ConnectionManager> = OnceLock::new();
 static CACHE_DEBUG_LOGGING: AtomicBool = AtomicBool::new(false);
+static CACHE_MAX_READ_RATIO_BITS: AtomicU64 = AtomicU64::new(1.0f64.to_bits());
 
 /// 默认 TTL: 5 分钟
 const DEFAULT_TTL_SECS: u64 = 5 * 60;
@@ -49,8 +50,29 @@ pub fn set_debug_logging(enabled: bool) {
     }
 }
 
+pub fn set_max_read_ratio(ratio: f64) {
+    let ratio = normalize_cache_max_read_ratio(ratio);
+
+    CACHE_MAX_READ_RATIO_BITS.store(ratio.to_bits(), Ordering::Relaxed);
+    if ratio < 1.0 {
+        tracing::info!("Cache max read ratio set to {:.3}", ratio);
+    }
+}
+
 fn cache_debug_logging_enabled() -> bool {
     CACHE_DEBUG_LOGGING.load(Ordering::Relaxed)
+}
+
+fn cache_max_read_ratio() -> f64 {
+    f64::from_bits(CACHE_MAX_READ_RATIO_BITS.load(Ordering::Relaxed))
+}
+
+fn normalize_cache_max_read_ratio(ratio: f64) -> f64 {
+    if ratio.is_finite() {
+        ratio.clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
 }
 
 fn short_hash(hash: &str) -> &str {
@@ -468,6 +490,45 @@ fn plan_cache_mutations(
 }
 
 /// 查询或创建缓存
+fn apply_cache_read_ratio_limit(
+    breakpoints: &[CacheBreakpoint],
+    cached_tokens: &mut [Option<i32>],
+    total_input_tokens: i32,
+) {
+    let ratio = cache_max_read_ratio();
+    apply_cache_read_ratio_limit_with_ratio(breakpoints, cached_tokens, total_input_tokens, ratio);
+}
+
+fn apply_cache_read_ratio_limit_with_ratio(
+    breakpoints: &[CacheBreakpoint],
+    cached_tokens: &mut [Option<i32>],
+    total_input_tokens: i32,
+    ratio: f64,
+) {
+    if ratio >= 1.0 {
+        return;
+    }
+
+    let max_read_tokens = ((total_input_tokens.max(0) as f64) * ratio).floor() as i32;
+    for (index, cached) in cached_tokens.iter_mut().enumerate() {
+        let Some(tokens) = *cached else {
+            continue;
+        };
+
+        let read_tokens = tokens.clamp(0, breakpoints[index].tokens);
+        if read_tokens > max_read_tokens {
+            tracing::debug!(
+                "Cache hit ignored by max read ratio: breakpoint_tokens={}, cached_tokens={}, max_read_tokens={}, ratio={:.3}",
+                breakpoints[index].tokens,
+                tokens,
+                max_read_tokens,
+                ratio
+            );
+            *cached = None;
+        }
+    }
+}
+
 pub async fn lookup_or_create(
     api_key: &str,
     breakpoints: &[CacheBreakpoint],
@@ -526,6 +587,8 @@ pub async fn lookup_or_create(
         cached_tokens.push(cached);
     }
 
+    apply_cache_read_ratio_limit(breakpoints, &mut cached_tokens, total_input_tokens);
+
     let (result, mutations) = plan_cache_mutations(breakpoints, &cached_tokens, total_input_tokens);
     log_breakpoints(breakpoints, Some(total_input_tokens));
     log_lookup_details(
@@ -573,4 +636,36 @@ pub async fn lookup_or_create(
     );
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn breakpoint(tokens: i32) -> CacheBreakpoint {
+        CacheBreakpoint {
+            hash: format!("hash-{tokens}"),
+            tokens,
+            ttl: DEFAULT_TTL_SECS,
+        }
+    }
+
+    #[test]
+    fn cache_read_ratio_limit_ignores_hits_above_request_ratio() {
+        let breakpoints = vec![breakpoint(3_000), breakpoint(7_500), breakpoint(9_200)];
+        let mut cached_tokens = vec![Some(3_000), Some(7_500), Some(9_200)];
+
+        apply_cache_read_ratio_limit_with_ratio(&breakpoints, &mut cached_tokens, 10_000, 0.8);
+
+        assert_eq!(cached_tokens, vec![Some(3_000), Some(7_500), None]);
+        let (result, _) = plan_cache_mutations(&breakpoints, &cached_tokens, 10_000);
+        assert_eq!(result.cache_read_input_tokens, 7_500);
+    }
+
+    #[test]
+    fn cache_read_ratio_limit_clamps_invalid_ratio_to_default() {
+        assert_eq!(normalize_cache_max_read_ratio(f64::NAN), 1.0);
+        assert_eq!(normalize_cache_max_read_ratio(-0.5), 0.0);
+        assert_eq!(normalize_cache_max_read_ratio(1.5), 1.0);
+    }
 }

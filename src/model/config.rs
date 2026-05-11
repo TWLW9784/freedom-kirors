@@ -95,6 +95,10 @@ pub struct Config {
     #[serde(default)]
     pub cache_debug_logging: bool,
 
+    /// Maximum ratio of input tokens that can be read from prompt cache per request.
+    #[serde(default = "default_cache_max_read_ratio")]
+    pub cache_max_read_ratio: f64,
+
     /// 负载均衡模式（"priority" 或 "balanced"）
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
@@ -159,6 +163,10 @@ fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
 
+fn default_cache_max_read_ratio() -> f64 {
+    1.0
+}
+
 fn default_extract_thinking() -> bool {
     true
 }
@@ -190,6 +198,7 @@ impl Default for Config {
             admin_api_key: None,
             redis_url: None,
             cache_debug_logging: false,
+            cache_max_read_ratio: default_cache_max_read_ratio(),
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),

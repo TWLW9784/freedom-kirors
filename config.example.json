@@ -7,5 +7,6 @@
   "adminApiKey": "sk-admin-your-secret-key",
   "defaultEndpoint": "ide",
   "redisUrl": "redis://redis:6379",
-  "cacheDebugLogging": false
+  "cacheDebugLogging": false,
+  "cacheMaxReadRatio": 1.0
 }

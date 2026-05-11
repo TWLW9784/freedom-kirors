@@ -158,6 +158,7 @@ async fn main() {
     });
 
     anthropic::cache::set_debug_logging(config.cache_debug_logging);
+    anthropic::cache::set_max_read_ratio(config.cache_max_read_ratio);
 
     // 初始化 Redis（如果配置了）
     if let Some(redis_url) = &config.redis_url {
