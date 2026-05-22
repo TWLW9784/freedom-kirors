@@ -259,14 +259,8 @@ export function ImageUpdateDialog({ open, onOpenChange }: ImageUpdateDialogProps
           </DialogTitle>
         </DialogHeader>
 
-        <div className="space-y-4 py-2">
-          <div
-            className={`rounded-md border p-3 ${
-              updateCheck?.hasUpdate
-                ? 'border-amber-500/40 bg-amber-50 dark:bg-amber-950/30'
-                : 'bg-muted/30'
-            }`}
-          >
+        <div className="space-y-5 py-2">
+          <section>
             <div className="flex items-start justify-between gap-2">
               <div className="flex items-center gap-2 text-sm font-medium text-foreground">
                 <Sparkles className="h-4 w-4" />
@@ -353,136 +347,134 @@ export function ImageUpdateDialog({ open, onOpenChange }: ImageUpdateDialogProps
             {updateCheck?.warning && (
               <div className="mt-2 text-xs text-destructive">{updateCheck.warning}</div>
             )}
+          </section>
 
-            <div className="mt-3 space-y-3 border-t pt-3">
-              {data?.previousVersion && (
-                <div className="text-xs text-muted-foreground">
-                  上一版本：
-                  <code className="font-mono">{data.previousVersion}</code>
-                  （可一键回退）
-                </div>
-              )}
-
-              {data?.lastAppliedAt && (
-                <div className="text-xs text-muted-foreground">
-                  上次更新于：
-                  <span className="font-mono">{formatDateTime(data.lastAppliedAt)}</span>
-                </div>
-              )}
-
-              <div className="flex items-start justify-between gap-3">
-                <div className="text-xs">
-                  <div className="font-medium text-foreground">无人值守自动更新</div>
-                  <div className="text-muted-foreground">
-                    开启后服务每天到指定时间自动检查新版本，发现新版即下载二进制并重启。
-                  </div>
-                </div>
-                <Switch
-                  checked={!!data?.autoApply}
-                  disabled={busy}
-                  onCheckedChange={(checked) => autoApplyMutation.mutate(checked)}
-                />
+          <section className="space-y-3 border-t pt-4">
+            {data?.previousVersion && (
+              <div className="text-xs text-muted-foreground">
+                上一版本：
+                <code className="font-mono">{data.previousVersion}</code>
+                （可一键回退）
               </div>
+            )}
 
-              <label
-                className={`flex items-center justify-between gap-3 text-xs ${
-                  data?.autoApply ? '' : 'opacity-60'
-                }`}
-              >
-                <span className="text-muted-foreground">触发时间（本地时区，HH:MM）</span>
-                <Input
-                  type="time"
-                  value={autoApplyTime}
-                  onChange={(e) => setAutoApplyTime(e.target.value)}
-                  onBlur={() => {
-                    if (autoApplyTime && autoApplyTime !== data?.autoApplyTime) {
-                      autoApplyTimeMutation.mutate(autoApplyTime)
-                    }
-                  }}
-                  disabled={busy || !data?.autoApply}
-                  className="w-28 font-mono text-sm"
-                />
-              </label>
+            {data?.lastAppliedAt && (
+              <div className="text-xs text-muted-foreground">
+                上次更新于：
+                <span className="font-mono">{formatDateTime(data.lastAppliedAt)}</span>
+              </div>
+            )}
 
-              <div className="space-y-2 border-t pt-3">
-                <div className="flex items-center justify-between gap-3 text-xs">
-                  <div>
-                    <div className="flex items-center gap-1.5 font-medium text-foreground">
-                      <KeyRound className="h-3.5 w-3.5" />
-                      GitHub Token
-                      {data?.githubTokenSet && (
-                        <Badge variant="success" className="ml-1">已配置</Badge>
-                      )}
-                    </div>
-                    <div className="text-muted-foreground">
-                      把 GitHub API 限流从匿名 60/小时 提升到认证 5000/小时；只读权限即可。
-                    </div>
-                  </div>
+            <div className="flex items-start justify-between gap-3">
+              <div className="text-xs">
+                <div className="font-medium text-foreground">无人值守自动更新</div>
+                <div className="text-muted-foreground">
+                  开启后服务每天到指定时间自动检查新版本，发现新版即下载二进制并重启。
                 </div>
-                <div className="flex gap-2">
-                  <Input
-                    type="password"
-                    autoComplete="new-password"
-                    placeholder={
-                      data?.githubTokenSet ? '已保存（输入新值会覆盖）' : 'ghp_xxxxxxxxxxxx'
-                    }
-                    value={githubToken}
-                    onChange={(e) => setGithubToken(e.target.value)}
-                    disabled={busy}
-                    className="font-mono text-sm"
-                  />
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    disabled={busy || !githubToken.trim()}
-                    onClick={() => verifyTokenMutation.mutate(githubToken.trim())}
-                    title="不保存，先用此 token 调用 /rate_limit 测试"
-                  >
-                    {verifyTokenMutation.isPending ? (
-                      <RefreshCw className="h-3.5 w-3.5 animate-spin" />
-                    ) : (
-                      <ShieldCheck className="h-3.5 w-3.5" />
-                    )}
-                    <span className="ml-1.5">验证</span>
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    disabled={busy || !githubToken.trim()}
-                    onClick={() => githubTokenMutation.mutate(githubToken.trim())}
-                  >
-                    {githubTokenMutation.isPending ? (
-                      <RefreshCw className="h-3.5 w-3.5 animate-spin" />
-                    ) : (
-                      <Save className="h-3.5 w-3.5" />
-                    )}
-                    <span className="ml-1.5">保存</span>
-                  </Button>
-                  {data?.githubTokenSet && (
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      disabled={busy}
-                      onClick={() => githubTokenMutation.mutate('')}
-                      title="清除已保存的 GitHub Token"
-                    >
-                      清除
-                    </Button>
-                  )}
-                </div>
-                <RateLimitSummary
-                  info={rateLimit}
-                  loading={checkingRate}
-                  onRefresh={() =>
-                    queryClient.invalidateQueries({ queryKey: ['github-rate-limit'] })
+              </div>
+              <Switch
+                checked={!!data?.autoApply}
+                disabled={busy}
+                onCheckedChange={(checked) => autoApplyMutation.mutate(checked)}
+              />
+            </div>
+
+            <label
+              className={`flex items-center justify-between gap-3 text-xs ${
+                data?.autoApply ? '' : 'opacity-60'
+              }`}
+            >
+              <span className="text-muted-foreground">触发时间（本地时区，HH:MM）</span>
+              <Input
+                type="time"
+                value={autoApplyTime}
+                onChange={(e) => setAutoApplyTime(e.target.value)}
+                onBlur={() => {
+                  if (autoApplyTime && autoApplyTime !== data?.autoApplyTime) {
+                    autoApplyTimeMutation.mutate(autoApplyTime)
                   }
-                />
+                }}
+                disabled={busy || !data?.autoApply}
+                className="w-28 font-mono text-sm"
+              />
+            </label>
+          </section>
+
+          <section className="space-y-2 border-t pt-4">
+            <div className="text-xs">
+              <div className="flex items-center gap-1.5 font-medium text-foreground">
+                <KeyRound className="h-3.5 w-3.5" />
+                GitHub Token
+                {data?.githubTokenSet && (
+                  <Badge variant="success" className="ml-1">已配置</Badge>
+                )}
+              </div>
+              <div className="text-muted-foreground">
+                把 GitHub API 限流从匿名 60/小时 提升到认证 5000/小时；只读权限即可。
               </div>
             </div>
-          </div>
+            <div className="flex gap-2">
+              <Input
+                type="password"
+                autoComplete="new-password"
+                placeholder={
+                  data?.githubTokenSet ? '已保存（输入新值会覆盖）' : 'ghp_xxxxxxxxxxxx'
+                }
+                value={githubToken}
+                onChange={(e) => setGithubToken(e.target.value)}
+                disabled={busy}
+                className="font-mono text-sm"
+              />
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={busy || !githubToken.trim()}
+                onClick={() => verifyTokenMutation.mutate(githubToken.trim())}
+                title="不保存，先用此 token 调用 /rate_limit 测试"
+              >
+                {verifyTokenMutation.isPending ? (
+                  <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <ShieldCheck className="h-3.5 w-3.5" />
+                )}
+                <span className="ml-1.5">验证</span>
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={busy || !githubToken.trim()}
+                onClick={() => githubTokenMutation.mutate(githubToken.trim())}
+              >
+                {githubTokenMutation.isPending ? (
+                  <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Save className="h-3.5 w-3.5" />
+                )}
+                <span className="ml-1.5">保存</span>
+              </Button>
+              {data?.githubTokenSet && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  disabled={busy}
+                  onClick={() => githubTokenMutation.mutate('')}
+                  title="清除已保存的 GitHub Token"
+                >
+                  清除
+                </Button>
+              )}
+            </div>
+            <RateLimitSummary
+              info={rateLimit}
+              loading={checkingRate}
+              onRefresh={() =>
+                queryClient.invalidateQueries({ queryKey: ['github-rate-limit'] })
+              }
+            />
+          </section>
 
           {lastOutput && (
             <div className="rounded-md border bg-muted/40 p-3">
@@ -629,7 +621,7 @@ interface RateLimitSummaryProps {
 function RateLimitSummary({ info, loading, onRefresh }: RateLimitSummaryProps) {
   if (loading && !info) {
     return (
-      <div className="flex items-center gap-1.5 rounded-md border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+      <div className="flex items-center gap-1.5 px-1 py-1 text-xs text-muted-foreground">
         <RefreshCw className="h-3.5 w-3.5 animate-spin" />
         正在查询 GitHub API 限流…
       </div>
@@ -645,15 +637,7 @@ function RateLimitSummary({ info, loading, onRefresh }: RateLimitSummaryProps) {
   const resetText = info.reset ? new Date(info.reset * 1000).toLocaleString() : '—'
 
   return (
-    <div
-      className={`rounded-md border px-3 py-2 text-xs ${
-        info.valid
-          ? danger
-            ? 'border-amber-500/40 bg-amber-50 dark:bg-amber-950/30'
-            : 'bg-muted/30'
-          : 'border-destructive/40 bg-destructive/5'
-      }`}
-    >
+    <div className="px-1 py-1 text-xs">
       <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-1.5 font-medium text-foreground">
           {info.valid ? (
