@@ -1492,6 +1492,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bedrock_client_validation_errors_map_to_400() {
+        // 三种 Bedrock 客户端校验错误必须映射为 400（而非 5xx），
+        // 否则会被 provider 当作上游瞬态错误触发冷却，放大成 503 风暴。
+        for needle in [
+            "TOOL_USE_RESULT_MISMATCH",
+            "ValidationException: Improperly formed request.",
+            "Expected toolResult blocks",
+        ] {
+            let resp = map_provider_error(anyhow::anyhow!(needle.to_string()));
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "错误串 `{needle}` 应映射为 400"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_upstream_error_still_maps_to_502() {
+        // 回归：普通上游错误不应被新分支误伤，仍应是 502 BAD_GATEWAY。
+        let resp = map_provider_error(anyhow::anyhow!("connection reset by peer"));
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
     fn available_models_include_opus_4_7_variants() {
         let models = available_models();
         let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
