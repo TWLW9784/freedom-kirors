@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import type { ChangeEvent } from 'react'
 import { toast } from 'sonner'
 import { useQuery } from '@tanstack/react-query'
 import { CheckCircle2, XCircle, AlertCircle, Loader2 } from 'lucide-react'
@@ -21,20 +22,40 @@ interface BatchImportDialogProps {
 
 interface CredentialInput {
   refreshToken?: string
+  refresh_token?: string
+  accessToken?: string
+  access_token?: string
+  profileArn?: string
+  profile_arn?: string
+  expiresAt?: string
+  expires_at?: string
   clientId?: string
+  client_id?: string
   clientSecret?: string
+  client_secret?: string
   region?: string
   authRegion?: string
+  auth_region?: string
   apiRegion?: string
+  api_region?: string
   priority?: number
   machineId?: string
+  machine_id?: string
   kiroApiKey?: string
+  kiro_api_key?: string
   authMethod?: string
+  auth_method?: string
+  provider?: string
+  startUrl?: string
+  start_url?: string
   endpoint?: string
   email?: string
   proxyUrl?: string
+  proxy_url?: string
   proxyUsername?: string
+  proxy_username?: string
   proxyPassword?: string
+  proxy_password?: string
 }
 
 interface VerificationResult {
@@ -94,12 +115,95 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     setResults([])
   }
 
+  const pickString = (...values: Array<string | undefined | null>) => {
+    const value = values.find(v => typeof v === 'string' && v.trim())
+    return value?.trim()
+  }
+
+  const normalizeAuthMethod = (value?: string): 'social' | 'idc' | 'api_key' | undefined => {
+    if (!value) return undefined
+    const lower = value.trim().toLowerCase().replace(/[-_\s]/g, '')
+    if (lower === 'idc' || lower === 'builderid' || lower === 'iam') return 'idc'
+    if (lower === 'apikey') return 'api_key'
+    if (lower === 'social') return 'social'
+    return undefined
+  }
+
+  const normalizeExpiresAt = (value?: string) => {
+    const raw = value?.trim()
+    if (!raw) return undefined
+    // KAM/账号管理器常见格式: 2026/06/06 01:59:56
+    const slashMatch = raw.match(/^(\d{4})\/(\d{2})\/(\d{2})\s+(\d{2}):(\d{2}):(\d{2})$/)
+    if (slashMatch) {
+      const [, y, m, d, hh, mm, ss] = slashMatch
+      return `${y}-${m}-${d}T${hh}:${mm}:${ss}Z`
+    }
+    return raw
+  }
+
+  const normalizeCredential = (cred: CredentialInput): CredentialInput => {
+    const usageData = (cred as { usageData?: { userInfo?: { email?: string } } }).usageData
+    return {
+      ...cred,
+      refreshToken: pickString(cred.refreshToken, cred.refresh_token),
+      accessToken: pickString(cred.accessToken, cred.access_token),
+      profileArn: pickString(cred.profileArn, cred.profile_arn),
+      expiresAt: normalizeExpiresAt(pickString(cred.expiresAt, cred.expires_at)),
+      clientId: pickString(cred.clientId, cred.client_id),
+      clientSecret: pickString(cred.clientSecret, cred.client_secret),
+      authRegion: pickString(cred.authRegion, cred.auth_region),
+      apiRegion: pickString(cred.apiRegion, cred.api_region),
+      machineId: pickString(cred.machineId, cred.machine_id),
+      kiroApiKey: pickString(cred.kiroApiKey, cred.kiro_api_key),
+      authMethod: normalizeAuthMethod(pickString(cred.authMethod, cred.auth_method)),
+      provider: pickString(cred.provider),
+      startUrl: pickString(cred.startUrl, cred.start_url),
+      email: pickString(cred.email, usageData?.userInfo?.email),
+      proxyUrl: pickString(cred.proxyUrl, cred.proxy_url),
+      proxyUsername: pickString(cred.proxyUsername, cred.proxy_username),
+      proxyPassword: pickString(cred.proxyPassword, cred.proxy_password),
+    }
+  }
+
+  const extractCredentialItems = (parsed: unknown): CredentialInput[] => {
+    if (Array.isArray(parsed)) return parsed as CredentialInput[]
+    if (parsed && typeof parsed === 'object' && Array.isArray((parsed as { accounts?: unknown }).accounts)) {
+      return (parsed as { accounts: CredentialInput[] }).accounts
+    }
+    return [parsed as CredentialInput]
+  }
+
+  const handleFileImport = async (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files ?? [])
+    event.target.value = ''
+    if (files.length === 0) return
+
+    try {
+      const imported: CredentialInput[] = []
+      for (const file of files) {
+        const text = await file.text()
+        const parsed = JSON.parse(text)
+        imported.push(...extractCredentialItems(parsed).map(normalizeCredential))
+      }
+
+      if (imported.length === 0) {
+        toast.error('文件中没有可导入的凭据')
+        return
+      }
+
+      setJsonInput(JSON.stringify(imported, null, 2))
+      toast.success(`已从 ${files.length} 个文件读取 ${imported.length} 个凭据，请确认后开始导入`)
+    } catch (error) {
+      toast.error('读取文件失败: ' + extractErrorMessage(error))
+    }
+  }
+
   const handleBatchImport = async () => {
     // 先单独解析 JSON，给出精准的错误提示
     let credentials: CredentialInput[]
     try {
       const parsed = JSON.parse(jsonInput)
-      credentials = Array.isArray(parsed) ? parsed : [parsed]
+      credentials = extractCredentialItems(parsed).map(normalizeCredential)
     } catch (error) {
       toast.error('JSON 格式错误: ' + extractErrorMessage(error))
       return
@@ -248,6 +352,8 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             const addedCred = await addCredential({
               authMethod: 'api_key',
               kiroApiKey: cred.kiroApiKey?.trim(),
+              provider: cred.provider?.trim() || undefined,
+              startUrl: cred.startUrl?.trim() || undefined,
               priority: cred.priority || 0,
               authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
               apiRegion: cred.apiRegion?.trim() || undefined,
@@ -290,7 +396,8 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           const token = cred.refreshToken!.trim()
           const clientId = cred.clientId?.trim() || undefined
           const clientSecret = cred.clientSecret?.trim() || undefined
-          const authMethod = clientId && clientSecret ? 'idc' : 'social'
+          const requestedAuthMethod = normalizeAuthMethod(cred.authMethod)
+          const authMethod = requestedAuthMethod || (clientId && clientSecret ? 'idc' : 'social')
 
           // idc 模式下必须同时提供 clientId 和 clientSecret
           if (authMethod === 'social' && (clientId || clientSecret)) {
@@ -299,7 +406,12 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
           const addedCred = await addCredential({
             refreshToken: token,
+            accessToken: cred.accessToken?.trim() || undefined,
+            profileArn: cred.profileArn?.trim() || undefined,
+            expiresAt: cred.expiresAt?.trim() || undefined,
             authMethod,
+            provider: cred.provider?.trim() || undefined,
+            startUrl: cred.startUrl?.trim() || undefined,
             authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
             apiRegion: cred.apiRegion?.trim() || undefined,
             clientId,
@@ -451,15 +563,29 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               JSON 格式凭据
             </label>
             <textarea
-              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\n支持 region 字段自动映射为 authRegion'}
+              placeholder={'粘贴 JSON 格式的凭据（支持单个对象、数组，或 KAM 导出的 {accounts:[...]}）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\n也支持 refresh_token / client_id / client_secret 等 snake_case 字段\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\n支持 region 字段自动映射为 authRegion'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}
               className="flex min-h-[200px] w-full rounded-xl border border-input bg-background/60 px-3.5 py-2.5 text-sm transition-all duration-150 ease-apple placeholder:text-muted-foreground/70 hover:border-border focus-visible:outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30 focus-visible:bg-background disabled:cursor-not-allowed disabled:opacity-50 font-mono"
             />
-            <p className="text-xs text-muted-foreground">
-              💡 导入时自动验活，失败的凭据会被排除
-            </p>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button type="button" variant="outline" size="sm" disabled={importing} asChild>
+                <label className="cursor-pointer">
+                  选择 JSON 文件批量导入
+                  <input
+                    type="file"
+                    accept=".json,.txt,application/json,text/plain"
+                    multiple
+                    className="hidden"
+                    onChange={handleFileImport}
+                  />
+                </label>
+              </Button>
+              <p className="text-xs text-muted-foreground">
+                💡 支持多文件、数组、单对象、KAM accounts；导入时自动验活，失败的凭据会被排除
+              </p>
+            </div>
           </div>
 
           {(importing || results.length > 0) && (

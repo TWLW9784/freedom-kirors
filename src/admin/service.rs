@@ -311,7 +311,7 @@ fn credential_to_kam_account(cred: KiroCredentials) -> Option<KamExportAccount> 
         region: non_empty(cred.region.clone())
             .or_else(|| non_empty(cred.auth_region.clone()))
             .or_else(|| non_empty(cred.api_region.clone())),
-        start_url: None,
+        start_url: non_empty(cred.start_url),
         client_id: non_empty(cred.client_id),
         client_secret: non_empty(cred.client_secret),
         refresh_token: Some(refresh_token),
@@ -393,15 +393,13 @@ impl AdminService {
             let cache = self.balance_cache.lock();
             cache.clone()
         };
-        let now_ts = Utc::now().timestamp() as f64;
-
         let mut credentials: Vec<CredentialStatusItem> = snapshot
             .entries
             .into_iter()
             .map(|entry| {
+                // 始终返回最后一次查到的余额（不按 TTL 过滤），前端根据 balance_updated_at 判断新鲜度
                 let (balance, balance_updated_at) = balance_snapshot
                     .get(&entry.id)
-                    .filter(|c| (now_ts - c.cached_at) < BALANCE_CACHE_TTL_SECS as f64)
                     .map(|c| (Some(c.data.clone()), Some(c.cached_at)))
                     .unwrap_or((None, None));
 
@@ -809,6 +807,7 @@ impl AdminService {
             expires_at: req.expires_at,
             auth_method: Some(req.auth_method),
             provider: req.provider,
+            start_url: req.start_url,
             client_id: req.client_id,
             client_secret: req.client_secret,
             priority: req.priority,
@@ -1783,16 +1782,11 @@ impl AdminService {
             }
         };
 
-        let now = Utc::now().timestamp() as f64;
+        // 不丢弃过期条目：保留所有历史余额，前端/业务逻辑按 TTL 判断是否需要刷新
         map.into_iter()
             .filter_map(|(k, v)| {
                 let id = k.parse::<u64>().ok()?;
-                // 丢弃超过 TTL 的条目
-                if (now - v.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
-                    Some((id, v))
-                } else {
-                    None
-                }
+                Some((id, v))
             })
             .collect()
     }

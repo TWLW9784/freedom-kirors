@@ -147,6 +147,8 @@ async fn refresh_social_token(
     tracing::info!("正在刷新 Social Token...");
 
     let refresh_token = credentials.refresh_token.as_ref().unwrap();
+    let _start_url = credentials.start_url.as_deref();
+
     // 优先级：凭据.auth_region > 凭据.region > config.auth_region > config.region
     let region = credentials.effective_auth_region(config);
 
@@ -2233,6 +2235,7 @@ impl MultiTokenManager {
             validated_cred.profile_arn = new_cred.profile_arn;
         }
         validated_cred.provider = new_cred.provider;
+        validated_cred.start_url = new_cred.start_url;
         validated_cred.fill_default_profile_arn();
         validated_cred.client_id = new_cred.client_id;
         validated_cred.client_secret = new_cred.client_secret;

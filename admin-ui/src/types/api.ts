@@ -85,6 +85,7 @@ export interface AddCredentialRequest {
   expiresAt?: string
   authMethod?: 'social' | 'idc' | 'api_key'
   provider?: string
+  startUrl?: string
   clientId?: string
   clientSecret?: string
   priority?: number

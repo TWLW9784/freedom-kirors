@@ -18,6 +18,7 @@ import {
   Settings,
   UploadCloud,
   MoreHorizontal,
+  ChevronDown,
   Activity,
   ChevronLeft,
   ChevronRight,
@@ -27,6 +28,8 @@ import {
   Copy,
   Wand2,
   Zap,
+  Search,
+  X,
 } from "lucide-react";
 
 function GithubIcon({ className }: { className?: string }) {
@@ -116,12 +119,110 @@ import {
   generateApiKey,
   formatNumber,
 } from "@/lib/utils";
-import type { BalanceResponse } from "@/types/api";
+import type { BalanceResponse, CredentialStatusItem } from "@/types/api";
 
 interface DashboardProps {
   onLogout: () => void;
   /** 当作为 Tab 嵌入到 App 中时为 true：隐藏自带顶栏与外层布局，由父 App 提供 */
   embedded?: boolean;
+}
+
+type CredentialFilter =
+  | "all"
+  | "enabled"
+  | "disabled"
+  | "available-pro"
+  | "pro"
+  | "pro-plus"
+  | "power"
+  | "free"
+  | "subscription-unknown"
+  | "throttled";
+
+type CredentialSortKey =
+  | "priority"
+  | "lastUsed"
+  | "remaining"
+  | "failures";
+
+type SortDirection = "asc" | "desc";
+
+const credentialFilterLabels: Record<CredentialFilter, string> = {
+  all: "全部",
+  enabled: "已启用",
+  disabled: "已禁用",
+  "available-pro": "可用 PRO/PRO+/POWER",
+  pro: "PRO",
+  "pro-plus": "PRO+",
+  power: "POWER",
+  free: "FREE",
+  "subscription-unknown": "未知/未查",
+  throttled: "风控冷却",
+};
+
+const credentialSortLabels: Record<CredentialSortKey, string> = {
+  priority: "优先级",
+  lastUsed: "最近使用",
+  remaining: "剩余额度",
+  failures: "失败次数",
+};
+
+function credentialSearchText(c: CredentialStatusItem): string {
+  return [
+    c.id,
+    c.email,
+    c.authMethod,
+    c.endpoint,
+    c.proxyUrl,
+    c.disabledReason,
+    c.balance?.subscriptionTitle,
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+}
+
+function getSubscriptionTitle(c: CredentialStatusItem): string {
+  return (c.balance?.subscriptionTitle || "").toUpperCase();
+}
+
+function isProCredential(c: CredentialStatusItem): boolean {
+  const t = getSubscriptionTitle(c);
+  return t.includes("PRO") && !t.includes("PRO+") && !t.includes("POWER");
+}
+
+function isProPlusCredential(c: CredentialStatusItem): boolean {
+  return getSubscriptionTitle(c).includes("PRO+");
+}
+
+function isPowerCredential(c: CredentialStatusItem): boolean {
+  return getSubscriptionTitle(c).includes("POWER");
+}
+
+function isAnyProCredential(c: CredentialStatusItem): boolean {
+  const t = getSubscriptionTitle(c);
+  return t.includes("PRO") || t.includes("POWER");
+}
+
+function isFreeCredential(c: CredentialStatusItem): boolean {
+  return getSubscriptionTitle(c).includes("FREE");
+}
+
+function hasKnownSubscription(c: CredentialStatusItem): boolean {
+  return Boolean(c.balance?.subscriptionTitle);
+}
+
+function getCredentialSortValue(c: CredentialStatusItem, key: CredentialSortKey): string | number {
+  switch (key) {
+    case "priority":
+      return c.priority;
+    case "failures":
+      return c.totalFailureCount ?? c.failureCount ?? 0;
+    case "lastUsed":
+      return c.lastUsedAt ? new Date(c.lastUsedAt).getTime() : 0;
+    case "remaining":
+      return c.balance?.remaining ?? 0;
+  }
 }
 
 export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
@@ -166,6 +267,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   });
   const cancelVerifyRef = useRef(false);
   const [currentPage, setCurrentPage] = useState(1);
+  const [credentialSearch, setCredentialSearch] = useState("");
+  const [credentialFilter, setCredentialFilter] = useState<CredentialFilter>("all");
+  const [credentialSortKey, setCredentialSortKey] = useState<CredentialSortKey>("priority");
+  const [credentialSortDirection, setCredentialSortDirection] = useState<SortDirection>("asc");
   const itemsPerPage = 12;
   const [darkMode, setDarkMode] = useState(() => {
     if (typeof window !== "undefined") {
@@ -187,10 +292,82 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const { data: updateCheck } = useUpdateCheck();
   const { data: failureStatsMap } = useFailureStats();
 
-  const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage);
-  const startIndex = (currentPage - 1) * itemsPerPage;
+  const allCredentials = data?.credentials || [];
+  const subscriptionStats = (() => {
+    let pro = 0, proPlus = 0, power = 0, free = 0, unknown = 0;
+    let availablePro = 0, availableProPlus = 0, availablePower = 0, availableFree = 0;
+    for (const c of allCredentials) {
+      if (isPowerCredential(c)) {
+        power += 1;
+        if (!c.disabled) availablePower += 1;
+      } else if (isProPlusCredential(c)) {
+        proPlus += 1;
+        if (!c.disabled) availableProPlus += 1;
+      } else if (isProCredential(c)) {
+        pro += 1;
+        if (!c.disabled) availablePro += 1;
+      } else if (isFreeCredential(c)) {
+        free += 1;
+        if (!c.disabled) availableFree += 1;
+      } else {
+        unknown += 1;
+      }
+    }
+    const availableAnyPro = availablePro + availableProPlus + availablePower;
+    return { pro, proPlus, power, free, unknown, availablePro, availableProPlus, availablePower, availableFree, availableAnyPro };
+  })();
+  const normalizedSearch = credentialSearch.trim().toLowerCase();
+  const filteredCredentials = allCredentials.filter((c) => {
+    const matchesSearch =
+      !normalizedSearch || credentialSearchText(c).includes(normalizedSearch);
+    if (!matchesSearch) return false;
+
+    switch (credentialFilter) {
+      case "enabled":
+        return !c.disabled;
+      case "disabled":
+        return c.disabled;
+      case "pro":
+        return isProCredential(c);
+      case "pro-plus":
+        return isProPlusCredential(c);
+      case "power":
+        return isPowerCredential(c);
+      case "free":
+        return isFreeCredential(c);
+      case "subscription-unknown":
+        return !hasKnownSubscription(c);
+      case "available-pro":
+        return !c.disabled && isAnyProCredential(c);
+      case "throttled":
+        return (c.throttledRemainingSecs ?? 0) > 0;
+      case "all":
+      default:
+        return true;
+    }
+  });
+  const filteredSortedCredentials = [...filteredCredentials].sort((a, b) => {
+    const av = getCredentialSortValue(a, credentialSortKey);
+    const bv = getCredentialSortValue(b, credentialSortKey);
+    let cmp = 0;
+    if (typeof av === "number" && typeof bv === "number") {
+      cmp = av - bv;
+    } else {
+      cmp = String(av).localeCompare(String(bv), "zh-CN", { numeric: true });
+    }
+    if (cmp === 0) cmp = a.id - b.id;
+    return credentialSortDirection === "asc" ? cmp : -cmp;
+  });
+  const totalPages = Math.max(1, Math.ceil(filteredSortedCredentials.length / itemsPerPage));
+  const safeCurrentPage = Math.min(currentPage, totalPages);
+  const startIndex = (safeCurrentPage - 1) * itemsPerPage;
   const endIndex = startIndex + itemsPerPage;
-  const serverPageCreds = data?.credentials.slice(startIndex, endIndex) || [];
+  const serverPageCreds = filteredSortedCredentials.slice(startIndex, endIndex);
+  const canManualSort =
+    credentialSortKey === "priority" &&
+    credentialSortDirection === "asc" &&
+    credentialFilter === "all" &&
+    !normalizedSearch;
   // 拖拽排序的本地乐观顺序：仅当 id 集合与当前页一致时生效，否则回落到服务端顺序，
   // 避免翻页 / 数据变更后顺序错乱。
   const [pageOrder, setPageOrder] = useState<number[] | null>(null);
@@ -211,6 +388,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const currentPageAllSelected =
     currentPageIds.length > 0 &&
     currentPageIds.every((id) => selectedIds.has(id));
+  const filteredCredentialIds = filteredSortedCredentials.map((c) => c.id);
+  const filteredAllSelected =
+    filteredCredentialIds.length > 0 &&
+    filteredCredentialIds.every((id) => selectedIds.has(id));
 
   // 翻页时清掉本地排序覆盖，回到服务端顺序
   useEffect(() => {
@@ -222,6 +403,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   );
 
   const handleDragEnd = (event: DragEndEvent) => {
+    if (!canManualSort) {
+      toast.info("当前处于筛选/排序视图，切回“全部 + 优先级升序”后可拖拽调整优先级");
+      return;
+    }
     const { active, over } = event;
     if (!over || active.id === over.id) return;
     const ids = currentCredentials.map((c) => c.id);
@@ -316,7 +501,11 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
 
   useEffect(() => {
     setCurrentPage(1);
-  }, [data?.credentials.length]);
+  }, [data?.credentials.length, credentialSearch, credentialFilter, credentialSortKey, credentialSortDirection]);
+
+  useEffect(() => {
+    if (currentPage > totalPages) setCurrentPage(totalPages);
+  }, [currentPage, totalPages]);
 
   useEffect(() => {
     if (!data?.credentials) {
@@ -383,6 +572,19 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         currentPageIds.forEach((id) => next.delete(id));
       } else {
         currentPageIds.forEach((id) => next.add(id));
+      }
+      return next;
+    });
+  };
+
+  /** 全选 / 取消全选当前筛选结果，支持跨页批量导出。 */
+  const toggleSelectFiltered = () => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (filteredAllSelected) {
+        filteredCredentialIds.forEach((id) => next.delete(id));
+      } else {
+        filteredCredentialIds.forEach((id) => next.add(id));
       }
       return next;
     });
@@ -787,6 +989,11 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   };
 
   const [exportingKam, setExportingKam] = useState(false);
+  const compactObject = <T extends Record<string, unknown>>(obj: T) =>
+    Object.fromEntries(
+      Object.entries(obj).filter(([, value]) => value !== undefined && value !== null && value !== ""),
+    );
+
   const handleExportKam = async () => {
     if (selectedIds.size === 0) {
       toast.info("请先勾选要导出的凭据");
@@ -796,12 +1003,30 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     setExportingKam(true);
     try {
       const exportData = await exportKamCredentials(ids);
-      const accountCount = exportData.accounts?.length ?? 0;
+      const normalizedAccounts = (exportData.accounts || []).map((account) =>
+        compactObject({
+          email: account.email,
+          accessToken: account.accessToken,
+          refreshToken: account.refreshToken,
+          clientId: account.clientId,
+          clientSecret: account.clientSecret,
+          profileArn: account.profileArn,
+          expiresAt: account.expiresAt,
+          region: account.region,
+          machineId: account.machineId,
+        }),
+      );
+      const accountCount = normalizedAccounts.length;
       if (accountCount === 0) {
         toast.warning("勾选的凭据中没有可导出的（缺少 refreshToken）");
         return;
       }
-      const json = JSON.stringify(exportData, null, 2);
+      const payload = {
+        version: "1.0",
+        exportedAt: new Date().toISOString(),
+        accounts: normalizedAccounts,
+      };
+      const json = JSON.stringify(payload, null, 2);
       const blob = new Blob([json], { type: "application/json" });
       const url = URL.createObjectURL(blob);
       const ts = new Date()
@@ -811,7 +1036,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         .slice(0, 19);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `kiro-account-manager-export-${ts}.json`;
+      a.download = `kiro-credentials-export-${accountCount}-${ts}.json`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -819,8 +1044,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       const skipped = ids.length - accountCount;
       toast.success(
         skipped > 0
-          ? `已导出 ${accountCount} 个账号，${skipped} 个无效已跳过`
-          : `已导出 ${accountCount} 个账号`,
+          ? `已导出 ${accountCount} 个凭据，${skipped} 个不可导出已跳过`
+          : `已导出 ${accountCount} 个凭据`,
       );
     } catch (err) {
       toast.error("导出失败: " + extractErrorMessage(err));
@@ -1088,7 +1313,9 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           <div className="flex items-center gap-2">
             <h2 className="text-lg font-semibold tracking-tight">凭据列表</h2>
             {data?.credentials && data.credentials.length > 0 && (
-              <Badge variant="secondary">{data.credentials.length}</Badge>
+              <Badge variant="secondary">
+                {filteredSortedCredentials.length}/{data.credentials.length}
+              </Badge>
             )}
             {currentCredentials.length > 0 && (
               <Button
@@ -1097,7 +1324,17 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 onClick={toggleSelectCurrentPage}
                 title={currentPageAllSelected ? "取消选择当前页" : "全选当前页"}
               >
-                {currentPageAllSelected ? "取消全选" : "全选当前页"}
+                {currentPageAllSelected ? "取消本页" : "全选本页"}
+              </Button>
+            )}
+            {filteredSortedCredentials.length > currentCredentials.length && (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={toggleSelectFiltered}
+                title={filteredAllSelected ? "取消选择当前筛选结果" : "选择当前筛选结果的所有页"}
+              >
+                {filteredAllSelected ? "取消筛选结果" : `全选筛选结果 (${filteredSortedCredentials.length})`}
               </Button>
             )}
             {selectedIds.size > 0 && (
@@ -1154,10 +1391,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   size="sm"
                   variant="outline"
                   disabled={exportingKam}
-                  title="导出勾选的凭据为 KAM JSON"
+                  title="导出勾选的凭据为规范化 JSON，可直接批量导入"
                 >
                   <FileDown className="h-3.5 w-3.5" />
-                  {exportingKam ? "导出中…" : "导出 KAM"}
+                  {exportingKam ? "导出中…" : "导出 JSON"}
                 </Button>
                 <Button
                   onClick={handleBatchDelete}
@@ -1327,6 +1564,106 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           </div>
         </div>
 
+        {/* 排序 / 筛选 */}
+        {data?.credentials && data.credentials.length > 0 && (
+          <Card className="mb-5">
+            <CardContent className="p-4 space-y-3">
+              <div className="flex flex-wrap items-center gap-2">
+                {(["all", "enabled", "disabled", "free", "pro", "pro-plus", "power"] as CredentialFilter[]).map((key) => (
+                  <Button
+                    key={key}
+                    type="button"
+                    size="sm"
+                    variant={credentialFilter === key ? "default" : "outline"}
+                    onClick={() => setCredentialFilter(key)}
+                  >
+                    {credentialFilterLabels[key]}
+                    {key === "available-pro" && ` (${subscriptionStats.availableAnyPro})`}
+                    {key === "pro" && ` (${subscriptionStats.pro})`}
+                    {key === "pro-plus" && ` (${subscriptionStats.proPlus})`}
+                    {key === "power" && ` (${subscriptionStats.power})`}
+                    {key === "free" && ` (${subscriptionStats.free})`}
+                    {key === "subscription-unknown" && ` (${subscriptionStats.unknown})`}
+                  </Button>
+                ))}
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button type="button" size="sm" variant="outline">
+                      更多筛选：{credentialFilterLabels[credentialFilter]}
+                      <ChevronDown className="h-3.5 w-3.5" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="start">
+                    <DropdownMenuLabel>筛选</DropdownMenuLabel>
+                    {(Object.keys(credentialFilterLabels) as CredentialFilter[]).map((key) => (
+                      <DropdownMenuItem key={key} onSelect={() => setCredentialFilter(key)}>
+                        <span className="w-4 text-center">{credentialFilter === key ? "✓" : ""}</span>
+                        {credentialFilterLabels[key]}
+                      </DropdownMenuItem>
+                    ))}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="relative min-w-[240px] flex-1">
+                  <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                  <Input
+                    value={credentialSearch}
+                    onChange={(e) => setCredentialSearch(e.target.value)}
+                    placeholder="搜索邮箱 / ID / 端点"
+                    className="pl-9"
+                  />
+                </div>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button type="button" variant="outline" className="h-10">
+                      排序：{credentialSortLabels[credentialSortKey]} · {credentialSortDirection === "asc" ? "升序" : "降序"}
+                      <ChevronDown className="h-3.5 w-3.5" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end">
+                    <DropdownMenuLabel>排序</DropdownMenuLabel>
+                    {(Object.keys(credentialSortLabels) as CredentialSortKey[]).map((key) => (
+                      <DropdownMenuItem key={key} onSelect={() => setCredentialSortKey(key)}>
+                        <span className="w-4 text-center">{credentialSortKey === key ? "✓" : ""}</span>
+                        {credentialSortLabels[key]}
+                      </DropdownMenuItem>
+                    ))}
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem onSelect={() => setCredentialSortDirection("asc")}>
+                      <span className="w-4 text-center">{credentialSortDirection === "asc" ? "✓" : ""}</span>
+                      升序
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onSelect={() => setCredentialSortDirection("desc")}>
+                      <span className="w-4 text-center">{credentialSortDirection === "desc" ? "✓" : ""}</span>
+                      降序
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  disabled={!credentialSearch && credentialFilter === "all" && credentialSortKey === "priority" && credentialSortDirection === "asc"}
+                  onClick={() => {
+                    setCredentialSearch("");
+                    setCredentialFilter("all");
+                    setCredentialSortKey("priority");
+                    setCredentialSortDirection("asc");
+                  }}
+                >
+                  <X className="h-3.5 w-3.5" />
+                  重置
+                </Button>
+              </div>
+              <div className="text-xs text-muted-foreground">
+                显示 {filteredSortedCredentials.length} / {data.credentials.length}；POWER {subscriptionStats.power}（可用 {subscriptionStats.availablePower}），PRO+ {subscriptionStats.proPlus}（可用 {subscriptionStats.availableProPlus}），PRO {subscriptionStats.pro}（可用 {subscriptionStats.availablePro}），FREE {subscriptionStats.free}，未知 {subscriptionStats.unknown}
+                {!canManualSort && "；当前视图不改写拖拽优先级"}
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
         {/* 列表 */}
         {data?.credentials.length === 0 ? (
           <Card>
@@ -1337,6 +1674,28 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               <p className="text-sm text-muted-foreground">
                 暂无凭据，点击右上角“添加凭据”开始
               </p>
+            </CardContent>
+          </Card>
+        ) : filteredSortedCredentials.length === 0 ? (
+          <Card>
+            <CardContent className="py-16 text-center">
+              <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-secondary text-muted-foreground">
+                <Search className="h-5 w-5" />
+              </div>
+              <p className="text-sm text-muted-foreground">没有匹配当前筛选条件的凭据</p>
+              <Button
+                className="mt-4"
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  setCredentialSearch("");
+                  setCredentialFilter("all");
+                  setCredentialSortKey("priority");
+                  setCredentialSortDirection("asc");
+                }}
+              >
+                清空筛选
+              </Button>
             </CardContent>
           </Card>
         ) : (
@@ -1379,7 +1738,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   variant="outline"
                   size="sm"
                   onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
-                  disabled={currentPage === 1}
+                  disabled={safeCurrentPage === 1}
                 >
                   <ChevronLeft className="h-3.5 w-3.5" />
                   上一页
@@ -1387,11 +1746,11 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 <div className="px-3 text-sm tabular-nums text-muted-foreground">
                   第{" "}
                   <span className="font-medium text-foreground">
-                    {currentPage}
+                    {safeCurrentPage}
                   </span>{" "}
                   / {totalPages} 页
                   <span className="mx-1.5 text-muted-foreground/50">·</span>共{" "}
-                  {data?.credentials.length} 个
+                  {filteredSortedCredentials.length} 个
                 </div>
                 <Button
                   variant="outline"
@@ -1399,7 +1758,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   onClick={() =>
                     setCurrentPage((p) => Math.min(totalPages, p + 1))
                   }
-                  disabled={currentPage === totalPages}
+                  disabled={safeCurrentPage === totalPages}
                 >
                   下一页
                   <ChevronRight className="h-3.5 w-3.5" />

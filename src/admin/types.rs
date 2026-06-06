@@ -95,10 +95,11 @@ pub struct SetPriorityRequest {
 #[serde(rename_all = "camelCase")]
 pub struct AddCredentialRequest {
     /// 刷新令牌（OAuth 凭据必填，API Key 凭据不需要）
+    #[serde(default, alias = "refresh_token")]
     pub refresh_token: Option<String>,
 
     /// 访问令牌（可选，来自 KAM 等导出时保留）
-    #[serde(default)]
+    #[serde(default, alias = "access_token")]
     pub access_token: Option<String>,
 
     /// Profile ARN（可选，缺失时部分上游接口会拒绝请求）
@@ -117,10 +118,16 @@ pub struct AddCredentialRequest {
     #[serde(default)]
     pub provider: Option<String>,
 
+    /// AWS SSO Start URL（Enterprise / IdC 账号刷新时需要）
+    #[serde(default, alias = "start_url")]
+    pub start_url: Option<String>,
+
     /// OIDC Client ID（IdC 认证需要）
+    #[serde(default, alias = "client_id")]
     pub client_id: Option<String>,
 
     /// OIDC Client Secret（IdC 认证需要）
+    #[serde(default, alias = "client_secret")]
     pub client_secret: Option<String>,
 
     /// 优先级（可选，默认 0）
@@ -132,30 +139,36 @@ pub struct AddCredentialRequest {
     pub region: Option<String>,
 
     /// 凭据级 Auth Region（用于 Token 刷新）
+    #[serde(default, alias = "auth_region")]
     pub auth_region: Option<String>,
 
     /// 凭据级 API Region（用于 API 请求）
+    #[serde(default, alias = "api_region")]
     pub api_region: Option<String>,
 
     /// 凭据级 Machine ID（可选，64 位字符串）
     /// 未配置时回退到 config.json 的 machineId
+    #[serde(default, alias = "machine_id")]
     pub machine_id: Option<String>,
 
     /// 用户邮箱（可选，用于前端显示）
     pub email: Option<String>,
 
     /// 凭据级代理 URL（可选，特殊值 "direct" 表示不使用代理）
+    #[serde(default, alias = "proxy_url")]
     pub proxy_url: Option<String>,
 
     /// 凭据级代理认证用户名（可选）
+    #[serde(default, alias = "proxy_username")]
     pub proxy_username: Option<String>,
 
     /// 凭据级代理认证密码（可选）
+    #[serde(default, alias = "proxy_password")]
     pub proxy_password: Option<String>,
 
     /// Kiro API Key（API Key 凭据必填，格式: ksk_xxxxxxxx）
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "kiro_api_key", skip_serializing_if = "Option::is_none")]
     pub kiro_api_key: Option<String>,
 
     /// 端点名称（可选，未配置时使用 config.defaultEndpoint）

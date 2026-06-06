@@ -50,6 +50,10 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
 
+    /// AWS SSO Start URL (Enterprise / IdC 认证需要)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_url: Option<String>,
+
     /// OIDC Client ID (IdC 认证需要)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
@@ -148,6 +152,7 @@ impl std::fmt::Debug for KiroCredentials {
             .field("expires_at", &self.expires_at)
             .field("auth_method", &self.auth_method)
             .field("provider", &self.provider)
+            .field("start_url", &self.start_url)
             .field("client_id", &fmt_redacted(&self.client_id))
             .field("client_secret", &fmt_redacted(&self.client_secret))
             .field("priority", &self.priority)
@@ -313,6 +318,23 @@ impl KiroCredentials {
                 .map(|p| p.eq_ignore_ascii_case("github") || p.eq_ignore_ascii_case("google"))
                 .unwrap_or(false);
 
+        // Enterprise / IdC 账号的 profileArn 是租户/账号特异的。
+        // KAM 完整导出里 profileArn 可能为 null，但 accessToken 仍可直接查额度；
+        // 这里不能补 BuilderId 的默认 ARN，否则会把可用账号变成 AWS 403。
+        let is_enterprise_or_idc = self
+            .provider
+            .as_deref()
+            .map(|p| p.eq_ignore_ascii_case("enterprise"))
+            .unwrap_or(false)
+            || self
+                .auth_method
+                .as_deref()
+                .map(|m| m.eq_ignore_ascii_case("idc"))
+                .unwrap_or(false);
+        if is_enterprise_or_idc && !is_social {
+            return false;
+        }
+
         self.profile_arn = Some(
             if is_social {
                 SOCIAL_PROFILE_ARN
@@ -407,6 +429,7 @@ mod tests {
             expires_at: None,
             auth_method: Some("social".to_string()),
             provider: None,
+            start_url: None,
             client_id: None,
             client_secret: None,
             priority: 0,
@@ -526,6 +549,7 @@ mod tests {
             expires_at: None,
             auth_method: None,
             provider: None,
+            start_url: None,
             client_id: None,
             client_secret: None,
             priority: 0,
@@ -558,6 +582,7 @@ mod tests {
             expires_at: None,
             auth_method: None,
             provider: None,
+            start_url: None,
             client_id: None,
             client_secret: None,
             priority: 0,
@@ -673,6 +698,7 @@ mod tests {
             expires_at: None,
             auth_method: Some("social".to_string()),
             provider: None,
+            start_url: None,
             client_id: None,
             client_secret: None,
             priority: 3,
