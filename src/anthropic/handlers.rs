@@ -196,8 +196,53 @@ fn last_attempt_outcome(tracer: &RequestTracer) -> Option<&'static str> {
     })
 }
 
+/// Image-budget warning threshold (in raw base64 chars, not decoded bytes).
+/// Emits a warning when the total base64 char count of all image content in one request exceeds this threshold.
+/// The threshold does not reject the request (the upstream makes the final call); it only gives operators more precise diagnostics.
+const IMAGE_BUDGET_WARN_BYTES: usize = 800 * 1024;
+
+/// Budget statistics for the image content in one inbound request.
+struct ImageBudget {
+    count: usize,
+    total_b64_bytes: usize,
+    largest_b64_bytes: usize,
+}
+
+/// Counts the total number of images in the payload and their base64 byte size.
+/// Looks only at inline base64 (image source.type == "base64"), skipping url-mode images (which do not
+/// go directly into a Bedrock single message body). This is a lightweight O(N) scan that does not decode base64.
+fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
+    let mut count = 0usize;
+    let mut total = 0usize;
+    let mut largest = 0usize;
+    for msg in &payload.messages {
+        if let serde_json::Value::Array(arr) = &msg.content {
+            for item in arr {
+                if item.get("type").and_then(|v| v.as_str()) != Some("image") {
+                    continue;
+                }
+                let Some(src) = item.get("source") else { continue };
+                if src.get("type").and_then(|v| v.as_str()) != Some("base64") {
+                    continue;
+                }
+                let n = src.get("data").and_then(|v| v.as_str()).map(|s| s.len()).unwrap_or(0);
+                count += 1;
+                total += n;
+                if n > largest {
+                    largest = n;
+                }
+            }
+        }
+    }
+    ImageBudget {
+        count,
+        total_b64_bytes: total,
+        largest_b64_bytes: largest,
+    }
+}
+
 /// 将 KiroProvider 错误映射为 HTTP 响应
-fn map_provider_error(err: Error) -> Response {
+pub(super) fn map_provider_error(err: Error) -> Response {
     let err_str = err.to_string();
 
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
@@ -225,6 +270,30 @@ fn map_provider_error(err: Error) -> Response {
         )
             .into_response();
     }
+
+    // Bedrock client-side validation errors (tool_use <-> tool_result mismatch, invalid message sequence, etc.)
+    // The root cause is the client's own messages array, not an upstream failure, so it must not map to 5xx
+    // otherwise it triggers an upstream cooldown that amplifies one client error into a 30+ burst of 503s.
+    // Detection is centralized in the endpoint layer (single source of truth for the markers); the provider
+    // already bails out without retry on these, and this mapping is the client-facing safety net.
+    if crate::kiro::endpoint::default_is_client_validation_error(&err_str) {
+        tracing::warn!(
+            error = %err,
+            "client messages array violates the protocol (Bedrock validation; mapped to 400 to avoid a false cooldown)"
+        );
+        // Return a stable, client-facing message and avoid echoing the raw upstream
+        // error string (which can carry request IDs or internal validation details).
+        // The full error is already logged above for diagnostics.
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "Invalid message sequence: tool_use and tool_result blocks must be correctly paired and ordered.".to_string(),
+            )),
+        )
+            .into_response();
+    }
+
     tracing::error!("Kiro API 调用失败: {}", err);
     (
         StatusCode::BAD_GATEWAY,
@@ -415,13 +484,25 @@ pub async fn post_messages(
     Extension(key_ctx): Extension<KeyContext>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    // Count the image budget on inbound to provide precise diagnostics for later context-window-full errors
+    let img_stats = count_image_budget(&payload);
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
         stream = %payload.stream,
         message_count = %payload.messages.len(),
+        image_count = %img_stats.count,
+        image_total_b64_kb = %(img_stats.total_b64_bytes / 1024),
+        image_largest_b64_kb = %(img_stats.largest_b64_bytes / 1024),
         "Received POST /v1/messages request"
     );
+    if img_stats.total_b64_bytes > IMAGE_BUDGET_WARN_BYTES {
+        tracing::warn!(
+            image_count = %img_stats.count,
+            image_total_b64_kb = %(img_stats.total_b64_bytes / 1024),
+            "incoming image payload is large; if upstream rejects with CONTENT_LENGTH_EXCEEDS_THRESHOLD, reduce image count or use lower-resolution screenshots"
+        );
+    }
     let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
@@ -462,6 +543,15 @@ pub async fn post_messages(
         return resp;
     }
 
+    let payload_stream = payload.stream;
+    // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
+    // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
+    if websearch::has_web_search_among_tools(&payload) {
+        tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
+        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream)
+            .await;
+    }
+
     // 转换请求
     let conversion_result = match convert_request(&payload) {
         Ok(result) => result,
@@ -484,10 +574,12 @@ pub async fn post_messages(
         }
     };
 
-    // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
+    // Build the Kiro request. profile_arn is injected by the provider layer from the actual
+    // credentials; additional_model_request_fields is already filtered by converter model support.
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
+        additional_model_request_fields: conversion_result.additional_model_request_fields,
     };
 
     let request_body = match serde_json::to_string(&kiro_request) {
@@ -1104,6 +1196,15 @@ pub async fn post_messages_cc(
         return resp;
     }
 
+    let payload_stream = payload.stream;
+    // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
+    // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
+    if websearch::has_web_search_among_tools(&payload) {
+        tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
+        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream)
+            .await;
+    }
+
     // 转换请求
     let conversion_result = match convert_request(&payload) {
         Ok(result) => result,
@@ -1126,10 +1227,12 @@ pub async fn post_messages_cc(
         }
     };
 
-    // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
+    // Build the Kiro request. profile_arn is injected by the provider layer from the actual
+    // credentials; additional_model_request_fields is already filtered by converter model support.
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
+        additional_model_request_fields: conversion_result.additional_model_request_fields,
     };
 
     let request_body = match serde_json::to_string(&kiro_request) {
@@ -1386,12 +1489,94 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bedrock_client_validation_errors_map_to_400() {
+        // 客户端校验错误必须映射为 400（而非 5xx），否则会被 provider 当作上游
+        // 瞬态错误触发冷却，放大成 503 风暴。识别逻辑集中在 endpoint 层。
+        for needle in [
+            // 精确 reason（provider 错误串里嵌着上游 body）
+            "非流式 API 请求失败: 500 {\"reason\":\"TOOL_USE_RESULT_MISMATCH\"}",
+            // message 级特异短语（纯文本报文）
+            "Expected toolResult blocks but found none",
+        ] {
+            let resp = map_provider_error(anyhow::anyhow!(needle.to_string()));
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "错误串 `{needle}` 应映射为 400"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_upstream_error_still_maps_to_502() {
+        // 回归：普通上游错误不应被新分支误伤，仍应是 502 BAD_GATEWAY。
+        let resp = map_provider_error(anyhow::anyhow!("connection reset by peer"));
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        // 回归：宽泛的 ValidationException 不再被当作客户端校验错误而误判为 400，
+        // 仍按上游错误走 502（避免把可重试故障误杀）。
+        let resp = map_provider_error(anyhow::anyhow!(
+            "ValidationException: transient backend issue".to_string()
+        ));
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
     fn available_models_include_opus_4_7_variants() {
         let models = available_models();
         let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
 
         assert!(ids.contains(&"claude-opus-4-7"));
         assert!(ids.contains(&"claude-opus-4-7-thinking"));
+    }
+
+    #[test]
+    fn count_image_budget_handles_empty() {
+        let req: super::super::types::MessagesRequest = serde_json::from_str(r#"{
+            "model": "claude-opus-4-7",
+            "max_tokens": 100,
+            "messages": []
+        }"#).unwrap();
+        let stats = count_image_budget(&req);
+        assert_eq!(stats.count, 0);
+        assert_eq!(stats.total_b64_bytes, 0);
+        assert_eq!(stats.largest_b64_bytes, 0);
+    }
+
+    #[test]
+    fn count_image_budget_counts_inline_base64() {
+        let req: super::super::types::MessagesRequest = serde_json::from_str(r#"{
+            "model": "claude-opus-4-7",
+            "max_tokens": 100,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hi"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA1111"}},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "BBBBBBBBBB"}},
+                    {"type": "image", "source": {"type": "url", "url": "https://example.com/x.png"}}
+                ]
+            }]
+        }"#).unwrap();
+        let stats = count_image_budget(&req);
+        assert_eq!(stats.count, 2);
+        assert_eq!(stats.total_b64_bytes, 18);
+        assert_eq!(stats.largest_b64_bytes, 10);
+    }
+
+    #[test]
+    fn count_image_budget_skips_url_only_images() {
+        let req: super::super::types::MessagesRequest = serde_json::from_str(r#"{
+            "model": "claude-opus-4-7",
+            "max_tokens": 100,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "url", "url": "https://example.com/x.png"}}
+                ]
+            }]
+        }"#).unwrap();
+        let stats = count_image_budget(&req);
+        assert_eq!(stats.count, 0);
     }
 
     #[test]
