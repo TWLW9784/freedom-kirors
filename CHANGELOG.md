@@ -4,7 +4,50 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.6.0] - 2026-06-07
+
+主题：**Enterprise / IAM Identity Center 凭据全链路打通 + 流式对话 profileArn 修复 + 登录体验对齐官方 IDE**。此前导入或登录企业（Enterprise）IdC 账号后，获取订阅/用量会报 `403 {"message":"Invalid token"}`，且发起对话会报 `400 profileArn is required` / `403 bearer token invalid`——根因是这类账号在请求里带了 BuilderID 占位 profileArn 或缺失真实 profileArn。这一版定位并修复了用量查询与流式对话两条链路，同时把添加凭据 / 登录 / 导出的整体行为与官方 IDE / 账号管理器对齐，并新增 Enterprise 登录入口与一批凭据管理体验改进。
+
+### 🛠 修复 — 流式对话 400「profileArn is required」/ 403「bearer token invalid」
+
+新版上游对流式端点（`generateAssistantResponse`）强制要求请求体携带 `profileArn`，且校验其与 token 身份匹配。表现为对话直接失败（新模型如 `claude-opus-4-8-thinking` 同样命中）：
+
+- 不带 profileArn → `400 {"message":"profileArn is required for this request."}`；
+- 带 BuilderID 占位符 ARN → `403 {"message":"The bearer token included in the request is invalid."}`。
+
+按官方 Kiro IDE 的行为分两类账号修复：
+
+- **流式端点始终发送 profileArn（含 BuilderID 占位符）**：新增 `KiroCredentials::streaming_profile_arn()`，流式端点不再像用量类接口那样剥离占位符。纯 BuilderID 账号的占位符与其 token 身份匹配，可正常使用。
+- **Enterprise / IdC 账号解析并回填真实 profileArn**：这类账号的占位符与 token 不匹配（403），必须使用真实 profileArn——而真实 ARN 既不是占位符也不在 OIDC 刷新响应里返回。新增 `ListAvailableProfiles` 上游调用（AWS JSON 1.0，target `AmazonCodeWhispererService.ListAvailableProfiles`，端点 `q.us-east-1` / `q.eu-central-1`）与 `MultiTokenManager::resolve_profile_arn_for()`：首次请求时按需解析真实 profileArn、写回凭据并持久化，之后直接命中。无 Enterprise profile 的账号（纯 BuilderID）进程内只查询一次，回退到占位符逻辑。
+- 用量类接口（getUsageLimits / ListAvailableModels / setUserPreference）继续使用 `effective_profile_arn()`（跳过占位符）；回填真实 ARN 后它们也会带上真实 profileArn，行为更贴近官方 IDE。
+
+### 🛠 修复 — Enterprise/IdC 用量查询 403
+
+- **跳过占位 profileArn**：新增 `KiroCredentials::effective_profile_arn()` 与 `is_placeholder_profile_arn()`——只向上游发送真实 ARN（含 Social 共享 ARN），跳过 `BUILDER_ID_PROFILE_ARN` 占位符。BuilderID / Enterprise / IdC 账号本就没有可用 profileArn，发送占位符会被上游以 403 "Invalid token" 拒绝。`getUsageLimits` / `ListAvailableModels` / `setUserPreference` 以及流式端点（ide/cli）的请求体与 `x-amzn-kiro-profile-arn` 头全部改用它。
+- **用量类接口固定使用兼容版本**：`getUsageLimits` / `ListAvailableModels` / `setUserPreference` 固定以 `0.9.2` 作为 `KiroIDE-<version>` 标识——新版上游对这些接口强制要求 profileArn，对无 profileArn 的 Enterprise/IdC 账号会失败；该版本下无需 profileArn 即可返回订阅与用量。
+- **区域映射 + 403 回退**：上述接口仅在 `us-east-1` / `eu-central-1` 两个端点提供服务，依据凭据 SSO 区域选择主端点（`eu-*` → eu-central-1，其余 → us-east-1），主端点 403 时自动回退到另一个端点。
+- **解析并回填邮箱**：`getUsageLimits` 响应的 `userInfo.email` 现在会被解析，凭据无邮箱时自动回填。
+
+### ✨ 新功能 — Kiro IDE 版本自动获取
+
+- 新增 `src/kiro/kiro_version.rs`：启动时从官方稳定版元数据端点（`prod.download.desktop.kiro.dev/stable/metadata-linux-x64-stable.json` 的 `currentRelease`）拉取当前 Kiro IDE 版本，进程内缓存 + 每 12h 后台刷新，失败回退到 `config.kiroVersion`。流式端点 User-Agent 与 Social 刷新随真实版本走，替代写死的版本号。
+
+### ✨ 新功能 — Enterprise 登录入口与登录体验
+
+- **新增 Enterprise (IAM Identity Center) 登录入口**：仅显示 SSO Start URL（必填）+ SSO 区域，与官方交互一致；登录成功的凭据带 `provider=Enterprise`、`startUrl`、`region`。
+- **SSO 区域可选 / 自定义**：登录对话框区域字段改为「分组下拉（US / Europe / Asia Pacific / Other 常用区域）+ 始终可输入的自定义文本框」。
+- **AWS SSO 与 Enterprise 均支持无痕登录**：勾选后复制验证链接，由用户在无痕 / 隐身窗口打开，避免与已登录的 AWS 账号串号。
+- **IdC 登录对齐官方**：注册客户端使用 5 个 codewhisperer 作用域并带上 `issuerUrl`（Builder ID 为默认 Start URL，Enterprise 为组织 Start URL）。
+- **新增 `startUrl` 字段**：凭据模型新增 SSO Start URL 字段，登录 / 导入 / 导出全链路保留。
+
+### ✨ 改进 — 凭据管理体验
+
+- **添加 / 登录成功后自动刷新余额**：添加凭据、Social 登录、IdC/Enterprise 登录成功后主动拉取一次余额（含订阅等级、邮箱）并写入缓存，新凭据卡片立即显示余额。
+- **凭据标签按登录方式显示**：卡片身份标签根据 `provider` 细分为 GitHub / Google / Builder ID / Enterprise / IAM SSO / API Key，不再统一显示 Social / IdC。
+- **删除登录与添加凭据中的优先级输入项**：保留卡片上对已有凭据的优先级编辑与拖拽排序。
+- **无需先停用即可直接删除凭据**：单个与批量删除都不再要求凭据处于禁用状态（仍有二次确认）。
+- **一键超额遇 403 友好提示**：开启超额（一键 / 单条）命中 403 / 权限不足时统一提示「请联系您的组织管理员以获取支持」。
+- **导出格式调整**：凭据导出改为嵌套 `Account` 结构（凭据收进 `credentials` 子对象、`expiresAt` 毫秒时间戳、含顶层 `groups`/`tags` 数组），便于第三方账号管理工具直接重新导入。
 
 ## [0.5.9] - 2026-06-03
 
