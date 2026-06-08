@@ -519,8 +519,10 @@ export interface RecentStats {
   total: number
   success: number
   error: number
+  successRate: number
   attempts: number
   failedAttempts: number
+  attemptSuccessRate: number
   throttle429: number
   avgMs: number
   maxMs: number

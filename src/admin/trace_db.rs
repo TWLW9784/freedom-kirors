@@ -581,6 +581,19 @@ impl TraceStore {
             }
         }
 
+        for stats in out.values_mut() {
+            stats.success_rate = if stats.total > 0 {
+                stats.success as f64 / stats.total as f64
+            } else {
+                0.0
+            };
+            stats.attempt_success_rate = if stats.attempts > 0 {
+                (stats.attempts.saturating_sub(stats.failed_attempts)) as f64 / stats.attempts as f64
+            } else {
+                0.0
+            };
+        }
+
         out
     }
 }
@@ -601,8 +614,10 @@ pub struct RecentStats {
     pub total: u64,
     pub success: u64,
     pub error: u64,
+    pub success_rate: f64,
     pub attempts: u64,
     pub failed_attempts: u64,
+    pub attempt_success_rate: f64,
     pub throttle_429: u64,
     pub avg_ms: f64,
     pub max_ms: u64,

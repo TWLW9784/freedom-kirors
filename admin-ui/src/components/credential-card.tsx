@@ -104,6 +104,18 @@ function formatMs(ms: number): string {
   return `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)}s`;
 }
 
+function formatPercent(rate: number): string {
+  if (!Number.isFinite(rate)) return "—";
+  return `${(Math.max(0, Math.min(1, rate)) * 100).toFixed(1)}%`;
+}
+
+function getSuccessRateClass(rate: number): string {
+  if (!Number.isFinite(rate)) return "text-muted-foreground";
+  if (rate >= 0.95) return "text-emerald-600 dark:text-emerald-400";
+  if (rate >= 0.8) return "text-amber-600 dark:text-amber-400";
+  return "text-destructive";
+}
+
 /** 把秒数格式化为 `mm:ss` 或 `hh:mm:ss` */
 function formatThrottleCountdown(secs: number): string {
   const total = Math.max(0, Math.floor(secs));
@@ -620,7 +632,7 @@ export function CredentialCard({
               <div className="col-span-2 rounded-lg border border-border/60 bg-secondary/30 p-2.5">
                 <div className="mb-2 flex items-center justify-between gap-2">
                   <div className="text-[11px] font-medium text-muted-foreground">
-                    近 1 小时调用 / 压测
+                    近 1 小时请求健康度
                   </div>
                   <div className="flex flex-wrap justify-end gap-1">
                     {recentStats.endpoints.map((endpoint) => (
@@ -628,6 +640,20 @@ export function CredentialCard({
                         {endpoint}
                       </Badge>
                     ))}
+                  </div>
+                </div>
+                <div className="mb-2 grid grid-cols-2 gap-2 text-[11px]">
+                  <div className="rounded-md border border-border/50 bg-background/50 px-2 py-1.5">
+                    <div className={`text-base font-semibold leading-none tabular-nums ${getSuccessRateClass(recentStats.successRate)}`}>
+                      {formatPercent(recentStats.successRate)}
+                    </div>
+                    <div className="mt-1 text-muted-foreground">最终成功率</div>
+                  </div>
+                  <div className="rounded-md border border-border/50 bg-background/50 px-2 py-1.5">
+                    <div className={`text-base font-semibold leading-none tabular-nums ${getSuccessRateClass(recentStats.attemptSuccessRate)}`}>
+                      {formatPercent(recentStats.attemptSuccessRate)}
+                    </div>
+                    <div className="mt-1 text-muted-foreground">上游尝试成功率</div>
                   </div>
                 </div>
                 <div className="grid grid-cols-4 gap-2 text-center text-[11px]">
