@@ -128,6 +128,20 @@ pub struct Config {
     #[serde(default = "default_account_throttle_cooldown_secs")]
     pub account_throttle_cooldown_secs: u64,
 
+    /// 同一 Kiro 官方账号/profile 同时允许的上游请求数。
+    ///
+    /// Kiro 官方的 SERVICE_REQUEST_RATE_EXCEEDED 通常按官方账号/profile 维度限流；
+    /// 同一 profile 下导入多个 token 并不能提升限额，反而会叠加触发 429。
+    /// 默认 1：同一官方账号串行发起，多个不同 profile 仍可并行。
+    #[serde(default = "default_kiro_account_max_in_flight")]
+    pub kiro_account_max_in_flight: usize,
+
+    /// 同一 Kiro 官方账号/profile 两次请求发起之间的最小间隔（毫秒）。
+    ///
+    /// 默认 1800ms，减少短时间突刺；设为 0 可关闭间隔限速。
+    #[serde(default = "default_kiro_account_min_interval_ms")]
+    pub kiro_account_min_interval_ms: u64,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -210,6 +224,14 @@ fn default_account_throttle_cooldown_secs() -> u64 {
     30 * 60
 }
 
+fn default_kiro_account_max_in_flight() -> usize {
+    1
+}
+
+fn default_kiro_account_min_interval_ms() -> u64 {
+    1800
+}
+
 fn default_update_auto_apply_time() -> String {
     "03:00".to_string()
 }
@@ -263,6 +285,8 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
+            kiro_account_max_in_flight: default_kiro_account_max_in_flight(),
+            kiro_account_min_interval_ms: default_kiro_account_min_interval_ms(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             trace_enabled: default_trace_enabled(),

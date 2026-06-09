@@ -9,6 +9,7 @@ use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::sleep;
 
 use crate::admin::trace_db::{TraceAttempt, TraceSink, outcome, truncate_snippet};
@@ -84,6 +85,17 @@ pub struct KiroCallResult {
     pub credential_id: u64,
     /// 持有实时并发 guard，直到响应对象被消费/丢弃才扣减 in-flight。
     pub _in_flight_guard: Option<InFlightGuard>,
+    /// 持有同一 Kiro 官方账号/profile 的限速 guard，直到响应对象被消费/丢弃才释放。
+    pub _account_rate_guard: Option<AccountRateGuard>,
+}
+
+/// 同一 Kiro 官方账号/profile 的限速 guard。
+///
+/// 持有 `OwnedSemaphorePermit` 期间，同一官方账号/profile 的并发会被限制在
+/// `config.kiroAccountMaxInFlight` 内；成功返回流式响应时随 `KiroCallResult` 一起
+/// 存活，避免长流式响应期间继续向同一官方账号发起大量新请求。
+pub struct AccountRateGuard {
+    _permit: OwnedSemaphorePermit,
 }
 
 /// Kiro API Provider
@@ -105,6 +117,11 @@ pub struct KiroProvider {
     endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
     /// 默认端点名称（凭据未指定 endpoint 时使用）
     default_endpoint: String,
+    /// 同一 Kiro 官方账号/profile 的并发限制器。
+    account_limiters: Mutex<HashMap<String, Arc<Semaphore>>>,
+    /// 同一 Kiro 官方账号/profile 最近一次发起上游请求的时间，用于平滑突刺。
+    account_last_start: Mutex<HashMap<String, Instant>>,
+
     /// 已尝试过 profileArn 解析的凭据 ID（进程内）。
     ///
     /// 避免对「无 Enterprise profile」的账号（如纯 BuilderID）在每次请求都重复调用
@@ -145,6 +162,8 @@ impl KiroProvider {
             tls_backend,
             endpoints,
             default_endpoint,
+            account_limiters: Mutex::new(HashMap::new()),
+            account_last_start: Mutex::new(HashMap::new()),
             profile_resolution_attempted: Mutex::new(HashSet::new()),
         }
     }
@@ -171,6 +190,86 @@ impl KiroProvider {
             .get(name)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
+    }
+
+    /// 获取同一 Kiro 官方账号/profile 的限速 key。
+    ///
+    /// 优先使用 profileArn：Kiro 官方的 SERVICE_REQUEST_RATE_EXCEEDED 更像是按
+    /// 官方账号/profile 维度限流；同一 profile 下多个 token 不能视为独立限额。
+    fn account_rate_key(credentials: &KiroCredentials, id: u64) -> String {
+        if let Some(profile_arn) = credentials
+            .effective_profile_arn()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return format!("profile:{}", profile_arn);
+        }
+        if let Some(email) = credentials
+            .email
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return format!("email:{}", email.to_ascii_lowercase());
+        }
+        format!("credential:{}", id)
+    }
+
+    /// 同一 Kiro 官方账号/profile 的主动节流。
+    ///
+    /// 这不是为了“绕过”官方限制，而是让本地调度不要把同一个官方账号瞬间打爆：
+    /// - `kiroAccountMaxInFlight` 控制同一 profile 最大并发；默认 1。
+    /// - `kiroAccountMinIntervalMs` 控制同一 profile 两次发起请求的最小间隔；默认 1800ms。
+    async fn acquire_account_rate_guard(
+        &self,
+        credentials: &KiroCredentials,
+        id: u64,
+    ) -> anyhow::Result<AccountRateGuard> {
+        let config = self.token_manager.config();
+        let max_in_flight = config.kiro_account_max_in_flight.max(1);
+        let min_interval = Duration::from_millis(config.kiro_account_min_interval_ms);
+        let key = Self::account_rate_key(credentials, id);
+
+        let limiter = {
+            let mut limiters = self.account_limiters.lock();
+            limiters
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(Semaphore::new(max_in_flight)))
+                .clone()
+        };
+
+        let permit = limiter
+            .acquire_owned()
+            .await
+            .map_err(|e| anyhow::anyhow!("Kiro 官方账号限速器已关闭: {}", e))?;
+
+        if !min_interval.is_zero() {
+            let wait = {
+                let mut last = self.account_last_start.lock();
+                let now = Instant::now();
+                match last.get(&key).copied() {
+                    Some(prev) => {
+                        let elapsed = now.saturating_duration_since(prev);
+                        if elapsed < min_interval {
+                            min_interval - elapsed
+                        } else {
+                            last.insert(key.clone(), now);
+                            Duration::ZERO
+                        }
+                    }
+                    None => {
+                        last.insert(key.clone(), now);
+                        Duration::ZERO
+                    }
+                }
+            };
+            if !wait.is_zero() {
+                sleep(wait).await;
+                self.account_last_start.lock().insert(key, Instant::now());
+            }
+        }
+
+        Ok(AccountRateGuard { _permit: permit })
     }
 
     /// 在发起请求前，确保 Enterprise / IdC 账号的真实 profileArn 已解析并写入 `ctx`。
@@ -500,6 +599,9 @@ impl KiroProvider {
                     tracing::debug!("  header {}: {}", k, v.to_str().unwrap_or("<binary>"));
                 }
             }
+            let account_rate_guard = self
+                .acquire_account_rate_guard(&ctx.credentials, ctx.id)
+                .await?;
             let in_flight_guard = self.token_manager.begin_in_flight(ctx.id);
             let response = match self.client_for(&ctx.credentials)?.execute(request).await {
                 Ok(resp) => resp,
@@ -549,6 +651,7 @@ impl KiroProvider {
                     response,
                     credential_id: ctx.id,
                     _in_flight_guard: Some(in_flight_guard),
+                    _account_rate_guard: Some(account_rate_guard),
                 });
             }
 
@@ -801,7 +904,15 @@ impl KiroProvider {
                     body
                 ));
                 if attempt + 1 < max_retries {
-                    sleep(Self::retry_delay(attempt)).await;
+                    let delay = if status.as_u16() == 429 {
+                        Self::rate_limit_retry_delay(
+                            attempt,
+                            self.token_manager.config().kiro_account_min_interval_ms,
+                        )
+                    } else {
+                        Self::retry_delay(attempt)
+                    };
+                    sleep(delay).await;
                 }
                 continue;
             }
@@ -908,6 +1019,16 @@ impl KiroProvider {
         let backoff = exp.min(MAX_MS);
         let jitter_max = (backoff / 4).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
+        Duration::from_millis(backoff.saturating_add(jitter))
+    }
+
+    fn rate_limit_retry_delay(attempt: usize, account_min_interval_ms: u64) -> Duration {
+        // Kiro 官方 SERVICE_REQUEST_RATE_EXCEEDED 是明确的速率限制，不能像普通 5xx
+        // 一样 200ms~2s 快速重试，否则一个用户请求会在官方冷却窗口内连续撞 429。
+        let base = account_min_interval_ms.max(5_000);
+        let exp = base.saturating_mul(2u64.saturating_pow(attempt.min(3) as u32));
+        let backoff = exp.min(30_000);
+        let jitter = fastrand::u64(0..=(backoff / 5).max(1));
         Duration::from_millis(backoff.saturating_add(jitter))
     }
 }

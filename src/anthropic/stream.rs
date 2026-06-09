@@ -2104,7 +2104,9 @@ mod tests {
     fn block_stop_position(events: &[SseEvent], index: i64) -> usize {
         events
             .iter()
-            .position(|e| e.event == "content_block_stop" && e.data["index"].as_i64() == Some(index))
+            .position(|e| {
+                e.event == "content_block_stop" && e.data["index"].as_i64() == Some(index)
+            })
             .unwrap_or_else(|| panic!("block {index} should stop"))
     }
 
@@ -2361,7 +2363,10 @@ mod tests {
         )));
         all_events.extend(ctx.generate_final_events());
 
-        assert_eq!(collect_thinking_content(&all_events), "delayed native reasoning");
+        assert_eq!(
+            collect_thinking_content(&all_events),
+            "delayed native reasoning"
+        );
         assert!(all_events.iter().any(|e| {
             e.event == "content_block_delta"
                 && e.data["delta"]["type"] == "signature_delta"
@@ -2383,7 +2388,10 @@ mod tests {
         )));
         all_events.extend(ctx.generate_final_events());
 
-        assert_eq!(collect_text_content(&all_events), "visible reasoning fallback");
+        assert_eq!(
+            collect_text_content(&all_events),
+            "visible reasoning fallback"
+        );
         assert_eq!(collect_thinking_content(&all_events), "");
         assert!(!all_events.iter().any(|e| {
             e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta"

@@ -970,7 +970,6 @@ pub struct CallContext {
     pub token: String,
 }
 
-
 /// 上游实时调用 guard，确保请求结束、失败或提前 return 时扣减 in_flight。
 pub struct InFlightGuard {
     manager: std::sync::Arc<MultiTokenManager>,
@@ -1748,7 +1747,6 @@ impl MultiTokenManager {
         }
     }
 
-
     /// 标记某凭据开始一次上游调用，返回 RAII guard；guard drop 时自动扣减。
     pub fn begin_in_flight(self: &std::sync::Arc<Self>, id: u64) -> InFlightGuard {
         {
@@ -1758,7 +1756,11 @@ impl MultiTokenManager {
                 entry.peak_in_flight = entry.peak_in_flight.max(entry.in_flight);
             }
         }
-        InFlightGuard { manager: std::sync::Arc::clone(self), id, active: true }
+        InFlightGuard {
+            manager: std::sync::Arc::clone(self),
+            id,
+            active: true,
+        }
     }
 
     pub fn mark_throttle_observed(&self, id: u64) -> Option<u64> {

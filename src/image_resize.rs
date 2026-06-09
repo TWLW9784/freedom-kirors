@@ -211,7 +211,11 @@ const IMAGE_TOKEN_FALLBACK: u32 = 1_600;
 ///
 /// `media_type` 形如 "image/png"；`data_base64` 是原始 base64 数据。
 pub fn estimate_image_tokens(media_type: &str, data_base64: &str) -> u32 {
-    let format = media_type.rsplit('/').next().unwrap_or("").to_ascii_lowercase();
+    let format = media_type
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
     let Some((w, h)) = peek_dimensions(&format, data_base64) else {
         return IMAGE_TOKEN_FALLBACK;
     };
@@ -386,7 +390,8 @@ mod tests {
     }
 
     #[test]
-    fn small_image_passes_through() {        let cfg = ResizeConfig {
+    fn small_image_passes_through() {
+        let cfg = ResizeConfig {
             enabled: true,
             max_long_side: 1568,
             max_bytes: 400_000,

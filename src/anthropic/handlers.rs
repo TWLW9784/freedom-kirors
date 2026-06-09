@@ -4,8 +4,10 @@ use std::convert::Infallible;
 use std::time::Instant;
 
 use crate::admin::client_keys::SharedClientKeyManager;
+use crate::admin::trace_db::{
+    SharedTraceStore, TraceAttempt, TraceKeySource, TraceRecord, TraceSink, outcome,
+};
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
-use crate::admin::trace_db::{SharedTraceStore, TraceAttempt, TraceRecord, TraceSink, outcome};
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
@@ -124,6 +126,7 @@ pub(crate) struct RequestTracer {
     trace_id: String,
     ts: String,
     key_id: u64,
+    key_source: TraceKeySource,
     model: String,
     is_stream: bool,
     started_at: Instant,
@@ -133,15 +136,22 @@ pub(crate) struct RequestTracer {
     usage: parking_lot::Mutex<Option<(i32, i32, i32, i32)>>,
 }
 
+struct RequestTraceOptions {
+    key_ctx: KeyContext,
+    model: String,
+    is_stream: bool,
+}
+
 impl RequestTracer {
-    pub fn new(state: &AppState, key_id: u64, model: String, is_stream: bool) -> Self {
+    fn new(state: &AppState, options: RequestTraceOptions) -> Self {
         Self {
             store: state.trace_store.clone(),
             trace_id: Uuid::new_v4().to_string(),
             ts: Utc::now().to_rfc3339(),
-            key_id,
-            model,
-            is_stream,
+            key_id: options.key_ctx.key_id,
+            key_source: options.key_ctx.key_source,
+            model: options.model,
+            is_stream: options.is_stream,
             started_at: Instant::now(),
             attempts: parking_lot::Mutex::new(Vec::new()),
             usage: parking_lot::Mutex::new(None),
@@ -173,6 +183,7 @@ impl RequestTracer {
             trace_id: self.trace_id.clone(),
             ts: self.ts.clone(),
             key_id: self.key_id,
+            key_source: self.key_source,
             model: self.model.clone(),
             is_stream: self.is_stream,
             final_status: final_status.to_string(),
@@ -238,11 +249,17 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
                 if item.get("type").and_then(|v| v.as_str()) != Some("image") {
                     continue;
                 }
-                let Some(src) = item.get("source") else { continue };
+                let Some(src) = item.get("source") else {
+                    continue;
+                };
                 if src.get("type").and_then(|v| v.as_str()) != Some("base64") {
                     continue;
                 }
-                let n = src.get("data").and_then(|v| v.as_str()).map(|s| s.len()).unwrap_or(0);
+                let n = src
+                    .get("data")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.len())
+                    .unwrap_or(0);
                 count += 1;
                 total += n;
                 if n > largest {
@@ -555,7 +572,11 @@ pub async fn post_messages(
 
         let resp = websearch::handle_websearch_request(provider, &payload, input_tokens).await;
         // WebSearch 路径走 MCP 端点，没有 credential_id 上下文，统一记 0
-        let status = if resp.status().is_success() { "success" } else { "error" };
+        let status = if resp.status().is_success() {
+            "success"
+        } else {
+            "error"
+        };
         hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
         return resp;
     }
@@ -564,7 +585,9 @@ pub async fn post_messages(
     // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
     // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
     if websearch::has_web_search_among_tools(&payload) {
-        tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
+        tracing::info!(
+            "detected mixed tools containing web_search, entering the web_search agentic loop"
+        );
         return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream)
             .await;
     }
@@ -646,9 +669,11 @@ pub async fn post_messages(
         // 流式响应
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
-            key_ctx.key_id,
-            payload.model.clone(),
-            true,
+            RequestTraceOptions {
+                key_ctx,
+                model: payload.model.clone(),
+                is_stream: true,
+            },
         ));
         handle_stream_request(
             provider,
@@ -667,9 +692,11 @@ pub async fn post_messages(
         let extract_thinking = state.extract_thinking && thinking_enabled;
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
-            key_ctx.key_id,
-            payload.model.clone(),
-            false,
+            RequestTraceOptions {
+                key_ctx,
+                model: payload.model.clone(),
+                is_stream: false,
+            },
         ));
         handle_non_stream_request(
             provider,
@@ -699,12 +726,20 @@ async fn handle_stream_request(
     tracer: std::sync::Arc<RequestTracer>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref())).await {
+    let call_result = match provider
+        .call_api_stream(request_body, Some(tracer.as_ref()))
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
             // 重试链路全部失败、未开始返回内容：error_type 取最后一跳分类
-            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None);
+            tracer.finalize(
+                "error",
+                last_attempt_outcome(&tracer),
+                Some(&e.to_string()),
+                None,
+            );
             return map_provider_error(e);
         }
     };
@@ -712,7 +747,8 @@ async fn handle_stream_request(
     let credential_id = call_result.credential_id;
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    let mut ctx =
+        StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
     ctx.cache_usage = cache_usage;
 
     // 生成初始事件
@@ -886,7 +922,12 @@ async fn handle_non_stream_request(
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
-            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None);
+            tracer.finalize(
+                "error",
+                last_attempt_outcome(&tracer),
+                Some(&e.to_string()),
+                None,
+            );
             return map_provider_error(e);
         }
     };
@@ -1276,7 +1317,11 @@ pub async fn post_messages_cc(
         ) as i32;
 
         let resp = websearch::handle_websearch_request(provider, &payload, input_tokens).await;
-        let status = if resp.status().is_success() { "success" } else { "error" };
+        let status = if resp.status().is_success() {
+            "success"
+        } else {
+            "error"
+        };
         hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
         return resp;
     }
@@ -1285,7 +1330,9 @@ pub async fn post_messages_cc(
     // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
     // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
     if websearch::has_web_search_among_tools(&payload) {
-        tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
+        tracing::info!(
+            "detected mixed tools containing web_search, entering the web_search agentic loop"
+        );
         return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream)
             .await;
     }
@@ -1367,9 +1414,11 @@ pub async fn post_messages_cc(
         // 流式响应（缓冲模式）
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
-            key_ctx.key_id,
-            payload.model.clone(),
-            true,
+            RequestTraceOptions {
+                key_ctx,
+                model: payload.model.clone(),
+                is_stream: true,
+            },
         ));
         handle_stream_request_buffered(
             provider,
@@ -1388,9 +1437,11 @@ pub async fn post_messages_cc(
         let extract_thinking = state.extract_thinking && thinking_enabled;
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
-            key_ctx.key_id,
-            payload.model.clone(),
-            false,
+            RequestTraceOptions {
+                key_ctx,
+                model: payload.model.clone(),
+                is_stream: false,
+            },
         ));
         handle_non_stream_request(
             provider,
@@ -1423,11 +1474,19 @@ async fn handle_stream_request_buffered(
     tracer: std::sync::Arc<RequestTracer>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref())).await {
+    let call_result = match provider
+        .call_api_stream(request_body, Some(tracer.as_ref()))
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
-            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None);
+            tracer.finalize(
+                "error",
+                last_attempt_outcome(&tracer),
+                Some(&e.to_string()),
+                None,
+            );
             return map_provider_error(e);
         }
     };
@@ -1672,11 +1731,14 @@ mod tests {
 
     #[test]
     fn count_image_budget_handles_empty() {
-        let req: super::super::types::MessagesRequest = serde_json::from_str(r#"{
+        let req: super::super::types::MessagesRequest = serde_json::from_str(
+            r#"{
             "model": "claude-opus-4-7",
             "max_tokens": 100,
             "messages": []
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         let stats = count_image_budget(&req);
         assert_eq!(stats.count, 0);
         assert_eq!(stats.total_b64_bytes, 0);
@@ -1706,7 +1768,8 @@ mod tests {
 
     #[test]
     fn count_image_budget_skips_url_only_images() {
-        let req: super::super::types::MessagesRequest = serde_json::from_str(r#"{
+        let req: super::super::types::MessagesRequest = serde_json::from_str(
+            r#"{
             "model": "claude-opus-4-7",
             "max_tokens": 100,
             "messages": [{
@@ -1715,7 +1778,9 @@ mod tests {
                     {"type": "image", "source": {"type": "url", "url": "https://example.com/x.png"}}
                 ]
             }]
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         let stats = count_image_budget(&req);
         assert_eq!(stats.count, 0);
     }

@@ -93,8 +93,8 @@ impl CacheUsage {
         let cache_total = cache_total.min(total);
         // 在缓存覆盖部分内部，按 estimate 口径的 read/creation 占比二次拆分。
         let read = if self.cache_covered_est > 0 {
-            ((cache_total as f64) * (self.cache_read as f64 / self.cache_covered_est as f64)).round()
-                as i32
+            ((cache_total as f64) * (self.cache_read as f64 / self.cache_covered_est as f64))
+                .round() as i32
         } else {
             0
         };
@@ -340,7 +340,10 @@ pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u6
             .zip(results.iter())
             .enumerate()
             .map(|(i, (s, r))| {
-                format!("[{i}] hash={} cum={} hit={}", s.hash, s.cumulative_tokens, r.hit)
+                format!(
+                    "[{i}] hash={} cum={} hit={}",
+                    s.hash, s.cumulative_tokens, r.hit
+                )
             })
             .collect();
         tracing::debug!(
@@ -437,7 +440,12 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
     // 1. tools（全部喂入，作为前缀基础的一部分；工具定义跨轮稳定）。
     if let Some(tools) = req.tools.as_ref() {
         for t in tools {
-            feed(&mut hasher, &tool_signature(t), &tool_token_text(t), &mut cum_tokens);
+            feed(
+                &mut hasher,
+                &tool_signature(t),
+                &tool_token_text(t),
+                &mut cum_tokens,
+            );
         }
     }
 
@@ -457,7 +465,12 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
             .position(|s| s.cache_control.is_some())
             .unwrap_or(0);
         for sys in systems.iter().skip(skip_until) {
-            feed(&mut hasher, &system_signature(sys), &sys.text, &mut cum_tokens);
+            feed(
+                &mut hasher,
+                &system_signature(sys),
+                &sys.text,
+                &mut cum_tokens,
+            );
         }
     }
 
@@ -489,7 +502,8 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
                         hasher.update(media_type.as_bytes());
                         hasher.update(b"|");
                         hasher.update(data.as_bytes());
-                        let img_tokens = crate::image_resize::estimate_image_tokens(media_type, data);
+                        let img_tokens =
+                            crate::image_resize::estimate_image_tokens(media_type, data);
                         cum_tokens = cum_tokens.saturating_add(img_tokens);
                     } else {
                         feed(
@@ -843,7 +857,8 @@ mod tests {
     }
 
     #[test]
-    fn compute_cache_usage_tools_hit_regardless_of_schema_order() {        use super::super::types::{CacheControl, Message, MessagesRequest};
+    fn compute_cache_usage_tools_hit_regardless_of_schema_order() {
+        use super::super::types::{CacheControl, Message, MessagesRequest};
 
         let make_req = |insert_required_first: bool| {
             let mut tool = build_tool_with_schema_order(insert_required_first);
@@ -900,7 +915,9 @@ mod tests {
         }
     }
 
-    fn req_with_messages(messages: Vec<super::super::types::Message>) -> super::super::types::MessagesRequest {
+    fn req_with_messages(
+        messages: Vec<super::super::types::Message>,
+    ) -> super::super::types::MessagesRequest {
         use super::super::types::MessagesRequest;
         MessagesRequest {
             model: "claude-sonnet-4-5-20250929".to_string(),
@@ -1157,9 +1174,18 @@ mod tests {
             model: "claude-opus-4-8".to_string(),
             max_tokens: 64,
             messages: vec![
-                Message { role: "user".into(), content: serde_json::json!([{"type":"text","text":body}]) },
-                Message { role: "assistant".into(), content: serde_json::json!([{"type":"text","text":body}]) },
-                Message { role: "user".into(), content: serde_json::json!([{"type":"text","text":body}]) },
+                Message {
+                    role: "user".into(),
+                    content: serde_json::json!([{"type":"text","text":body}]),
+                },
+                Message {
+                    role: "assistant".into(),
+                    content: serde_json::json!([{"type":"text","text":body}]),
+                },
+                Message {
+                    role: "user".into(),
+                    content: serde_json::json!([{"type":"text","text":body}]),
+                },
             ],
             stream: false,
             system: None,
@@ -1236,7 +1262,10 @@ mod tests {
         // 用 image_resize 的同款 PNG 生成器造一张 750×750（≈750 token）的真图。
         let png = make_test_png(750, 750);
         let img_tokens = crate::image_resize::estimate_image_tokens("image/png", &png) as i32;
-        assert!(img_tokens > 100, "前提：测试图应有可观 token，实测 {img_tokens}");
+        assert!(
+            img_tokens > 100,
+            "前提：测试图应有可观 token，实测 {img_tokens}"
+        );
 
         let make = |trailing: &str| MessagesRequest {
             model: "m".to_string(),
@@ -1249,8 +1278,14 @@ mod tests {
                         {"type":"text","text":"describe"}
                     ]),
                 },
-                Message { role: "assistant".to_string(), content: serde_json::json!("a pixel") },
-                Message { role: "user".to_string(), content: serde_json::json!(trailing) },
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("a pixel"),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!(trailing),
+                },
             ],
             stream: false,
             system: None,
@@ -1268,7 +1303,9 @@ mod tests {
         // 最深历史段至少覆盖到 [含图user] 段，covered 应 ≥ 图片 token（远大于纯文本）。
         assert!(
             u1.cache_covered_est >= img_tokens + text_only - 5,
-            "covered({}) 应含图片 token({})", u1.cache_covered_est, img_tokens
+            "covered({}) 应含图片 token({})",
+            u1.cache_covered_est,
+            img_tokens
         );
         assert_eq!(u1.cache_read, 0);
 
@@ -1276,7 +1313,9 @@ mod tests {
         let u2 = compute_cache_usage(&cache, &make("q2"), 1);
         assert!(
             u2.cache_read >= img_tokens,
-            "含图历史应跨轮命中且 read({}) 含图片 token({})", u2.cache_read, img_tokens
+            "含图历史应跨轮命中且 read({}) 含图片 token({})",
+            u2.cache_read,
+            img_tokens
         );
     }
 
@@ -1292,7 +1331,8 @@ mod tests {
             }
         }
         let mut buf = Vec::new();
-        img.write_to(&mut Cursor::new(&mut buf), ImageFormat::Png).unwrap();
+        img.write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
+            .unwrap();
         B64.encode(&buf)
     }
 }
