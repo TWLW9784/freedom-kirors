@@ -21,6 +21,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 - **修正在线更新源**：将前端「在线更新」对应的 GitHub Releases 检查与二进制下载源从上游 `ZyphrZero/kiro.rs` 改为二次开发仓库 `TWLW9784/freedom-kirors`，避免用户在前端点击更新时下载官方二进制覆盖本项目的二开功能。
 - **同步仓库链接**：Admin UI 的 GitHub 链接指向 `TWLW9784/freedom-kirors`；README 补充独立更新源说明。
+- **修复 API Key 凭据模型测试**：API Key 凭据固定使用 `cli` 端点；启动时自动把历史中空端点/`ide` 端点的 API Key 凭据迁移为 `cli`，避免点击模型测试时报 `403 The bearer token included in the request is invalid`。
 
 ### 2026-06-13
 

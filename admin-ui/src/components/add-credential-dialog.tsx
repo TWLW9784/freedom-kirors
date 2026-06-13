@@ -101,7 +101,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         proxyUrl: proxyUrl.trim() || undefined,
         proxyUsername: proxyUsername.trim() || undefined,
         proxyPassword: proxyPassword.trim() || undefined,
-        endpoint: endpoint.trim() || undefined,
+        endpoint: isApiKey ? 'cli' : endpoint.trim() || undefined,
         groups: groups,
         sourceChannel: sourceChannel.trim() || undefined,
       },
@@ -265,13 +265,15 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               </label>
               <Input
                 id="endpoint"
-                placeholder="留空使用默认端点（如 ide / cli）"
-                value={endpoint}
+                placeholder={isApiKey ? 'API Key 固定使用 cli' : '留空使用默认端点（如 ide / cli）'}
+                value={isApiKey ? 'cli' : endpoint}
                 onChange={(e) => setEndpoint(e.target.value)}
-                disabled={isPending}
+                disabled={isPending || isApiKey}
               />
               <p className="text-xs text-muted-foreground">
-                可选。决定该凭据走哪套 Kiro API。留空使用全局 defaultEndpoint
+                {isApiKey
+                  ? 'API Key 凭据必须走 CLI 端点，使用 IDE 端点会返回 invalid bearer token'
+                  : '可选。决定该凭据走哪套 Kiro API。留空使用全局 defaultEndpoint'}
               </p>
             </div>
 

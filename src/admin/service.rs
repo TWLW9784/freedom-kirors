@@ -432,6 +432,8 @@ impl AdminService {
         let balance_cache = Self::load_balance_cache_from(&cache_path);
         let update_config = RuntimeUpdateConfig::from_config(token_manager.config());
 
+        let _ = token_manager.normalize_api_key_endpoints_to_cli();
+
         let svc = Self {
             token_manager,
             balance_cache: Mutex::new(balance_cache),
@@ -1141,7 +1143,13 @@ impl AdminService {
 
         // 构建凭据对象
         let email = req.email.clone();
-        let should_expand_profiles = !req.auth_method.eq_ignore_ascii_case("api_key");
+        let is_api_key_auth = req.auth_method.eq_ignore_ascii_case("api_key");
+        let should_expand_profiles = !is_api_key_auth;
+        let endpoint = if is_api_key_auth {
+            Some("cli".to_string())
+        } else {
+            req.endpoint
+        };
         let new_cred = KiroCredentials {
             id: None,
             access_token: req.access_token,
@@ -1165,7 +1173,7 @@ impl AdminService {
             proxy_password: req.proxy_password,
             disabled: false, // 新添加的凭据默认启用
             kiro_api_key: req.kiro_api_key,
-            endpoint: req.endpoint,
+            endpoint,
             groups: req.groups,
             source_channel: req.source_channel,
             max_in_flight: None,
@@ -1188,6 +1196,30 @@ impl AdminService {
                 None
             }
         };
+
+        // API Key 凭据没有 refresh 流程；添加成功不代表上游 Runtime 接受该 key。
+        // 这里做一次轻量模型测试，失败则回滚，避免前端显示“添加成功”但模型测试/调度稳定 403。
+        if is_api_key_auth {
+            let test = self
+                .test_credential_model(credential_id, TestCredentialModelRequest::default())
+                .await?;
+            if !test.ok {
+                let _ = self.token_manager.delete_credential(credential_id);
+                {
+                    let mut cache = self.balance_cache.lock();
+                    cache.remove(&credential_id);
+                }
+                self.save_balance_cache();
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "API Key 验活失败：模型测试返回 {}，{}",
+                    test.status
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "网络错误".to_string()),
+                    test.error
+                        .unwrap_or_else(|| "上游未返回错误详情".to_string())
+                )));
+            }
+        }
 
         // 账号级去重：不同的 API Key 字符串可能属于同一个上游 Kiro 账户
         // （一个账户可签发多把 key）。仅靠 kiroApiKey 哈希无法识别，这里用上游
@@ -1253,11 +1285,7 @@ impl AdminService {
     /// 在已有凭据中查找与指定上游账号（account_key = userId 或 email）重复的凭据。
     /// 比对对象为余额缓存中已解析出上游账号身份的其他凭据（排除 self_id）。
     /// 返回（重复凭据 id, 展示标签）。
-    fn find_duplicate_account(
-        &self,
-        self_id: u64,
-        account_key: &str,
-    ) -> Option<(u64, String)> {
+    fn find_duplicate_account(&self, self_id: u64, account_key: &str) -> Option<(u64, String)> {
         let snapshot = self.token_manager.snapshot();
         let cache = self.balance_cache.lock();
         for entry in &snapshot.entries {

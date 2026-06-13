@@ -1251,7 +1251,11 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    fn select_next_credential(&self, model: Option<&str>, group: Option<&str>) -> Option<(u64, KiroCredentials)> {
+    fn select_next_credential(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
         let now = Instant::now();
 
@@ -1318,7 +1322,11 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    pub async fn acquire_context(&self, model: Option<&str>, group: Option<&str>) -> anyhow::Result<CallContext> {
+    pub async fn acquire_context(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> anyhow::Result<CallContext> {
         let total = self.total_count_in_group(group);
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -3161,6 +3169,34 @@ impl MultiTokenManager {
         Ok(new_id)
     }
 
+    /// API Key 凭据只能稳定走 CLI 端点；历史版本曾允许其继承默认 IDE 端点，
+    /// 会在模型测试/实际请求中触发 403 invalid bearer token。
+    /// 启动时把已有 API Key 凭据的空端点或 IDE 端点自动迁移为 CLI。
+    pub fn normalize_api_key_endpoints_to_cli(&self) -> anyhow::Result<usize> {
+        let mut changed = 0usize;
+        {
+            let mut entries = self.entries.lock();
+            for entry in entries.iter_mut() {
+                if entry.credentials.is_api_key_credential()
+                    && entry
+                        .credentials
+                        .endpoint
+                        .as_deref()
+                        .map(|v| v.trim().is_empty() || v.eq_ignore_ascii_case("ide"))
+                        .unwrap_or(true)
+                {
+                    entry.credentials.endpoint = Some("cli".to_string());
+                    changed += 1;
+                }
+            }
+        }
+        if changed > 0 {
+            self.persist_credentials()?;
+            tracing::info!(changed, "已将 API Key 凭据端点自动迁移为 cli");
+        }
+        Ok(changed)
+    }
+
     /// 更新凭据的可编辑字段（Admin API）
     ///
     /// 支持更新 email、proxy_url、proxy_username、proxy_password、profile_arn。
@@ -4748,7 +4784,10 @@ mod tests {
         assert!(group_matches(&[], None));
         assert!(group_matches(&["g1".to_string()], None));
         // 绑定分组时只匹配 groups 含该名的账号
-        assert!(group_matches(&["g1".to_string(), "g2".to_string()], Some("g1")));
+        assert!(group_matches(
+            &["g1".to_string(), "g2".to_string()],
+            Some("g1")
+        ));
         assert!(!group_matches(&["g2".to_string()], Some("g1")));
         assert!(!group_matches(&[], Some("g1")));
     }
@@ -4824,7 +4863,11 @@ mod tests {
         manager.report_success(1);
         manager.report_success(1);
         let pick = manager.select_next_credential(None, Some("g1"));
-        assert_eq!(pick.map(|(id, _)| id), Some(2), "balanced 应在 g1 内选 success_count 最小的 B");
+        assert_eq!(
+            pick.map(|(id, _)| id),
+            Some(2),
+            "balanced 应在 g1 内选 success_count 最小的 B"
+        );
         // g2 不受 g1 计数影响，仍只会选到 C(id3)
         let pick_g2 = manager.select_next_credential(None, Some("g2"));
         assert_eq!(pick_g2.map(|(id, _)| id), Some(3));
