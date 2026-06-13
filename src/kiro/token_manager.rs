@@ -13,7 +13,7 @@ use tokio::sync::Mutex as TokioMutex;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
@@ -911,6 +911,16 @@ pub struct CredentialEntrySnapshot {
     /// 账号来源渠道（纯备注）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
+    /// 凭据级最大并发上限（None 表示跟随档位默认）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_in_flight: Option<usize>,
+    /// 凭据级最小请求间隔毫秒（None 表示跟随档位默认）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_interval_ms: Option<u64>,
+    /// 有效并发上限（考虑档位 fallback 后的实际值）
+    pub effective_max_in_flight: usize,
+    /// 有效最小间隔毫秒（考虑档位 fallback 后的实际值）
+    pub effective_min_interval_ms: u64,
 }
 
 /// 凭据管理器状态快照
@@ -925,6 +935,19 @@ pub struct ManagerSnapshot {
     pub total: usize,
     /// 可用凭据数量
     pub available: usize,
+}
+
+/// 档位并发配置快照（运行时可改，Admin API 读写）
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConcurrencyConfigSnapshot {
+    pub tier_max_in_flight_enterprise: usize,
+    pub tier_max_in_flight_pro: usize,
+    pub tier_max_in_flight_basic: usize,
+    pub tier_min_interval_ms_enterprise: u64,
+    pub tier_min_interval_ms_pro: u64,
+    pub tier_min_interval_ms_basic: u64,
+    pub adaptive_concurrency_enabled: bool,
 }
 
 /// 多凭据 Token 管理器
@@ -951,6 +974,16 @@ pub struct MultiTokenManager {
     account_throttle_failover: AtomicBool,
     /// 账号级风控冷却时长（秒，运行时可修改）
     account_throttle_cooldown_secs: AtomicU64,
+    /// 按档位默认并发（运行时可改，企业/Pro/Basic）
+    tier_max_in_flight_enterprise: AtomicUsize,
+    tier_max_in_flight_pro: AtomicUsize,
+    tier_max_in_flight_basic: AtomicUsize,
+    /// 按档位默认最小请求间隔（毫秒，运行时可改）
+    tier_min_interval_ms_enterprise: AtomicU64,
+    tier_min_interval_ms_pro: AtomicU64,
+    tier_min_interval_ms_basic: AtomicU64,
+    /// 自适应降并发开关（运行时可改）
+    adaptive_concurrency_enabled: AtomicBool,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -989,6 +1022,17 @@ impl Drop for InFlightGuard {
             self.manager.end_in_flight(self.id);
             self.active = false;
         }
+    }
+}
+
+/// 判断某账号的分组集合是否匹配请求所属分组（严格隔离）
+///
+/// - `group = None`：Key 未绑定分组（含 master apiKey），匹配所有账号。
+/// - `group = Some(g)`：仅匹配 `cred_groups` 包含 `g` 的账号。
+fn group_matches(cred_groups: &[String], group: Option<&str>) -> bool {
+    match group {
+        None => true,
+        Some(g) => cred_groups.iter().any(|cg| cg == g),
     }
 }
 
@@ -1099,6 +1143,13 @@ impl MultiTokenManager {
         let load_balancing_mode = config.load_balancing_mode.clone();
         let throttle_failover = config.account_throttle_failover;
         let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
+        let tier_mif_ent = config.tier_max_in_flight_enterprise;
+        let tier_mif_pro = config.tier_max_in_flight_pro;
+        let tier_mif_basic = config.tier_max_in_flight_basic;
+        let tier_int_ent = config.tier_min_interval_ms_enterprise;
+        let tier_int_pro = config.tier_min_interval_ms_pro;
+        let tier_int_basic = config.tier_min_interval_ms_basic;
+        let adaptive_enabled = config.adaptive_concurrency_enabled;
         let manager = Self {
             config,
             proxy: Mutex::new(proxy),
@@ -1110,6 +1161,13 @@ impl MultiTokenManager {
             load_balancing_mode: Mutex::new(load_balancing_mode),
             account_throttle_failover: AtomicBool::new(throttle_failover),
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
+            tier_max_in_flight_enterprise: AtomicUsize::new(tier_mif_ent),
+            tier_max_in_flight_pro: AtomicUsize::new(tier_mif_pro),
+            tier_max_in_flight_basic: AtomicUsize::new(tier_mif_basic),
+            tier_min_interval_ms_enterprise: AtomicU64::new(tier_int_ent),
+            tier_min_interval_ms_pro: AtomicU64::new(tier_int_pro),
+            tier_min_interval_ms_basic: AtomicU64::new(tier_int_basic),
+            adaptive_concurrency_enabled: AtomicBool::new(adaptive_enabled),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
         };
@@ -2187,6 +2245,34 @@ impl MultiTokenManager {
                     endpoint: e.credentials.endpoint.clone(),
                     groups: e.credentials.groups.clone(),
                     source_channel: e.credentials.source_channel.clone(),
+                    max_in_flight: e.credentials.max_in_flight,
+                    min_interval_ms: e.credentials.min_interval_ms,
+                    effective_max_in_flight: {
+                        use crate::kiro::model::credentials::AccountTier;
+                        if let Some(v) = e.credentials.max_in_flight {
+                            v.max(1)
+                        } else {
+                            let cfg = self.config();
+                            match e.credentials.account_tier() {
+                                AccountTier::Enterprise => cfg.tier_max_in_flight_enterprise.max(1),
+                                AccountTier::Pro => cfg.tier_max_in_flight_pro.max(1),
+                                AccountTier::Basic => cfg.tier_max_in_flight_basic.max(1),
+                            }
+                        }
+                    },
+                    effective_min_interval_ms: {
+                        use crate::kiro::model::credentials::AccountTier;
+                        if let Some(v) = e.credentials.min_interval_ms {
+                            v
+                        } else {
+                            let cfg = self.config();
+                            match e.credentials.account_tier() {
+                                AccountTier::Enterprise => cfg.tier_min_interval_ms_enterprise,
+                                AccountTier::Pro => cfg.tier_min_interval_ms_pro,
+                                AccountTier::Basic => cfg.tier_min_interval_ms_basic,
+                            }
+                        }
+                    },
                 })
                 .collect(),
             current_id,
@@ -2801,6 +2887,13 @@ impl MultiTokenManager {
         Ok((token, credentials))
     }
 
+    pub async fn prepare_admin_request_token(
+        &self,
+        id: u64,
+    ) -> anyhow::Result<(String, KiroCredentials)> {
+        self.prepare_request_token(id).await
+    }
+
     /// 获取指定凭据当前可用的模型列表（Admin API）
     ///
     /// 按需实时查询上游 `ListAvailableModels`，不做缓存。
@@ -3080,6 +3173,8 @@ impl MultiTokenManager {
         proxy_username: Option<Option<String>>,
         proxy_password: Option<Option<String>>,
         profile_arn: Option<Option<String>>,
+        max_in_flight: Option<Option<usize>>,
+        min_interval_ms: Option<Option<u64>>,
     ) -> anyhow::Result<()> {
         {
             let mut entries = self.entries.lock();
@@ -3102,6 +3197,14 @@ impl MultiTokenManager {
             }
             if let Some(v) = profile_arn {
                 entry.credentials.profile_arn = v.filter(|s| !s.is_empty());
+            }
+            if let Some(v) = max_in_flight {
+                // Some(None) = 清除（回退到档位默认）；Some(Some(0)) 视为清除
+                entry.credentials.max_in_flight = v.filter(|&n| n > 0);
+            }
+            if let Some(v) = min_interval_ms {
+                // Some(None) = 清除；Some(Some(x)) 直接写入，0 合法（关闭间隔）
+                entry.credentials.min_interval_ms = v;
             }
         }
         self.persist_credentials()?;
@@ -3504,6 +3607,169 @@ impl MultiTokenManager {
         config
             .save()
             .with_context(|| format!("持久化账号级风控配置失败: {}", config_path.display()))?;
+
+        Ok(())
+    }
+
+    // ===== 档位并发默认（运行时可改 + 持久化）=====
+
+    /// 读取当前档位并发配置快照（企业/Pro/Basic 并发、间隔、自适应开关）。
+    pub fn get_concurrency_config(&self) -> ConcurrencyConfigSnapshot {
+        ConcurrencyConfigSnapshot {
+            tier_max_in_flight_enterprise: self
+                .tier_max_in_flight_enterprise
+                .load(Ordering::Relaxed),
+            tier_max_in_flight_pro: self.tier_max_in_flight_pro.load(Ordering::Relaxed),
+            tier_max_in_flight_basic: self.tier_max_in_flight_basic.load(Ordering::Relaxed),
+            tier_min_interval_ms_enterprise: self
+                .tier_min_interval_ms_enterprise
+                .load(Ordering::Relaxed),
+            tier_min_interval_ms_pro: self.tier_min_interval_ms_pro.load(Ordering::Relaxed),
+            tier_min_interval_ms_basic: self.tier_min_interval_ms_basic.load(Ordering::Relaxed),
+            adaptive_concurrency_enabled: self.adaptive_concurrency_enabled.load(Ordering::Relaxed),
+        }
+    }
+
+    /// 按档位返回有效默认并发（凭据无显式 maxInFlight 时回退到此，运行时值优先于 Config）。
+    pub fn tier_max_in_flight(&self, tier: crate::kiro::model::credentials::AccountTier) -> usize {
+        use crate::kiro::model::credentials::AccountTier;
+        let v = match tier {
+            AccountTier::Enterprise => self.tier_max_in_flight_enterprise.load(Ordering::Relaxed),
+            AccountTier::Pro => self.tier_max_in_flight_pro.load(Ordering::Relaxed),
+            AccountTier::Basic => self.tier_max_in_flight_basic.load(Ordering::Relaxed),
+        };
+        v.max(1)
+    }
+
+    /// 按档位返回有效默认最小间隔（毫秒，运行时值优先于 Config）。
+    pub fn tier_min_interval_ms(&self, tier: crate::kiro::model::credentials::AccountTier) -> u64 {
+        use crate::kiro::model::credentials::AccountTier;
+        match tier {
+            AccountTier::Enterprise => self.tier_min_interval_ms_enterprise.load(Ordering::Relaxed),
+            AccountTier::Pro => self.tier_min_interval_ms_pro.load(Ordering::Relaxed),
+            AccountTier::Basic => self.tier_min_interval_ms_basic.load(Ordering::Relaxed),
+        }
+    }
+
+    /// 自适应降并发是否启用（运行时值）。
+    pub fn adaptive_concurrency_enabled(&self) -> bool {
+        self.adaptive_concurrency_enabled.load(Ordering::Relaxed)
+    }
+
+    /// 凭据的有效并发：显式 maxInFlight 优先，否则按档位默认（运行时值）。
+    pub fn effective_max_in_flight(
+        &self,
+        cred: &crate::kiro::model::credentials::KiroCredentials,
+    ) -> usize {
+        cred.max_in_flight
+            .filter(|&v| v >= 1)
+            .unwrap_or_else(|| self.tier_max_in_flight(cred.account_tier()))
+    }
+
+    /// 凭据的有效最小间隔（毫秒）：按档位默认（运行时值）。
+    pub fn effective_min_interval_ms(
+        &self,
+        cred: &crate::kiro::model::credentials::KiroCredentials,
+    ) -> u64 {
+        self.tier_min_interval_ms(cred.account_tier())
+    }
+
+    /// 更新档位并发配置（Admin API）。任一字段 `None` 表示不修改。
+    /// 并发取值范围 1..=256，间隔 0..=60000ms。先改内存后持久化，持久化失败回滚。
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_concurrency_config(
+        &self,
+        ent_mif: Option<usize>,
+        pro_mif: Option<usize>,
+        basic_mif: Option<usize>,
+        ent_int: Option<u64>,
+        pro_int: Option<u64>,
+        basic_int: Option<u64>,
+        adaptive: Option<bool>,
+    ) -> anyhow::Result<ConcurrencyConfigSnapshot> {
+        for v in [ent_mif, pro_mif, basic_mif].into_iter().flatten() {
+            if !(1..=256).contains(&v) {
+                anyhow::bail!("并发上限必须在 1..=256 内: {}", v);
+            }
+        }
+        for v in [ent_int, pro_int, basic_int].into_iter().flatten() {
+            if v > 60_000 {
+                anyhow::bail!("最小间隔必须在 0..=60000ms 内: {}", v);
+            }
+        }
+
+        let prev = self.get_concurrency_config();
+        let next = ConcurrencyConfigSnapshot {
+            tier_max_in_flight_enterprise: ent_mif.unwrap_or(prev.tier_max_in_flight_enterprise),
+            tier_max_in_flight_pro: pro_mif.unwrap_or(prev.tier_max_in_flight_pro),
+            tier_max_in_flight_basic: basic_mif.unwrap_or(prev.tier_max_in_flight_basic),
+            tier_min_interval_ms_enterprise: ent_int
+                .unwrap_or(prev.tier_min_interval_ms_enterprise),
+            tier_min_interval_ms_pro: pro_int.unwrap_or(prev.tier_min_interval_ms_pro),
+            tier_min_interval_ms_basic: basic_int.unwrap_or(prev.tier_min_interval_ms_basic),
+            adaptive_concurrency_enabled: adaptive.unwrap_or(prev.adaptive_concurrency_enabled),
+        };
+
+        self.store_concurrency_config(&next);
+
+        if let Err(err) = self.persist_concurrency_config(&next) {
+            self.store_concurrency_config(&prev); // 回滚
+            return Err(err);
+        }
+
+        tracing::info!(
+            "档位并发配置已更新: ent={}/{} pro={}/{} basic={}/{} adaptive={}",
+            next.tier_max_in_flight_enterprise,
+            next.tier_min_interval_ms_enterprise,
+            next.tier_max_in_flight_pro,
+            next.tier_min_interval_ms_pro,
+            next.tier_max_in_flight_basic,
+            next.tier_min_interval_ms_basic,
+            next.adaptive_concurrency_enabled,
+        );
+        Ok(next)
+    }
+
+    fn store_concurrency_config(&self, c: &ConcurrencyConfigSnapshot) {
+        self.tier_max_in_flight_enterprise
+            .store(c.tier_max_in_flight_enterprise, Ordering::Relaxed);
+        self.tier_max_in_flight_pro
+            .store(c.tier_max_in_flight_pro, Ordering::Relaxed);
+        self.tier_max_in_flight_basic
+            .store(c.tier_max_in_flight_basic, Ordering::Relaxed);
+        self.tier_min_interval_ms_enterprise
+            .store(c.tier_min_interval_ms_enterprise, Ordering::Relaxed);
+        self.tier_min_interval_ms_pro
+            .store(c.tier_min_interval_ms_pro, Ordering::Relaxed);
+        self.tier_min_interval_ms_basic
+            .store(c.tier_min_interval_ms_basic, Ordering::Relaxed);
+        self.adaptive_concurrency_enabled
+            .store(c.adaptive_concurrency_enabled, Ordering::Relaxed);
+    }
+
+    fn persist_concurrency_config(&self, c: &ConcurrencyConfigSnapshot) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，档位并发配置仅在当前进程生效");
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.tier_max_in_flight_enterprise = c.tier_max_in_flight_enterprise;
+        config.tier_max_in_flight_pro = c.tier_max_in_flight_pro;
+        config.tier_max_in_flight_basic = c.tier_max_in_flight_basic;
+        config.tier_min_interval_ms_enterprise = c.tier_min_interval_ms_enterprise;
+        config.tier_min_interval_ms_pro = c.tier_min_interval_ms_pro;
+        config.tier_min_interval_ms_basic = c.tier_min_interval_ms_basic;
+        config.adaptive_concurrency_enabled = c.adaptive_concurrency_enabled;
+        config
+            .save()
+            .with_context(|| format!("持久化档位并发配置失败: {}", config_path.display()))?;
 
         Ok(())
     }

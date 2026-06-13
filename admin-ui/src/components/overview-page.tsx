@@ -543,7 +543,7 @@ function DistributionPanels({
 }) {
   return (
     <div className="mb-6 grid min-w-0 gap-4 lg:grid-cols-2">
-      <ModelPanel data={byModel} timeText={timeText} />
+      <ModelPanel data={byModel} timeText={timeText} groupFilterActive={groupFilterActive} />
       <CredentialPanel data={byCred} />
     </div>
   )

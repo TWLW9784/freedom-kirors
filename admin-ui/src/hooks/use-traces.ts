@@ -1,5 +1,5 @@
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
-import { getTraces, getFailureStats, getRecentStats } from '@/api/traces'
+import { getTraces, getFailureStats, getRecentStats, getLimiterSnapshots } from '@/api/traces'
 import type { TraceQuery } from '@/types/api'
 
 /**
@@ -38,6 +38,18 @@ export function useRecentStats() {
     queryFn: getRecentStats,
     refetchInterval: 10_000,
     staleTime: 5_000,
+    refetchOnWindowFocus: false,
+  })
+}
+
+/** 自适应限流器实时快照（按 account key）：limit/gradient/RTT/退避计数 */
+export function useLimiterSnapshots(enabled = true) {
+  return useQuery({
+    queryKey: ['limiter', 'snapshots'],
+    queryFn: getLimiterSnapshots,
+    enabled,
+    refetchInterval: enabled ? 3_000 : false,
+    staleTime: 1_500,
     refetchOnWindowFocus: false,
   })
 }

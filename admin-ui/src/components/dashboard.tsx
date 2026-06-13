@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, type FormEvent } from "react";
 import {
   RefreshCw,
   LogOut,
@@ -31,6 +31,7 @@ import {
   Zap,
   Search,
   X,
+  Tags,
 } from "lucide-react";
 
 function GithubIcon({ className }: { className?: string }) {
@@ -92,6 +93,7 @@ import {
   useSetPriority,
 } from "@/hooks/use-credentials";
 import { useUpdateCheck } from "@/hooks/use-update-check";
+import { useGroupOptions } from "@/hooks/use-groups";
 import { useFailureStats, useRecentStats } from "@/hooks/use-traces";
 import { useRectSelect } from "@/hooks/use-rect-select";
 import {
@@ -303,6 +305,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const { data: updateCheck } = useUpdateCheck();
   const { data: failureStatsMap } = useFailureStats();
   const { data: recentStatsMap } = useRecentStats();
+  const groupOptions = useGroupOptions();
+  const [groupFilter, setGroupFilter] = useState("");
 
   const allCredentials = data?.credentials || [];
   const totalInFlight = allCredentials.reduce(
@@ -341,6 +345,14 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     const matchesSearch =
       !normalizedSearch || credentialSearchText(c).includes(normalizedSearch);
     if (!matchesSearch) return false;
+
+    if (groupFilter) {
+      if (groupFilter === "__none__") {
+        if ((c.groups?.length ?? 0) > 0) return false;
+      } else if (!c.groups?.includes(groupFilter)) {
+        return false;
+      }
+    }
 
     switch (credentialFilter) {
       case "enabled":
@@ -517,7 +529,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
 
   useEffect(() => {
     setCurrentPage(1);
-  }, [data?.credentials.length, credentialSearch, credentialFilter, credentialSortKey, credentialSortDirection]);
+  }, [data?.credentials.length, credentialSearch, credentialFilter, credentialSortKey, credentialSortDirection, groupFilter]);
 
   useEffect(() => {
     if (currentPage > totalPages) setCurrentPage(totalPages);
@@ -550,6 +562,27 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const toggleDarkMode = () => {
     setDarkMode(!darkMode);
     document.documentElement.classList.toggle("dark");
+  };
+
+  const handleUpdateAdminKey = async (event: FormEvent) => {
+    event.preventDefault();
+    const key = newAdminKey.trim();
+    if (!key) {
+      toast.error("请输入新的登录 API Key");
+      return;
+    }
+    setUpdatingAdminKey(true);
+    try {
+      await updateAdminKey({ newKey: key });
+      storage.setApiKey(key);
+      toast.success("登录 API Key 已更新");
+      setAdminKeyDialogOpen(false);
+      setNewAdminKey("");
+    } catch (error) {
+      toast.error(extractErrorMessage(error));
+    } finally {
+      setUpdatingAdminKey(false);
+    }
   };
 
   const handleRefresh = () => {
@@ -1057,12 +1090,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         toast.warning("勾选的凭据中没有可导出的（缺少 refreshToken）");
         return;
       }
-      const payload = {
-        version: "1.0",
-        exportedAt: new Date().toISOString(),
-        accounts: normalizedAccounts,
-      };
-      const json = JSON.stringify(payload, null, 2);
+      const json = JSON.stringify(normalizedAccounts, null, 2);
       const blob = new Blob([json], { type: "application/json" });
       const url = URL.createObjectURL(blob);
       const ts = new Date()

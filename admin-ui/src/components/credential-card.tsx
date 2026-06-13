@@ -14,6 +14,7 @@ import {
   Clock,
   ScrollText,
   Boxes,
+  FlaskConical,
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -43,13 +44,14 @@ import { maskProxyUrl, extractErrorMessage, overageFailureMessage } from "@/lib/
 import {
   useSetDisabled,
   useSetPriority,
+  useSetMaxInFlight,
   useResetFailure,
   useDeleteCredential,
   useForceRefreshToken,
   useResetSuccessCount,
   useClearThrottle,
 } from "@/hooks/use-credentials";
-import { setCredentialOverage } from "@/api/credentials";
+import { setCredentialOverage, testCredentialModel } from "@/api/credentials";
 import { useQueryClient } from "@tanstack/react-query";
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
@@ -218,6 +220,10 @@ export function CredentialCard({
   const [priorityValue, setPriorityValue] = useState(
     String(credential.priority),
   );
+  const [editingMaxInFlight, setEditingMaxInFlight] = useState(false);
+  const [maxInFlightValue, setMaxInFlightValue] = useState(
+    credential.maxInFlight != null ? String(credential.maxInFlight) : "",
+  );
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
   const [showEditDialog, setShowEditDialog] = useState(false);
   const [showUpdateTokenDialog, setShowUpdateTokenDialog] = useState(false);
@@ -227,6 +233,7 @@ export function CredentialCard({
 
   const setDisabled = useSetDisabled();
   const setPriority = useSetPriority();
+  const setMaxInFlight = useSetMaxInFlight();
   const resetFailure = useResetFailure();
   const deleteCredential = useDeleteCredential();
   const forceRefresh = useForceRefreshToken();
@@ -276,6 +283,26 @@ export function CredentialCard({
     });
   }, [clearThrottle, credential.id]);
   const [overageBusy, setOverageBusy] = useState(false);
+  const [testingModel, setTestingModel] = useState(false);
+  const handleTestModel = async () => {
+    setTestingModel(true);
+    try {
+      const res = await testCredentialModel(credential.id);
+      if (res.ok) {
+        toast.success(
+          `#${credential.id} 模型测试成功：${res.model} · ${res.endpoint} · ${res.status} · ${formatMs(res.elapsedMs)}`,
+        );
+      } else {
+        toast.error(
+          `#${credential.id} 模型测试失败：${res.status ?? "网络"} · ${res.error || "未知错误"}`,
+        );
+      }
+    } catch (err) {
+      toast.error("模型测试失败: " + extractErrorMessage(err));
+    } finally {
+      setTestingModel(false);
+    }
+  };
   const handleSetOverage = async (enabled: boolean) => {
     setOverageBusy(true);
     try {
@@ -320,6 +347,26 @@ export function CredentialCard({
         onSuccess: (res) => {
           toast.success(res.message);
           setEditingPriority(false);
+        },
+        onError: (err) => toast.error("操作失败: " + (err as Error).message),
+      },
+    );
+  };
+
+  const handleMaxInFlightChange = () => {
+    const raw = maxInFlightValue.trim();
+    // 空值 = 清除覆盖、回退档位默认
+    const next: number | null = raw === "" ? null : parseInt(raw, 10);
+    if (next !== null && (isNaN(next) || next < 1)) {
+      toast.error("并发上限必须是 ≥1 的整数，留空则回退账号档位默认");
+      return;
+    }
+    setMaxInFlight.mutate(
+      { id: credential.id, maxInFlight: next },
+      {
+        onSuccess: (res) => {
+          toast.success(res.message);
+          setEditingMaxInFlight(false);
         },
         onError: (err) => toast.error("操作失败: " + (err as Error).message),
       },
@@ -559,6 +606,65 @@ export function CredentialCard({
               </dd>
             </div>
             <div className="flex min-w-0 items-center justify-between gap-2">
+              <dt className="shrink-0 text-muted-foreground">并发上限</dt>
+              <dd className="min-w-0">
+                {editingMaxInFlight ? (
+                  <div className="inline-flex max-w-full items-center gap-1">
+                    <Input
+                      type="number"
+                      value={maxInFlightValue}
+                      onChange={(e) => setMaxInFlightValue(e.target.value)}
+                      className="w-16 h-7 text-sm rounded-md"
+                      min="1"
+                      placeholder="默认"
+                    />
+                    <Button
+                      size="icon"
+                      variant="ghost"
+                      className="h-7 w-7"
+                      onClick={handleMaxInFlightChange}
+                      disabled={setMaxInFlight.isPending}
+                    >
+                      ✓
+                    </Button>
+                    <Button
+                      size="icon"
+                      variant="ghost"
+                      className="h-7 w-7"
+                      onClick={() => {
+                        setEditingMaxInFlight(false);
+                        setMaxInFlightValue(
+                          credential.maxInFlight != null
+                            ? String(credential.maxInFlight)
+                            : "",
+                        );
+                      }}
+                    >
+                      ✕
+                    </Button>
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    className="inline-flex cursor-pointer items-center gap-1 rounded px-1.5 py-0.5 font-medium tabular-nums transition-colors hover:bg-accent hover:text-primary"
+                    onClick={() => setEditingMaxInFlight(true)}
+                    title="点击编辑该凭据并发上限；留空则跟随账号档位默认"
+                  >
+                    {credential.maxInFlight != null ? (
+                      <span>{credential.maxInFlight}</span>
+                    ) : (
+                      <span className="text-muted-foreground">
+                        默认{credential.effectiveMaxInFlight != null
+                          ? ` (${credential.effectiveMaxInFlight})`
+                          : ""}
+                      </span>
+                    )}
+                    <Pencil className="h-3 w-3 opacity-70" />
+                  </button>
+                )}
+              </dd>
+            </div>
+            <div className="flex min-w-0 items-center justify-between gap-2">
               <dt className="shrink-0 text-muted-foreground">失败次数</dt>
               <dd className="min-w-0">
                 <button
@@ -785,6 +891,17 @@ export function CredentialCard({
                     {formatResetDate(balance.nextResetAt)}
                   </span>
                 </div>
+                {balance.accountEmail && (
+                  <div className="break-words text-[11px] text-muted-foreground">
+                    上游账号：
+                    <span
+                      className="font-medium text-foreground"
+                      title={balance.accountUserId || undefined}
+                    >
+                      {balance.accountEmail}
+                    </span>
+                  </div>
+                )}
               </div>
             ) : (
               <div className="flex flex-1 items-center justify-center text-center text-[13px] text-muted-foreground">
@@ -795,7 +912,7 @@ export function CredentialCard({
 
           {/* 操作区 */}
           <div className="mt-auto grid grid-cols-2 gap-2 border-t border-border/50 pt-3 min-[420px]:flex min-[420px]:flex-col min-[560px]:flex-row min-[560px]:items-center min-[560px]:justify-between">
-            <div className="grid min-w-0 grid-cols-3 gap-1 col-span-2 min-[420px]:col-span-1 min-[420px]:flex min-[420px]:items-center">
+            <div className="grid min-w-0 grid-cols-4 gap-1 col-span-2 min-[420px]:col-span-1 min-[420px]:flex min-[420px]:items-center">
               <Button
                 ref={setActivatorNodeRef}
                 size="icon"
@@ -844,6 +961,21 @@ export function CredentialCard({
                   className={`h-3.5 w-3.5 ${loadingBalance ? "animate-spin" : ""}`}
                 />
                 <span className="hidden sm:inline">刷新余额</span>
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="w-full px-2 min-[420px]:w-auto min-[420px]:px-3"
+                onClick={handleTestModel}
+                disabled={testingModel || credential.disabled}
+                title={credential.disabled ? "已禁用" : "用该凭据真实调用一次测试模型"}
+              >
+                {testingModel ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <FlaskConical className="h-3.5 w-3.5" />
+                )}
+                <span className="hidden sm:inline">测试模型</span>
               </Button>
             </div>
 

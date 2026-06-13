@@ -74,6 +74,7 @@ interface VerificationResult {
 export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps) {
   const [jsonInput, setJsonInput] = useState('')
   const [importing, setImporting] = useState(false)
+  const [allowSameAccount, setAllowSameAccount] = useState(false)
   const [progress, setProgress] = useState({ current: 0, total: 0 })
   const [currentProcessing, setCurrentProcessing] = useState<string>('')
   const [results, setResults] = useState<VerificationResult[]>([])
@@ -173,6 +174,34 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     return [parsed as CredentialInput]
   }
 
+  const extractApiKeyLines = (text: string): CredentialInput[] => {
+    return text
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(line => line && !line.startsWith('#'))
+      .map(line => {
+        const tokens = line.split(/[\s,;]+/).map(t => t.trim()).filter(t => t)
+        return tokens.find(t => t.startsWith('ksk_')) || ''
+      })
+      .filter(key => key.startsWith('ksk_'))
+      .map((kiroApiKey, index) => ({
+        authMethod: 'api_key',
+        kiroApiKey,
+        email: `api-key-${index + 1}`,
+      }))
+  }
+
+  const parseImportText = (text: string): CredentialInput[] => {
+    try {
+      const parsed = JSON.parse(text)
+      return extractCredentialItems(parsed).map(normalizeCredential)
+    } catch (error) {
+      const apiKeys = extractApiKeyLines(text)
+      if (apiKeys.length > 0) return apiKeys
+      throw error
+    }
+  }
+
   const handleFileImport = async (event: ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(event.target.files ?? [])
     event.target.value = ''
@@ -182,8 +211,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       const imported: CredentialInput[] = []
       for (const file of files) {
         const text = await file.text()
-        const parsed = JSON.parse(text)
-        imported.push(...extractCredentialItems(parsed).map(normalizeCredential))
+        imported.push(...parseImportText(text))
       }
 
       if (imported.length === 0) {
@@ -199,13 +227,12 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
   }
 
   const handleBatchImport = async () => {
-    // 先单独解析 JSON，给出精准的错误提示
+    // 支持 JSON，也支持一行一个 ksk_ API Key 的纯文本
     let credentials: CredentialInput[]
     try {
-      const parsed = JSON.parse(jsonInput)
-      credentials = extractCredentialItems(parsed).map(normalizeCredential)
+      credentials = parseImportText(jsonInput).map(normalizeCredential)
     } catch (error) {
-      toast.error('JSON 格式错误: ' + extractErrorMessage(error))
+      toast.error('格式错误：请上传/粘贴 JSON，或一行一个 ksk_ API Key。' + extractErrorMessage(error))
       return
     }
 
@@ -365,6 +392,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               proxyUrl: cred.proxyUrl?.trim() || undefined,
               proxyUsername: cred.proxyUsername?.trim() || undefined,
               proxyPassword: cred.proxyPassword?.trim() || undefined,
+              allowSameAccount,
             })
 
             addedCredId = addedCred.credentialId
@@ -425,6 +453,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             proxyUrl: cred.proxyUrl?.trim() || undefined,
             proxyUsername: cred.proxyUsername?.trim() || undefined,
             proxyPassword: cred.proxyPassword?.trim() || undefined,
+            allowSameAccount,
           })
 
           addedCredId = addedCred.credentialId
@@ -452,6 +481,25 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             return newResults
           })
         } catch (error) {
+          const errMsg = extractErrorMessage(error)
+          // 后端账号级去重：不同 key 但属于同一上游账户。后端已自行回滚，
+          // 这里归类为"重复"而非"失败"。
+          if (errMsg.includes('已存在') || errMsg.includes('重复')) {
+            duplicateCount++
+            setResults(prev => {
+              const newResults = [...prev]
+              newResults[i] = {
+                ...newResults[i],
+                status: 'duplicate',
+                error: errMsg,
+                email: undefined,
+              }
+              return newResults
+            })
+            setProgress({ current: i + 1, total: credentials.length })
+            continue
+          }
+
           // 验活失败，尝试回滚（先禁用再删除）
           let rollbackStatus: VerificationResult['rollbackStatus'] = 'skipped'
           let rollbackError: string | undefined
@@ -476,7 +524,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             newResults[i] = {
               ...newResults[i],
               status: 'failed',
-              error: extractErrorMessage(error),
+              error: errMsg,
               email: undefined,
               rollbackStatus,
               rollbackError,
@@ -565,7 +613,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               JSON 格式凭据
             </label>
             <textarea
-              placeholder={'粘贴 JSON 格式的凭据（支持单个对象、数组，或 KAM 导出的 {accounts:[...]}）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\n也支持 refresh_token / client_id / client_secret 等 snake_case 字段\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\n支持 region 字段自动映射为 authRegion'}
+              placeholder={'粘贴 JSON 格式的凭据（支持单个对象、数组，或 KAM 导出的 {accounts:[...]}）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\n也支持 refresh_token / client_id / client_secret 等 snake_case 字段\nAPI Key JSON: [{"kiroApiKey":"ksk_xxx"}]\nAPI Key TXT: 一行一个 ksk_...\n\n支持 region 字段自动映射为 authRegion'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}
@@ -574,7 +622,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             <div className="flex flex-wrap items-center gap-2">
               <Button type="button" variant="outline" size="sm" disabled={importing} asChild>
                 <label className="cursor-pointer">
-                  选择 JSON 文件批量导入
+                  选择 JSON/TXT 文件批量导入
                   <input
                     type="file"
                     accept=".json,.txt,application/json,text/plain"
@@ -585,9 +633,21 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
                 </label>
               </Button>
               <p className="text-xs text-muted-foreground">
-                💡 支持多文件、数组、单对象、KAM accounts；导入时自动验活，失败的凭据会被排除
+                💡 支持多文件、数组、单对象、KAM accounts、TXT 一行一个 ksk_；导入时自动验活，失败的凭据会被排除
               </p>
             </div>
+            <label className="flex cursor-pointer items-start gap-2 text-xs text-muted-foreground">
+              <input
+                type="checkbox"
+                className="mt-0.5"
+                checked={allowSameAccount}
+                disabled={importing}
+                onChange={(e) => setAllowSameAccount(e.target.checked)}
+              />
+              <span>
+                允许同一上游账户的多把 key（默认关闭：不同 key 但属于同一个 Kiro 账户会被账号级去重拒绝。除非你确实需要同账户多 key，否则建议保持关闭。）
+              </span>
+            </label>
           </div>
 
           {(importing || results.length > 0) && (

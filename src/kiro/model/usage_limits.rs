@@ -36,6 +36,10 @@ pub struct UserInfo {
     /// 账号邮箱
     #[serde(default)]
     pub email: Option<String>,
+
+    /// 上游账号唯一 ID（用于识别不同 API Key 是否属于同一账户）
+    #[serde(default)]
+    pub user_id: Option<String>,
 }
 
 /// 订阅信息
@@ -181,6 +185,14 @@ impl UsageLimitsResponse {
         self.user_info
             .as_ref()
             .and_then(|info| info.email.as_deref())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// 获取上游账号唯一 ID（用于识别不同 API Key 是否属于同一账户）
+    pub fn user_id(&self) -> Option<&str> {
+        self.user_info
+            .as_ref()
+            .and_then(|info| info.user_id.as_deref())
             .filter(|s| !s.is_empty())
     }
 

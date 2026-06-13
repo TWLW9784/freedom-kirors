@@ -3,6 +3,7 @@ import {
   getCredentials,
   setCredentialDisabled,
   setCredentialPriority,
+  setCredentialMaxInFlight,
   resetCredentialFailure,
   forceRefreshToken,
   clearThrottle,
@@ -16,6 +17,8 @@ import {
   setLoadBalancingMode,
   getAccountThrottleConfig,
   setAccountThrottleConfig,
+  getConcurrencyConfig,
+  setConcurrencyConfig,
   getLogGovernanceConfig,
   setLogGovernanceConfig,
   resetSuccessCount,
@@ -70,6 +73,18 @@ export function useSetPriority() {
   return useMutation({
     mutationFn: ({ id, priority }: { id: number; priority: number }) =>
       setCredentialPriority(id, priority),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 设置凭据级最大并发（null = 清除覆盖、回退档位默认）
+export function useSetMaxInFlight() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, maxInFlight }: { id: number; maxInFlight: number | null }) =>
+      setCredentialMaxInFlight(id, maxInFlight),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
@@ -211,6 +226,25 @@ export function useSetAccountThrottleConfig() {
     mutationFn: setAccountThrottleConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['accountThrottleConfig'] })
+    },
+  })
+}
+
+// 获取档位并发配置
+export function useConcurrencyConfig() {
+  return useQuery({
+    queryKey: ['concurrencyConfig'],
+    queryFn: getConcurrencyConfig,
+  })
+}
+
+// 更新档位并发配置
+export function useSetConcurrencyConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setConcurrencyConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['concurrencyConfig'] })
     },
   })
 }

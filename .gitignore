@@ -31,3 +31,9 @@
 .ace-tool/
 .codegraph/
 .claude/
+# Local deployment/runtime secrets and backups
+/api_keys.json
+/proxy_pool.json
+/config.json.*
+/kiro_balance_cache.json.*
+/traces.db.*

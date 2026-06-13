@@ -165,6 +165,8 @@ async fn main() {
         endpoints,
         config.default_endpoint.clone(),
     );
+    // 取 account 限流器共享句柄，供 admin 可观测读取实时限流状态（provider 随后被 move 进路由）。
+    let account_limiters_handle = kiro_provider.account_limiters();
 
     // 初始化 count_tokens 配置
     token::init_config(token::CountTokensConfig {
@@ -291,7 +293,8 @@ async fn main() {
                     .with_log_governance(
                         Some(admin_trace_store.clone()),
                         Some(usage_recorder.clone()),
-                    );
+                    )
+                    .with_account_limiters(Some(account_limiters_handle.clone()));
             let admin_state = admin::AdminState::new(
                 admin_key,
                 admin_service,

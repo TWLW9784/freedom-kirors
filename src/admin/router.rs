@@ -10,21 +10,22 @@ use super::{
         add_credential, add_proxy, apply_image_update, assign_proxies_round_robin,
         assign_proxy_to_credential, batch_add_proxies, check_all_proxies, check_proxy,
         check_rate_limit, check_update, clear_throttle, complete_social_login,
-        complete_social_relogin, create_client_key, delete_client_key, delete_credential,
-        delete_proxy, disable_quota_exceeded, enable_overage_all, expand_credential_profiles,
-        export_credentials, force_refresh_token, get_account_throttle_config, get_all_credentials,
-        get_credential_balance, get_credential_models, get_global_proxy, get_load_balancing_mode,
-        get_log_governance_config, get_proxy_pool, get_update_config, list_client_keys,
-        list_traces, poll_idc_login, poll_idc_relogin, poll_social_login, poll_social_relogin,
-        pull_update_image, reset_all_success_count, reset_client_key_stats, reset_failure_count,
-        reset_success_count, rollback_image_update, set_account_throttle_config,
-        set_client_key_disabled, set_credential_disabled, set_credential_overage,
+        complete_social_relogin, create_client_key, create_group, delete_client_key,
+        delete_credential, delete_group, delete_proxy, disable_quota_exceeded,
+        enable_overage_all, expand_credential_profiles, export_credentials, force_refresh_token, get_account_throttle_config, get_all_credentials,
+        get_concurrency_config, get_credential_balance, get_credential_models, get_global_proxy,
+        get_load_balancing_mode, get_log_governance_config, get_proxy_pool, get_update_config,
+        limiter_snapshots, list_client_keys, list_groups, list_traces, poll_idc_login, poll_idc_relogin,
+        poll_social_login, poll_social_relogin, pull_update_image, reset_all_success_count,
+        reset_client_key_stats, reset_failure_count, reset_success_count, rollback_image_update,
+        set_account_throttle_config, set_client_key_disabled, set_concurrency_config,
+        set_credential_disabled, set_credential_max_in_flight, set_credential_overage,
         set_credential_priority, set_global_proxy, set_load_balancing_mode,
         set_log_governance_config, set_proxy_enabled, set_update_config, start_idc_login,
         start_idc_relogin, start_social_login, start_social_relogin, stats_by_credential,
-        stats_by_model, stats_overview, stats_timeseries, trace_failure_stats, trace_recent_stats,
-        update_admin_key, update_api_key, update_client_key, update_credential,
-        update_refresh_token,
+        stats_by_model, stats_overview, stats_timeseries, test_credential_model,
+        trace_failure_stats, trace_recent_stats, update_admin_key,
+        update_client_key, update_credential, update_group, update_refresh_token,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -62,6 +63,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         )
         .route("/credentials/{id}/disabled", post(set_credential_disabled))
         .route("/credentials/{id}/priority", post(set_credential_priority))
+        .route(
+            "/credentials/{id}/max-in-flight",
+            post(set_credential_max_in_flight),
+        )
         .route("/credentials/{id}/reset", post(reset_failure_count))
         .route("/credentials/{id}/clear-throttle", post(clear_throttle))
         .route("/credentials/{id}/reset-stats", post(reset_success_count))
@@ -75,6 +80,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/refresh", post(force_refresh_token))
         .route("/credentials/{id}/refresh-token", put(update_refresh_token))
         .route("/credentials/{id}/balance", get(get_credential_balance))
+        .route("/credentials/{id}/test-model", post(test_credential_model))
         .route("/credentials/{id}/models", get(get_credential_models))
         .route(
             "/credentials/{id}/profiles/expand",
@@ -98,6 +104,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/account-throttle",
             get(get_account_throttle_config).put(set_account_throttle_config),
+        )
+        .route(
+            "/config/concurrency",
+            get(get_concurrency_config).put(set_concurrency_config),
         )
         .route(
             "/config/log-governance",
@@ -153,6 +163,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/client-keys/{id}",
             delete(delete_client_key).put(update_client_key),
         )
+        .route("/groups", get(list_groups).post(create_group))
+        .route("/groups/{name}", delete(delete_group).patch(update_group))
         .route("/client-keys/{id}/disabled", post(set_client_key_disabled))
         .route(
             "/client-keys/{id}/reset-stats",
@@ -164,7 +176,17 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/stats/by-credential", get(stats_by_credential))
         .route("/traces/failure-stats", get(trace_failure_stats))
         .route("/traces/recent-stats", get(trace_recent_stats))
+        .route("/limiter/snapshots", get(limiter_snapshots))
         .route("/traces", get(list_traces))
+        .route("/stress-test/start", post(super::handlers::start_stress_test))
+        .route(
+            "/stress-test/{session_id}/status",
+            get(super::handlers::stress_test_status),
+        )
+        .route(
+            "/stress-test/{session_id}/stop",
+            post(super::handlers::stop_stress_test),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,

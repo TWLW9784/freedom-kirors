@@ -610,7 +610,7 @@ pub async fn post_messages(
         tracing::info!(
             "detected mixed tools containing web_search, entering the web_search agentic loop"
         );
-        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream)
+        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream, key_ctx.group.clone())
             .await;
     }
 
@@ -756,7 +756,7 @@ async fn handle_stream_request(
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
-        .call_api_stream(request_body, Some(tracer.as_ref()))
+        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
         .await
     {
         Ok(resp) => resp,
@@ -768,6 +768,7 @@ async fn handle_stream_request(
                 last_attempt_outcome(&tracer),
                 Some(&e.to_string()),
                 None,
+            TraceUsage::zero(),
             );
             return map_provider_error(e);
         }
@@ -977,6 +978,7 @@ async fn handle_non_stream_request(
                 last_attempt_outcome(&tracer),
                 Some(&e.to_string()),
                 None,
+            TraceUsage::zero(),
             );
             return map_provider_error(e);
         }
@@ -1389,7 +1391,7 @@ pub async fn post_messages_cc(
         tracing::info!(
             "detected mixed tools containing web_search, entering the web_search agentic loop"
         );
-        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream)
+        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream, key_ctx.group.clone())
             .await;
     }
 
@@ -1537,7 +1539,7 @@ async fn handle_stream_request_buffered(
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
-        .call_api_stream(request_body, Some(tracer.as_ref()))
+        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
         .await
     {
         Ok(resp) => resp,
@@ -1548,6 +1550,7 @@ async fn handle_stream_request_buffered(
                 last_attempt_outcome(&tracer),
                 Some(&e.to_string()),
                 None,
+            TraceUsage::zero(),
             );
             return map_provider_error(e);
         }

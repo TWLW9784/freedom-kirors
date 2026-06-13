@@ -1,7 +1,7 @@
 import { forwardRef, useEffect, useState, type ComponentPropsWithoutRef } from 'react'
 import {
   Activity, RefreshCw, UploadCloud, Settings, Key, Wand2, Eye, EyeOff, Copy,
-  MoreHorizontal, ShieldAlert, ShieldCheck,
+  MoreHorizontal, ShieldAlert, ShieldCheck, Gauge,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -24,6 +24,7 @@ import { useUpdateCheck } from '@/hooks/use-update-check'
 import { updateAdminKey } from '@/api/credentials'
 import { extractErrorMessage, generateApiKey } from '@/lib/utils'
 import { ImageUpdateDialog } from '@/components/image-update-dialog'
+import { ConcurrencyConfigDialog } from '@/components/concurrency-config-dialog'
 
 /**
  * 顶栏右侧通用工具栏：负载均衡切换、刷新、在线更新、设置（Key 管理）。
@@ -44,6 +45,8 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
   const { data: updateCheck } = useUpdateCheck()
 
   const [imageUpdateOpen, setImageUpdateOpen] = useState(false)
+  const [concurrencyOpen, setConcurrencyOpen] = useState(false)
+
   const [keyDialogOpen, setKeyDialogOpen] = useState(false)
   const [newKey, setNewKey] = useState('')
   const [showPlain, setShowPlain] = useState(false)
@@ -111,6 +114,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     isSettingThrottle,
     loadBalancingMode: loadBalancingData?.mode,
     openImageUpdate: () => setImageUpdateOpen(true),
+    openConcurrency: () => setConcurrencyOpen(true),
     openKeyDialog,
     throttleConfig,
     updateCheck,
@@ -126,6 +130,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     <>
       {compact ? <CompactTools controls={controls} /> : <FullTools controls={controls} />}
       <ImageUpdateDialog open={imageUpdateOpen} onOpenChange={setImageUpdateOpen} />
+      <ConcurrencyConfigDialog open={concurrencyOpen} onOpenChange={setConcurrencyOpen} />
 
       <Dialog
         open={keyDialogOpen}
@@ -231,6 +236,7 @@ interface ToolControls {
   isSettingThrottle: boolean
   loadBalancingMode?: 'priority' | 'balanced'
   openImageUpdate: () => void
+  openConcurrency: () => void
   openKeyDialog: () => void
   throttleConfig?: { failover: boolean; cooldownSecs: number }
   updateCheck?: { hasUpdate: boolean; latestVersion: string; currentVersion: string }
@@ -248,6 +254,7 @@ function FullTools({ controls }: { controls: ToolControls }) {
         onToggleFailover={controls.handleToggleFailover}
         onChangeCooldown={controls.updateCooldown}
       />
+      <ConcurrencyButton onOpen={controls.openConcurrency} />
       <RefreshButton onRefresh={controls.handleRefresh} />
       <ImageUpdateButton controls={controls} />
       <KeySettingsMenu onOpenKeyDialog={controls.openKeyDialog} />
@@ -290,6 +297,9 @@ function CompactTools({ controls }: { controls: ToolControls }) {
         <DropdownMenuItem onSelect={controls.openImageUpdate}>
           <UploadCloud />镜像在线更新
         </DropdownMenuItem>
+        <DropdownMenuItem onSelect={controls.openConcurrency}>
+          <Gauge />全局并发档位默认
+        </DropdownMenuItem>
         <ThrottleCompactItems {...throttleProps} />
         <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
         <DropdownMenuItem onSelect={controls.openKeyDialog}>
@@ -317,6 +327,15 @@ function LoadBalancingButton({ controls }: { controls: ToolControls }) {
             ? '优先级'
             : '均衡负载'}
       </span>
+    </Button>
+  )
+}
+
+function ConcurrencyButton({ onOpen }: { onOpen: () => void }) {
+  return (
+    <Button variant="outline" size="sm" onClick={onOpen} title="全局并发档位默认">
+      <Gauge className="h-3.5 w-3.5" />
+      <span className="hidden md:inline">并发档位</span>
     </Button>
   )
 }

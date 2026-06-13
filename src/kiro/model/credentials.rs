@@ -15,6 +15,20 @@ pub const BUILDER_ID_PROFILE_ARN: &str =
 pub const SOCIAL_PROFILE_ARN: &str =
     "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
 
+/// 凭据并发档位。
+///
+/// 用于在凭据未显式设置 `max_in_flight` 时，按账号类型回退到不同的默认并发与间隔。
+/// 档位对应的具体数值由 [`crate::model::config::Config`] 持有，运行时可调。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountTier {
+    /// 企业 / IdC 账号：官方限额最高。
+    Enterprise,
+    /// Pro / Pro+ 订阅：居中。
+    Pro,
+    /// Free / Google / Github social：限额最低。
+    Basic,
+}
+
 /// Kiro OAuth 凭证
 ///
 /// `Debug` 输出经过脱敏处理：access_token / refresh_token / client_secret /
@@ -140,6 +154,22 @@ pub struct KiroCredentials {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
+
+    /// 凭据级最大并发上限（同一 profile 同时允许的上游请求数）。
+    ///
+    /// `None` 时按账号档位回退到全局默认（企业 > Pro/Pro+ > Free/social）。
+    /// 显式设置后覆盖档位默认；自适应降并发仍可能在运行时把实际并发压到更低。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_in_flight: Option<usize>,
+
+    /// 凭据级最小请求间隔（毫秒）。
+    ///
+    /// `None` 时按账号档位回退到全局默认（Enterprise 300ms / Pro 800ms / Basic 1800ms）。
+    /// 显式设置为 0 可完全关闭间隔限制。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_interval_ms: Option<u64>,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -184,8 +214,10 @@ impl std::fmt::Debug for KiroCredentials {
             .field("disabled", &self.disabled)
             .field("kiro_api_key", &fmt_redacted(&self.kiro_api_key))
             .field("endpoint", &self.endpoint)
-            .field("groups", &self.groups)
+.field("groups", &self.groups)
             .field("source_channel", &self.source_channel)
+            .field("max_in_flight", &self.max_in_flight)
+            .field("min_interval_ms", &self.min_interval_ms)
             .finish()
     }
 }
@@ -405,6 +437,49 @@ impl KiroCredentials {
         }
     }
 
+    /// 推断凭据所属的并发档位。
+    ///
+    /// 用于在凭据未显式设置 `max_in_flight` 时，按账号类型回退到不同的默认并发：
+    /// 企业/IdC 账号官方限额最高 → `Enterprise`；
+    /// Pro / Pro+ 订阅居中 → `Pro`；
+    /// Free / Google / Github social 限额最低 → `Basic`。
+    pub fn account_tier(&self) -> AccountTier {
+        // Enterprise / IdC（且非 social）= 最高档
+        let is_enterprise_or_idc = self
+            .provider
+            .as_deref()
+            .map(|p| p.eq_ignore_ascii_case("enterprise"))
+            .unwrap_or(false)
+            || self
+                .auth_method
+                .as_deref()
+                .map(|m| m.eq_ignore_ascii_case("idc"))
+                .unwrap_or(false);
+        if is_enterprise_or_idc && !self.is_social_login() {
+            return AccountTier::Enterprise;
+        }
+
+        // 订阅标题含 PRO（且非 FREE）= 中档；social / free = 低档
+        match self.subscription_title.as_deref() {
+            Some(title) => {
+                let upper = title.to_uppercase();
+                if upper.contains("PRO") && !upper.contains("FREE") {
+                    AccountTier::Pro
+                } else {
+                    AccountTier::Basic
+                }
+            }
+            None => {
+                // 无订阅信息：social 归低档，其余暂归中档（首次取号后会被订阅信息校正）
+                if self.is_social_login() {
+                    AccountTier::Basic
+                } else {
+                    AccountTier::Pro
+                }
+            }
+        }
+    }
+
     /// 检查是否为 API Key 凭据
     ///
     /// API Key 凭据直接使用 kiro_api_key 作为 Bearer Token，无需 refreshToken
@@ -515,7 +590,6 @@ mod tests {
             start_url: None,
             client_id: None,
             client_secret: None,
-            start_url: None,
             priority: 0,
             region: None,
             auth_region: None,
@@ -529,8 +603,10 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
-            groups: vec![],
+groups: vec![],
             source_channel: None,
+            max_in_flight: None,
+            min_interval_ms: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -707,7 +783,6 @@ mod tests {
             start_url: None,
             client_id: None,
             client_secret: None,
-            start_url: None,
             priority: 0,
             region: Some("eu-west-1".to_string()),
             auth_region: None,
@@ -721,8 +796,10 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
-            groups: vec![],
+groups: vec![],
             source_channel: None,
+            max_in_flight: None,
+            min_interval_ms: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -743,7 +820,6 @@ mod tests {
             start_url: None,
             client_id: None,
             client_secret: None,
-            start_url: None,
             priority: 0,
             region: None,
             auth_region: None,
@@ -757,8 +833,10 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
-            groups: vec![],
+groups: vec![],
             source_channel: None,
+            max_in_flight: None,
+            min_interval_ms: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -862,7 +940,6 @@ mod tests {
             start_url: None,
             client_id: None,
             client_secret: None,
-            start_url: None,
             priority: 3,
             region: Some("us-west-2".to_string()),
             auth_region: None,
@@ -876,8 +953,10 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
-            groups: vec![],
+groups: vec![],
             source_channel: None,
+            max_in_flight: None,
+            min_interval_ms: None,
         };
 
         let json = original.to_pretty_json().unwrap();

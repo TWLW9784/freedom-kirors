@@ -4,6 +4,7 @@ import type {
   CredentialsStatusResponse,
   BalanceResponse,
   AvailableModelsResponse,
+  TestCredentialModelResponse,
   ExpandProfilesResponse,
   SuccessResponse,
   SetDisabledRequest,
@@ -116,6 +117,18 @@ export async function exportKamCredentials(
   return data
 }
 
+export async function testCredentialModel(
+  id: number,
+  model = 'claude-opus-4.8'
+): Promise<TestCredentialModelResponse> {
+  const { data } = await api.post<TestCredentialModelResponse>(
+    `/credentials/${id}/test-model`,
+    { model, prompt: 'ping', maxTokens: 4 },
+    { timeout: 180000 }
+  )
+  return data
+}
+
 // 设置凭据禁用状态
 export async function setCredentialDisabled(
   id: number,
@@ -136,6 +149,18 @@ export async function setCredentialPriority(
   const { data } = await api.post<SuccessResponse>(
     `/credentials/${id}/priority`,
     { priority } as SetPriorityRequest
+  )
+  return data
+}
+
+// 设置凭据级最大并发（传 null 清除覆盖、回退账号档位默认）
+export async function setCredentialMaxInFlight(
+  id: number,
+  maxInFlight: number | null
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/${id}/max-in-flight`,
+    { maxInFlight }
   )
   return data
 }
@@ -343,6 +368,31 @@ export async function setAccountThrottleConfig(
   patch: Partial<AccountThrottleConfig>,
 ): Promise<AccountThrottleConfig> {
   const { data } = await api.put<AccountThrottleConfig>('/config/account-throttle', patch)
+  return data
+}
+
+// 档位并发配置（企业/Pro/Basic 默认并发 + 间隔 + 自适应开关）
+export interface ConcurrencyConfig {
+  tierMaxInFlightEnterprise: number
+  tierMaxInFlightPro: number
+  tierMaxInFlightBasic: number
+  tierMinIntervalMsEnterprise: number
+  tierMinIntervalMsPro: number
+  tierMinIntervalMsBasic: number
+  adaptiveConcurrencyEnabled: boolean
+}
+
+// 获取档位并发配置
+export async function getConcurrencyConfig(): Promise<ConcurrencyConfig> {
+  const { data } = await api.get<ConcurrencyConfig>('/config/concurrency')
+  return data
+}
+
+// 更新档位并发配置（运行时即时生效并持久化）
+export async function setConcurrencyConfig(
+  patch: Partial<ConcurrencyConfig>,
+): Promise<ConcurrencyConfig> {
+  const { data } = await api.put<ConcurrencyConfig>('/config/concurrency', patch)
   return data
 }
 

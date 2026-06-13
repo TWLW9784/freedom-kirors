@@ -43,6 +43,12 @@ export interface CredentialStatusItem {
   groups?: string[]
   /** 账号来源渠道（纯备注） */
   sourceChannel?: string
+  /** 凭据级最大并发覆盖（null/缺省表示跟随账号档位默认） */
+  maxInFlight?: number | null
+  /** 凭据级最小请求间隔覆盖（毫秒；缺省表示跟随账号档位默认） */
+  minIntervalMs?: number | null
+  /** 实际生效的最大并发（凭据覆盖 ?? 档位默认） */
+  effectiveMaxInFlight?: number
   /** 后端缓存的最近一次余额（5 分钟内） */
   balance?: BalanceResponse
   /** 余额缓存的更新时间（Unix 秒） */
@@ -64,6 +70,10 @@ export interface BalanceResponse {
   overageCapable?: boolean
   /** 上游 overageCapability 原始字符串，用于排查"未知"状态 */
   overageCapabilityRaw?: string
+  /** 上游账号邮箱（用于识别多个 key 是否属于同一账户） */
+  accountEmail?: string
+  /** 上游账号唯一 ID（用于识别多个 key 是否属于同一账户） */
+  accountUserId?: string
 }
 
 // 某凭据当前可用的模型列表响应
@@ -78,6 +88,17 @@ export interface AvailableModelItem {
   modelName?: string
   description?: string
   maxInputTokens?: number
+}
+
+export interface TestCredentialModelResponse {
+  credentialId: number
+  ok: boolean
+  model: string
+  endpoint: string
+  status?: number | null
+  elapsedMs: number
+  responsePreview?: string | null
+  error?: string | null
 }
 
 // Profile 扫描与自动补齐响应
@@ -136,6 +157,8 @@ export interface AddCredentialRequest {
   email?: string
   groups?: string[]
   sourceChannel?: string
+  /** 允许同一上游 Kiro 账户的多把 key（默认 false，同账户会被账号级去重拒绝） */
+  allowSameAccount?: boolean
 }
 
 // 添加凭据响应
@@ -574,3 +597,42 @@ export type FailureStatsMap = Record<string, FailureStats>
 
 /** credentialId(字符串) → 最近调用概况 */
 export type RecentStatsMap = Record<string, RecentStats>
+
+/** 单个 account key 的自适应限流器实时状态 */
+export interface LimiterSnapshot {
+  key: string
+  inFlight: number
+  configured: number
+  currentLimit: number
+  probeCap: number
+  rttMinMs: number | null
+  rttCurrentMs: number | null
+  gradient: number | null
+  successCount: number
+  throttleCount: number
+  softErrorCount: number
+}
+
+// ============ 账号分组（独立实体）============
+export interface GroupItem {
+  name: string
+  description?: string
+  credentialCount: number
+  clientKeyCount: number
+  createdAt: string
+  updatedAt?: string
+}
+
+export interface GroupsResponse {
+  groups: GroupItem[]
+}
+
+export interface CreateGroupRequest {
+  name: string
+  description?: string
+}
+
+export interface UpdateGroupRequest {
+  newName?: string
+  description?: string
+}

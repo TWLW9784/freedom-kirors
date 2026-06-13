@@ -4,15 +4,23 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use std::time::Instant;
+
 use chrono::{DateTime, Duration, Timelike, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::http_client::ProxyConfig;
+use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::auth::idc::{self, BUILDER_ID_START_URL};
 use crate::kiro::auth::social;
+use crate::kiro::endpoint::{CliEndpoint, IdeEndpoint, KiroEndpoint, RequestContext};
+use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::requests::conversation::{
+    ConversationState, CurrentMessage, UserInputMessage,
+};
+use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::Config;
 
@@ -21,14 +29,15 @@ use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
     AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse, AssignProxyRequest,
     AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse, AvailableProfileItem,
-    BalanceResponse, BatchAddProxyRequest, CheckRateLimitRequest, CredentialStatusItem,
-    CredentialsExportResponse, CredentialsStatusResponse, EnableOverageAllResult,
-    ExpandProfilesResponse, ExportedAccount, ExportedCredentials, GitHubRateLimitInfo,
-    ImageUpdateResponse, LoadBalancingModeResponse, LogGovernanceConfigResponse,
-    PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry,
-    ProxyPoolResponse, QuotaExceededResult, SetAccountThrottleConfigRequest,
-    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetUpdateConfigRequest,
-    StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse,
+    BalanceResponse, BatchAddProxyRequest, CheckRateLimitRequest, ConcurrencyConfigResponse,
+    CredentialStatusItem, CredentialsExportResponse, CredentialsStatusResponse,
+    EnableOverageAllResult, ExpandProfilesResponse, ExportedAccount, ExportedCredentials,
+    GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
+    LogGovernanceConfigResponse, PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse,
+    ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult, SetAccountThrottleConfigRequest,
+    SetConcurrencyConfigRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
+    SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
+    StartSocialLoginResponse, TestCredentialModelRequest, TestCredentialModelResponse,
     UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
 };
 
@@ -117,6 +126,8 @@ pub struct AdminService {
     trace_store: Option<crate::admin::trace_db::SharedTraceStore>,
     /// 用量日志记录器（用于日志治理：保留天数运行时可改）
     usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
+    /// account 限流器注册表共享句柄（与 provider 共享，仅用于可观测读取快照）
+    account_limiters: Option<Arc<crate::kiro::rate_limit::AccountRateLimiters>>,
 }
 
 /// Social 登录会话状态
@@ -433,6 +444,7 @@ impl AdminService {
             social_sessions: Arc::new(Mutex::new(HashMap::new())),
             trace_store: None,
             usage_recorder: None,
+            account_limiters: None,
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -467,6 +479,23 @@ impl AdminService {
         self.trace_store = trace_store;
         self.usage_recorder = usage_recorder;
         self
+    }
+
+    /// 注入 account 限流器共享句柄（与 provider 共享），用于可观测读取实时限流状态。
+    pub fn with_account_limiters(
+        mut self,
+        account_limiters: Option<Arc<crate::kiro::rate_limit::AccountRateLimiters>>,
+    ) -> Self {
+        self.account_limiters = account_limiters;
+        self
+    }
+
+    /// 读取所有 account 限流器的可观测快照（不发任何上游请求）。
+    pub fn limiter_snapshots(&self) -> Vec<crate::kiro::rate_limit::LimiterSnapshot> {
+        self.account_limiters
+            .as_ref()
+            .map(|l| l.snapshots())
+            .unwrap_or_default()
     }
 
     /// 获取所有凭据状态
@@ -517,6 +546,10 @@ impl AdminService {
                     endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
                     groups: entry.groups,
                     source_channel: entry.source_channel,
+                    max_in_flight: entry.max_in_flight,
+                    min_interval_ms: entry.min_interval_ms,
+                    effective_max_in_flight: entry.effective_max_in_flight,
+                    effective_min_interval_ms: entry.effective_min_interval_ms,
                     balance,
                     balance_updated_at,
                 }
@@ -534,15 +567,50 @@ impl AdminService {
         }
     }
 
+    /// 导出前兜底补齐真实 profileArn。
+    ///
+    /// 新增凭据时已经会自动扫描 profile，但上游临时失败、旧数据迁移或手工导入缺字段时，
+    /// 凭据可能仍没有真实 profileArn。导出前只对选中 OAuth/IdC 凭据做一次轻量补齐，
+    /// 避免导出的 Enterprise 账号缺少 profileArn。
+    async fn ensure_export_profiles(&self, id_filter: Option<&HashSet<u64>>) {
+        let candidates: Vec<u64> = self
+            .token_manager
+            .clone_all_credentials()
+            .into_iter()
+            .filter(|cred| {
+                cred.id
+                    .and_then(|id| id_filter.map(|f| f.contains(&id)))
+                    .unwrap_or(true)
+            })
+            .filter(|cred| !cred.is_api_key_credential())
+            .filter(|cred| {
+                cred.refresh_token
+                    .as_deref()
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false)
+            })
+            .filter(|cred| cred.effective_profile_arn().is_none())
+            .filter_map(|cred| cred.id)
+            .collect();
+
+        for id in candidates {
+            if let Err(e) = self.token_manager.expand_profiles_for(id).await {
+                tracing::warn!("导出前补齐 profileArn 失败（跳过） #{}: {}", id, e);
+            }
+        }
+    }
+
     /// 导出凭据为兼容 JSON（嵌套 `Account` 格式）
     ///
     /// 返回的结构体含 refreshToken、accessToken、clientSecret 等敏感字段，
     /// 调用方需自行保证传输与存储安全；按 priority 升序排序，与 UI 列表一致。
     /// `id_filter` 为 None 时导出全部凭据；为 Some 时仅导出集合内的 ID。
-    pub fn export_credentials(
+    pub async fn export_credentials(
         &self,
         id_filter: Option<&HashSet<u64>>,
     ) -> CredentialsExportResponse {
+        self.ensure_export_profiles(id_filter).await;
+
         let mut credentials = self.token_manager.clone_all_credentials();
         if let Some(filter) = id_filter {
             credentials.retain(|c| c.id.map(|id| filter.contains(&id)).unwrap_or(false));
@@ -641,6 +709,27 @@ impl AdminService {
             .map_err(|e| self.classify_error(e, id))
     }
 
+    /// 设置凭据级最大并发（`None` = 清除覆盖，回退到账号档位默认）。
+    /// 运行时即时生效：限流器下次取用该 key 时会同步到新目标。
+    pub fn set_max_in_flight(
+        &self,
+        id: u64,
+        max_in_flight: Option<usize>,
+    ) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .update_credential(
+                id,
+                None,                // email 不修改
+                None,                // proxy_url 不修改
+                None,                // proxy_username 不修改
+                None,                // proxy_password 不修改
+                None,                // profile_arn 不修改
+                Some(max_in_flight), // 设置/清除 max_in_flight
+                None,                // min_interval_ms 不修改
+            )
+            .map_err(|e| self.classify_error(e, id))
+    }
+
     /// 重置失败计数并重新启用
     pub fn reset_and_enable(&self, id: u64) -> Result<(), AdminServiceError> {
         self.token_manager
@@ -661,6 +750,112 @@ impl AdminService {
     }
 
     /// 获取凭据余额（带缓存）
+    pub async fn test_credential_model(
+        &self,
+        id: u64,
+        req: TestCredentialModelRequest,
+    ) -> Result<TestCredentialModelResponse, AdminServiceError> {
+        let model = if req.model.trim().is_empty() {
+            "claude-opus-4.8".to_string()
+        } else {
+            req.model.trim().to_string()
+        };
+        let prompt = if req.prompt.trim().is_empty() {
+            "ping".to_string()
+        } else {
+            req.prompt.trim().to_string()
+        };
+        let _max_tokens = req.max_tokens.clamp(1, 64);
+        let start = Instant::now();
+
+        let (token, credentials) = self
+            .token_manager
+            .prepare_admin_request_token(id)
+            .await
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        let endpoint_name = credentials
+            .endpoint
+            .as_deref()
+            .unwrap_or(&self.token_manager.config().default_endpoint)
+            .to_string();
+        let endpoint: Box<dyn KiroEndpoint> = match endpoint_name.as_str() {
+            "cli" => Box::new(CliEndpoint::new()),
+            "ide" => Box::new(IdeEndpoint::new()),
+            other => {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "未知端点: {}",
+                    other
+                )));
+            }
+        };
+
+        let config = self.token_manager.config();
+        let machine_id = machine_id::generate_from_credentials(&credentials, config);
+        let request = KiroRequest {
+            conversation_state: ConversationState::new(Uuid::new_v4().to_string())
+                .with_agent_task_type("vibe")
+                .with_chat_trigger_type("MANUAL")
+                .with_current_message(CurrentMessage::new(UserInputMessage::new(
+                    prompt,
+                    model.clone(),
+                ))),
+            profile_arn: credentials.streaming_profile_arn(),
+            additional_model_request_fields: None,
+        };
+        let request_body = serde_json::to_string(&request)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: &token,
+            machine_id: &machine_id,
+            config,
+        };
+        let body = endpoint.transform_api_body(&request_body, &ctx);
+        let url = endpoint.api_url(&ctx);
+        let global_proxy = self.token_manager.proxy();
+        let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
+        let client = build_client(effective_proxy.as_ref(), 120, config.tls_backend)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        let req_builder = client
+            .post(&url)
+            .body(body)
+            .header("content-type", endpoint.content_type())
+            .header("Connection", "close");
+        let response = endpoint.decorate_api(req_builder, &ctx).send().await;
+        let elapsed_ms = start.elapsed().as_millis();
+        match response {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let text = resp.text().await.unwrap_or_default();
+                Ok(TestCredentialModelResponse {
+                    credential_id: id,
+                    ok: (200..300).contains(&status),
+                    model,
+                    endpoint: endpoint_name,
+                    status: Some(status),
+                    elapsed_ms,
+                    response_preview: Some(text.chars().take(800).collect()),
+                    error: if (200..300).contains(&status) {
+                        None
+                    } else {
+                        Some(text.chars().take(500).collect())
+                    },
+                })
+            }
+            Err(e) => Ok(TestCredentialModelResponse {
+                credential_id: id,
+                ok: false,
+                model,
+                endpoint: endpoint_name,
+                status: None,
+                elapsed_ms,
+                response_preview: None,
+                error: Some(e.to_string()),
+            }),
+        }
+    }
+
     pub async fn get_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
         // 先查缓存
         {
@@ -727,6 +922,8 @@ impl AdminService {
                 .subscription_info
                 .as_ref()
                 .and_then(|s| s.overage_capability.clone()),
+            account_email: usage.email().map(|s| s.to_string()),
+            account_user_id: usage.user_id().map(|s| s.to_string()),
         })
     }
 
@@ -971,6 +1168,8 @@ impl AdminService {
             endpoint: req.endpoint,
             groups: req.groups,
             source_channel: req.source_channel,
+            max_in_flight: None,
+            min_interval_ms: None,
         };
 
         // 调用 token_manager 添加凭据
@@ -980,11 +1179,55 @@ impl AdminService {
             .await
             .map_err(|e| self.classify_add_error(e))?;
 
-        // 主动获取余额（含订阅等级 / 邮箱）并写入缓存，添加后立即可见，
+        // 主动获取余额（含订阅等级 / 邮箱 / 上游账号身份）并写入缓存，添加后立即可见，
         // 同时避免首次请求时 Free 账号绕过 Opus 模型过滤
-        if let Err(e) = self.get_balance(credential_id).await {
-            tracing::warn!("添加凭据后刷新余额失败（不影响凭据添加）: {}", e);
+        let new_balance = match self.get_balance(credential_id).await {
+            Ok(b) => Some(b),
+            Err(e) => {
+                tracing::warn!("添加凭据后刷新余额失败（不影响凭据添加）: {}", e);
+                None
+            }
+        };
+
+        // 账号级去重：不同的 API Key 字符串可能属于同一个上游 Kiro 账户
+        // （一个账户可签发多把 key）。仅靠 kiroApiKey 哈希无法识别，这里用上游
+        // 账号身份（userId，回退 email）做二次去重。命中则回滚刚添加的凭据并报错。
+        // 调用方可传 allow_same_account=true 显式跳过（例如同账户多 key 轮换场景）。
+        if !req.allow_same_account {
+            if let Some(account_key) = new_balance.as_ref().and_then(|b| {
+                b.account_user_id
+                    .as_deref()
+                    .or(b.account_email.as_deref())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            }) {
+                if let Some((dup_id, dup_label)) =
+                    self.find_duplicate_account(credential_id, &account_key)
+                {
+                    // 回滚刚添加的凭据
+                    let _ = self.token_manager.delete_credential(credential_id);
+                    {
+                        let mut cache = self.balance_cache.lock();
+                        cache.remove(&credential_id);
+                    }
+                    self.save_balance_cache();
+                    return Err(AdminServiceError::InvalidCredential(format!(
+                        "凭据已存在（上游账号重复：与凭据 #{}{} 属于同一个 Kiro 账户）",
+                        dup_id,
+                        if dup_label.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" {}", dup_label)
+                        }
+                    )));
+                }
+            }
         }
+
+        let email = new_balance
+            .as_ref()
+            .and_then(|b| b.account_email.clone())
+            .or(email);
 
         // Enterprise / IdC 账号可能同一 refreshToken 下存在多个可用 profile。
         // 添加其中一个后，后台自动扫描 ListAvailableProfiles 并把缺失 profile 拆成独立凭据。
@@ -1007,6 +1250,43 @@ impl AdminService {
         })
     }
 
+    /// 在已有凭据中查找与指定上游账号（account_key = userId 或 email）重复的凭据。
+    /// 比对对象为余额缓存中已解析出上游账号身份的其他凭据（排除 self_id）。
+    /// 返回（重复凭据 id, 展示标签）。
+    fn find_duplicate_account(
+        &self,
+        self_id: u64,
+        account_key: &str,
+    ) -> Option<(u64, String)> {
+        let snapshot = self.token_manager.snapshot();
+        let cache = self.balance_cache.lock();
+        for entry in &snapshot.entries {
+            if entry.id == self_id {
+                continue;
+            }
+            let Some(cached) = cache.get(&entry.id) else {
+                continue;
+            };
+            let key = cached
+                .data
+                .account_user_id
+                .as_deref()
+                .or(cached.data.account_email.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            if key == Some(account_key) {
+                let label = cached
+                    .data
+                    .account_email
+                    .clone()
+                    .or_else(|| entry.email.clone())
+                    .unwrap_or_default();
+                return Some((entry.id, label));
+            }
+        }
+        None
+    }
+
     /// 更新凭据的可编辑字段（email、proxy 等）
     pub fn update_credential(
         &self,
@@ -1025,6 +1305,11 @@ impl AdminService {
                     .map(|v| if v.is_empty() { None } else { Some(v) }),
                 req.profile_arn
                     .map(|v| if v.is_empty() { None } else { Some(v) }),
+                // max_in_flight: None = 不修改；Some(0) = 清除（回退档位默认）；Some(n) = 设置
+                req.max_in_flight
+                    .map(|v| if v == 0 { None } else { Some(v) }),
+                // min_interval_ms: None = 不修改；直接透传（Some(0) 合法 = 关闭间隔）
+                req.min_interval_ms.map(Some),
             )
             .map_err(|e| self.classify_error(e, id))
     }
@@ -1688,6 +1973,48 @@ impl AdminService {
         Ok(self.get_account_throttle_config())
     }
 
+    /// 读取档位并发配置（企业/Pro/Basic 默认并发 + 间隔 + 自适应开关）
+    pub fn get_concurrency_config(&self) -> ConcurrencyConfigResponse {
+        let c = self.token_manager.get_concurrency_config();
+        ConcurrencyConfigResponse {
+            tier_max_in_flight_enterprise: c.tier_max_in_flight_enterprise,
+            tier_max_in_flight_pro: c.tier_max_in_flight_pro,
+            tier_max_in_flight_basic: c.tier_max_in_flight_basic,
+            tier_min_interval_ms_enterprise: c.tier_min_interval_ms_enterprise,
+            tier_min_interval_ms_pro: c.tier_min_interval_ms_pro,
+            tier_min_interval_ms_basic: c.tier_min_interval_ms_basic,
+            adaptive_concurrency_enabled: c.adaptive_concurrency_enabled,
+        }
+    }
+
+    /// 更新档位并发配置（运行时即时生效并持久化 config.json）
+    pub fn set_concurrency_config(
+        &self,
+        req: SetConcurrencyConfigRequest,
+    ) -> Result<ConcurrencyConfigResponse, AdminServiceError> {
+        let c = self
+            .token_manager
+            .set_concurrency_config(
+                req.tier_max_in_flight_enterprise,
+                req.tier_max_in_flight_pro,
+                req.tier_max_in_flight_basic,
+                req.tier_min_interval_ms_enterprise,
+                req.tier_min_interval_ms_pro,
+                req.tier_min_interval_ms_basic,
+                req.adaptive_concurrency_enabled,
+            )
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+        Ok(ConcurrencyConfigResponse {
+            tier_max_in_flight_enterprise: c.tier_max_in_flight_enterprise,
+            tier_max_in_flight_pro: c.tier_max_in_flight_pro,
+            tier_max_in_flight_basic: c.tier_max_in_flight_basic,
+            tier_min_interval_ms_enterprise: c.tier_min_interval_ms_enterprise,
+            tier_min_interval_ms_pro: c.tier_min_interval_ms_pro,
+            tier_min_interval_ms_basic: c.tier_min_interval_ms_basic,
+            adaptive_concurrency_enabled: c.adaptive_concurrency_enabled,
+        })
+    }
+
     /// 读取日志治理配置（trace 开关 / trace 保留天数 / usage 保留天数）
     pub fn get_log_governance_config(&self) -> LogGovernanceConfigResponse {
         let cfg = self.token_manager.config();
@@ -2167,6 +2494,8 @@ impl AdminService {
                 None,            // proxy_username 不修改
                 None,            // proxy_password 不修改
                 None,            // profile_arn 不修改
+                None,            // max_in_flight 不修改
+                None,            // min_interval_ms 不修改
             )
             .map_err(|e| {
                 let msg = e.to_string();
@@ -2236,7 +2565,16 @@ impl AdminService {
             let url = urls[i % urls.len()].clone();
             if self
                 .token_manager
-                .update_credential(*cred_id, None, Some(Some(url)), None, None, None)
+                .update_credential(
+                    *cred_id,
+                    None,
+                    Some(Some(url)),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
                 .is_ok()
             {
                 assigned += 1;

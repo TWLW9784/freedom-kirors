@@ -18,9 +18,10 @@ use super::{
         AddCredentialRequest, AddProxyRequest, AssignProxyRequest, AssignRoundRobinRequest,
         BatchAddProxyRequest, ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest,
         CreateClientKeyRequest, CreateClientKeyResponse, GlobalProxyResponse,
-        SetAccountThrottleConfigRequest, SetDisabledRequest, SetGlobalProxyRequest,
-        SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
-        SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
+        SetAccountThrottleConfigRequest, SetConcurrencyConfigRequest, SetDisabledRequest,
+        SetGlobalProxyRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
+        SetMaxInFlightRequest, SetPriorityRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
+        StartSocialLoginRequest, SuccessResponse, TestCredentialModelRequest,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
         UpdateRefreshTokenRequest,
     },
@@ -61,7 +62,7 @@ pub async fn export_credentials(
         })
         .filter(|s| !s.is_empty());
 
-    let response = state.service.export_credentials(id_filter.as_ref());
+    let response = state.service.export_credentials(id_filter.as_ref()).await;
     Json(response)
 }
 
@@ -98,6 +99,23 @@ pub async fn set_credential_priority(
     }
 }
 
+/// POST /api/admin/credentials/:id/max-in-flight
+/// 设置凭据级最大并发（max_in_flight 为 null 时清除覆盖、回退档位默认）
+pub async fn set_credential_max_in_flight(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetMaxInFlightRequest>,
+) -> impl IntoResponse {
+    match state.service.set_max_in_flight(id, payload.max_in_flight) {
+        Ok(_) => Json(SuccessResponse::new(match payload.max_in_flight {
+            Some(v) => format!("凭据 #{} 最大并发已设置为 {}", id, v),
+            None => format!("凭据 #{} 最大并发已清除，回退到账号档位默认", id),
+        }))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// POST /api/admin/credentials/:id/reset
 /// 重置失败计数并重新启用
 pub async fn reset_failure_count(
@@ -122,6 +140,19 @@ pub async fn clear_throttle(
 ) -> impl IntoResponse {
     match state.service.clear_throttle(id) {
         Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 风控冷却已解除", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/test-model
+/// 使用指定凭据发起一次极小真实模型调用，验证该凭据是否可用
+pub async fn test_credential_model(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<TestCredentialModelRequest>,
+) -> impl IntoResponse {
+    match state.service.test_credential_model(id, payload).await {
+        Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -439,6 +470,24 @@ pub async fn set_account_throttle_config(
     Json(payload): Json<SetAccountThrottleConfigRequest>,
 ) -> impl IntoResponse {
     match state.service.set_account_throttle_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/concurrency
+/// 获取档位并发配置（企业/Pro/Basic 默认并发 + 间隔 + 自适应开关）
+pub async fn get_concurrency_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_concurrency_config())
+}
+
+/// PUT /api/admin/config/concurrency
+/// 更新档位并发配置（运行时即时生效并持久化）
+pub async fn set_concurrency_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetConcurrencyConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_concurrency_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
@@ -1304,3 +1353,279 @@ pub async fn trace_recent_stats(State(state): State<AdminState>) -> impl IntoRes
         .collect();
     Json(map)
 }
+
+// ============ 账号分组（独立实体）============
+
+fn group_to_item(
+    g: &super::groups::Group,
+    state: &AdminState,
+) -> super::types::GroupItem {
+    super::types::GroupItem {
+        name: g.name.clone(),
+        description: g.description.clone(),
+        created_at: g.created_at.clone(),
+        credential_count: state
+            .service
+            .token_manager()
+            .count_credentials_with_group(&g.name),
+        client_key_count: state.client_keys.count_with_group(&g.name),
+    }
+}
+
+/// GET /api/admin/groups
+pub async fn list_groups(State(state): State<AdminState>) -> impl IntoResponse {
+    let groups = state.groups.list();
+    let items: Vec<super::types::GroupItem> =
+        groups.iter().map(|g| group_to_item(g, &state)).collect();
+    Json(super::types::GroupsResponse {
+        total: items.len(),
+        groups: items,
+    })
+}
+
+/// POST /api/admin/groups
+pub async fn create_group(
+    State(state): State<AdminState>,
+    Json(payload): Json<super::types::CreateGroupRequest>,
+) -> impl IntoResponse {
+    match state
+        .groups
+        .create(payload.name, payload.description)
+    {
+        Ok(g) => Json(group_to_item(&g, &state)).into_response(),
+        Err(e) => {
+            let msg = e.to_string();
+            // "已存在" → 409；其他校验失败 → 400
+            let (code, resp) = if msg.contains("已存在") {
+                (
+                    StatusCode::CONFLICT,
+                    super::types::AdminErrorResponse::invalid_request(msg),
+                )
+            } else {
+                (
+                    StatusCode::BAD_REQUEST,
+                    super::types::AdminErrorResponse::invalid_request(msg),
+                )
+            };
+            (code, Json(resp)).into_response()
+        }
+    }
+}
+
+/// PATCH /api/admin/groups/:name
+///
+/// 改名 / 改备注。改名时级联更新所有引用该分组的凭据 / 客户端 Key。
+pub async fn update_group(
+    State(state): State<AdminState>,
+    Path(name): Path<String>,
+    Json(payload): Json<super::types::UpdateGroupRequest>,
+) -> impl IntoResponse {
+    if !state.groups.exists(&name) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(super::types::AdminErrorResponse::not_found(format!(
+                "分组 {} 不存在",
+                name
+            ))),
+        )
+            .into_response();
+    }
+
+    // 1. 改名（先校验目标名再级联）
+    let mut current_name = name.clone();
+    if let Some(new_name) = payload.new_name.as_deref() {
+        let trimmed = new_name.trim();
+        if !trimmed.is_empty() && trimmed != name {
+            // GroupManager 内做唯一性 / 长度 / 空校验
+            match state.groups.rename(&name, trimmed) {
+                Ok(_) => {}
+                Err(e) => {
+                    let msg = e.to_string();
+                    let code = if msg.contains("已存在") {
+                        StatusCode::CONFLICT
+                    } else {
+                        StatusCode::BAD_REQUEST
+                    };
+                    return (
+                        code,
+                        Json(super::types::AdminErrorResponse::invalid_request(msg)),
+                    )
+                        .into_response();
+                }
+            }
+            // 级联：失败时尝试回滚分组改名（避免注册表与凭据 / Key 不一致）
+            let cred_res = state
+                .service
+                .token_manager()
+                .rename_credential_group(&name, trimmed);
+            if let Err(e) = cred_res {
+                let _ = state.groups.rename(trimmed, &name);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(super::types::AdminErrorResponse::internal_error(format!(
+                        "级联更新凭据失败: {}",
+                        e
+                    ))),
+                )
+                    .into_response();
+            }
+            state.client_keys.rename_group(&name, trimmed);
+            current_name = trimmed.to_string();
+        }
+    }
+
+    // 2. 改备注
+    if let Some(desc) = payload.description {
+        let desc_opt = if desc.trim().is_empty() {
+            None
+        } else {
+            Some(desc)
+        };
+        if let Err(e) = state.groups.update_description(&current_name, desc_opt) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(super::types::AdminErrorResponse::invalid_request(e.to_string())),
+            )
+                .into_response();
+        }
+    }
+
+    let group = match state.groups.get(&current_name) {
+        Some(g) => g,
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(super::types::AdminErrorResponse::internal_error(
+                    "分组在更新过程中消失，状态异常",
+                )),
+            )
+                .into_response();
+        }
+    };
+    Json(group_to_item(&group, &state)).into_response()
+}
+
+/// DELETE /api/admin/groups/:name?force=true
+///
+/// 默认拒绝删除仍被引用的分组；带 `force=true` 时级联清理所有引用并删除。
+pub async fn delete_group(
+    State(state): State<AdminState>,
+    Path(name): Path<String>,
+    Query(query): Query<super::types::DeleteGroupQuery>,
+) -> impl IntoResponse {
+    if !state.groups.exists(&name) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(super::types::AdminErrorResponse::not_found(format!(
+                "分组 {} 不存在",
+                name
+            ))),
+        )
+            .into_response();
+    }
+
+    let cred_count = state
+        .service
+        .token_manager()
+        .count_credentials_with_group(&name);
+    let key_count = state.client_keys.count_with_group(&name);
+
+    if (cred_count > 0 || key_count > 0) && !query.force {
+        return (
+            StatusCode::CONFLICT,
+            Json(super::types::AdminErrorResponse::invalid_request(format!(
+                "分组仍被引用（凭据 {} / 客户端 Key {}），传 ?force=true 级联清理",
+                cred_count, key_count
+            ))),
+        )
+            .into_response();
+    }
+
+    if query.force {
+        if let Err(e) = state
+            .service
+            .token_manager()
+            .remove_credential_group(&name)
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(super::types::AdminErrorResponse::internal_error(format!(
+                    "级联清理凭据失败: {}",
+                    e
+                ))),
+            )
+                .into_response();
+        }
+        state.client_keys.clear_group(&name);
+    }
+
+    state.groups.delete(&name);
+    Json(super::types::SuccessResponse::new(format!(
+        "分组 {} 已删除",
+        name
+    )))
+    .into_response()
+}
+
+/// GET /api/admin/limiter/snapshots
+/// 返回所有 account key 的自适应限流器实时状态（不发任何上游请求）。
+pub async fn limiter_snapshots(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.limiter_snapshots())
+}
+
+/// POST /api/admin/stress-test/start
+/// 启动压力测试（后台任务，复用真实上游调用）
+pub async fn start_stress_test(
+    State(state): State<AdminState>,
+    Json(config): Json<crate::admin::stress_test::StressTestConfig>,
+) -> impl IntoResponse {
+    if config.credential_ids.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "请至少选择一个凭证" })),
+        );
+    }
+    let (session_id, total) =
+        crate::admin::stress_test::start_session(config, state.service.clone());
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "sessionId": session_id,
+            "totalRequests": total,
+            "status": "started"
+        })),
+    )
+}
+
+/// GET /api/admin/stress-test/{session_id}/status
+/// 轮询读取测试进度与结果
+pub async fn stress_test_status(
+    State(_state): State<AdminState>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    match crate::admin::stress_test::get_status(&session_id) {
+        Some(status) => (StatusCode::OK, Json(serde_json::json!(status))),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "会话不存在或已过期" })),
+        ),
+    }
+}
+
+/// POST /api/admin/stress-test/{session_id}/stop
+/// 停止正在运行的测试
+pub async fn stop_stress_test(
+    State(_state): State<AdminState>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    let found = crate::admin::stress_test::stop_session(&session_id);
+    if found {
+        (StatusCode::OK, Json(serde_json::json!({ "status": "stopping" })))
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "会话不存在" })),
+        )
+    }
+}
+

@@ -9,7 +9,6 @@ use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::sleep;
 
 use crate::admin::trace_db::{TraceAttempt, TraceSink, outcome, truncate_snippet};
@@ -95,11 +94,11 @@ pub struct KiroCallResult {
 
 /// 同一 Kiro 官方账号/profile 的限速 guard。
 ///
-/// 持有 `OwnedSemaphorePermit` 期间，同一官方账号/profile 的并发会被限制在
-/// `config.kiroAccountMaxInFlight` 内；成功返回流式响应时随 `KiroCallResult` 一起
+/// 持有 [`LimiterPermit`] 期间，同一官方账号/profile 的并发被限制在
+/// 「配置目标 ∩ 自适应上限」内；成功返回流式响应时随 `KiroCallResult` 一起
 /// 存活，避免长流式响应期间继续向同一官方账号发起大量新请求。
 pub struct AccountRateGuard {
-    _permit: OwnedSemaphorePermit,
+    _permit: crate::kiro::rate_limit::LimiterPermit,
 }
 
 /// Kiro API Provider
@@ -121,10 +120,10 @@ pub struct KiroProvider {
     endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
     /// 默认端点名称（凭据未指定 endpoint 时使用）
     default_endpoint: String,
-    /// 同一 Kiro 官方账号/profile 的并发限制器。
-    account_limiters: Mutex<HashMap<String, Arc<Semaphore>>>,
-    /// 同一 Kiro 官方账号/profile 最近一次发起上游请求的时间，用于平滑突刺。
-    account_last_start: Mutex<HashMap<String, Instant>>,
+    /// 同一 Kiro 官方账号/profile 的自适应并发限制器（运行时可调 + 429 自适应降并发）。
+    /// 最小请求间隔由限制器内部维护，不再单独存 last_start。
+    /// 用 Arc 包裹以便 admin 层共享同一份状态做可观测。
+    account_limiters: Arc<crate::kiro::rate_limit::AccountRateLimiters>,
 
     /// 已尝试过 profileArn 解析的凭据 ID（进程内）。
     ///
@@ -166,10 +165,14 @@ impl KiroProvider {
             tls_backend,
             endpoints,
             default_endpoint,
-            account_limiters: Mutex::new(HashMap::new()),
-            account_last_start: Mutex::new(HashMap::new()),
+            account_limiters: Arc::new(crate::kiro::rate_limit::AccountRateLimiters::new()),
             profile_resolution_attempted: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// 返回 account 限流器注册表的共享句柄（供 admin 可观测读取快照）。
+    pub fn account_limiters(&self) -> Arc<crate::kiro::rate_limit::AccountRateLimiters> {
+        Arc::clone(&self.account_limiters)
     }
 
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
@@ -221,59 +224,64 @@ impl KiroProvider {
 
     /// 同一 Kiro 官方账号/profile 的主动节流。
     ///
-    /// 这不是为了“绕过”官方限制，而是让本地调度不要把同一个官方账号瞬间打爆：
-    /// - `kiroAccountMaxInFlight` 控制同一 profile 最大并发；默认 1。
-    /// - `kiroAccountMinIntervalMs` 控制同一 profile 两次发起请求的最小间隔；默认 1800ms。
+    /// 有效并发 = `min(凭据级 maxInFlight ?? 档位默认, 自适应上限)`，
+    /// 最小间隔按档位默认。两者均由 [`crate::kiro::rate_limit::AdaptiveLimiter`] 维护：
+    /// 运行时改配置/改凭据 maxInFlight 即时生效，429 时自适应压低、成功后逐步回升。
     async fn acquire_account_rate_guard(
         &self,
         credentials: &KiroCredentials,
         id: u64,
     ) -> anyhow::Result<AccountRateGuard> {
-        let config = self.token_manager.config();
-        let max_in_flight = config.kiro_account_max_in_flight.max(1);
-        let min_interval = Duration::from_millis(config.kiro_account_min_interval_ms);
+        // 运行时值（atomics）优先：Admin 改了档位默认后即时生效，无需重启
+        let configured = self.token_manager.effective_max_in_flight(credentials);
+        let min_interval =
+            Duration::from_millis(self.token_manager.effective_min_interval_ms(credentials));
         let key = Self::account_rate_key(credentials, id);
 
-        let limiter = {
-            let mut limiters = self.account_limiters.lock();
-            limiters
-                .entry(key.clone())
-                .or_insert_with(|| Arc::new(Semaphore::new(max_in_flight)))
-                .clone()
-        };
-
-        let permit = limiter
-            .acquire_owned()
-            .await
-            .map_err(|e| anyhow::anyhow!("Kiro 官方账号限速器已关闭: {}", e))?;
-
-        if !min_interval.is_zero() {
-            let wait = {
-                let mut last = self.account_last_start.lock();
-                let now = Instant::now();
-                match last.get(&key).copied() {
-                    Some(prev) => {
-                        let elapsed = now.saturating_duration_since(prev);
-                        if elapsed < min_interval {
-                            min_interval - elapsed
-                        } else {
-                            last.insert(key.clone(), now);
-                            Duration::ZERO
-                        }
-                    }
-                    None => {
-                        last.insert(key.clone(), now);
-                        Duration::ZERO
-                    }
-                }
-            };
-            if !wait.is_zero() {
-                sleep(wait).await;
-                self.account_last_start.lock().insert(key, Instant::now());
-            }
-        }
+        let permit = crate::kiro::rate_limit::acquire_permit(
+            &self.account_limiters,
+            &key,
+            configured,
+            min_interval,
+        )
+        .await;
 
         Ok(AccountRateGuard { _permit: permit })
+    }
+
+    /// 暴露 account key 计算给上层（429 自适应上报用同一 key）。
+    pub fn account_rate_key_for(&self, credentials: &KiroCredentials, id: u64) -> String {
+        Self::account_rate_key(credentials, id)
+    }
+
+    /// 观测到 429：该 account key 乘性退避。
+    fn report_account_throttle_to_limiter(&self, key: &str, observed_in_flight: u64) {
+        if !self.token_manager.adaptive_concurrency_enabled() {
+            return;
+        }
+        if let Some(limiter) = self.account_limiters.get(key) {
+            limiter.on_throttle(observed_in_flight);
+        }
+    }
+
+    /// 一次成功：上报该 account key 的 RTT，用延迟梯度驱动 AIMD 探测/收缩。
+    fn report_account_success_to_limiter(&self, key: &str, rtt: Duration) {
+        if !self.token_manager.adaptive_concurrency_enabled() {
+            return;
+        }
+        if let Some(limiter) = self.account_limiters.get(key) {
+            limiter.on_success(rtt);
+        }
+    }
+
+    /// timeout / 524 / read error / 5xx 等软错误：该 account key 乘性退避。
+    fn report_account_soft_error_to_limiter(&self, key: &str) {
+        if !self.token_manager.adaptive_concurrency_enabled() {
+            return;
+        }
+        if let Some(limiter) = self.account_limiters.get(key) {
+            limiter.on_soft_error();
+        }
     }
 
     /// 在发起请求前，确保 Enterprise / IdC 账号的真实 profileArn 已解析并写入 `ctx`。
@@ -487,7 +495,7 @@ impl KiroProvider {
                 if attempt + 1 < max_retries {
                     // 429 限流用更长退避；408/5xx 仍用通用快速退避
                     let delay = if status.as_u16() == 429 {
-                        Self::retry_delay_throttle(attempt)
+                        Self::rate_limit_retry_delay(attempt, 5_000)
                     } else {
                         Self::retry_delay(attempt)
                     };
@@ -616,6 +624,7 @@ impl KiroProvider {
             let account_rate_guard = self
                 .acquire_account_rate_guard(&ctx.credentials, ctx.id)
                 .await?;
+            let account_key = self.account_rate_key_for(&ctx.credentials, ctx.id);
             let in_flight_guard = self.token_manager.begin_in_flight(ctx.id);
             let response = match self.client_for(&ctx.credentials)?.execute(request).await {
                 Ok(resp) => resp,
@@ -636,6 +645,11 @@ impl KiroProvider {
                         Some(&e.to_string()),
                         attempt_start,
                     );
+                    // timeout/read error 是压过容量拐点时最早出现的软拥塞信号，纳入限流器退避；
+                    // connect 失败更可能是代理/链路不可达，避免把它当成官方容量信号。
+                    if e.is_timeout() || !e.is_connect() {
+                        self.report_account_soft_error_to_limiter(&account_key);
+                    }
                     // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
                     // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
                     last_error = Some(e.into());
@@ -661,6 +675,7 @@ impl KiroProvider {
                     attempt_start,
                 );
                 self.token_manager.report_success(ctx.id);
+                self.report_account_success_to_limiter(&account_key, attempt_start.elapsed());
                 return Ok(KiroCallResult {
                     response,
                     credential_id: ctx.id,
@@ -796,6 +811,7 @@ impl KiroProvider {
                     .token_manager
                     .mark_throttle_observed(ctx.id)
                     .unwrap_or(0);
+                self.report_account_throttle_to_limiter(&account_key, observed_in_flight);
                 tracing::warn!(
                     "API 请求失败（账号级风控，凭据 #{} 冷却 {}s 并切换，触发时并发 {}，尝试 {}/{}）: {}",
                     ctx.id,
@@ -872,6 +888,7 @@ impl KiroProvider {
             // 重新建连。
             if status.as_u16() == 524 || endpoint.is_gateway_timeout(&body) {
                 tracing::warn!("API 请求失败（上游网关超时，不重试）: {} {}", status, body);
+                self.report_account_soft_error_to_limiter(&account_key);
                 Self::emit_attempt(
                     sink,
                     attempt,
@@ -893,6 +910,11 @@ impl KiroProvider {
                 } else {
                     None
                 };
+                if let Some(obs) = observed_in_flight {
+                    self.report_account_throttle_to_limiter(&account_key, obs);
+                } else if status.as_u16() == 408 || status.is_server_error() {
+                    self.report_account_soft_error_to_limiter(&account_key);
+                }
                 tracing::warn!(
                     "API 请求失败（上游瞬态错误，触发时并发 {:?}，尝试 {}/{}）: {} {}",
                     observed_in_flight,

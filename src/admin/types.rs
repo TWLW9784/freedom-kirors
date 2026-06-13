@@ -3,6 +3,38 @@
 use crate::admin::proxy_pool::ProxyHealth;
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(default)]
+pub struct TestCredentialModelRequest {
+    pub model: String,
+    pub prompt: String,
+    pub max_tokens: i32,
+}
+
+impl Default for TestCredentialModelRequest {
+    fn default() -> Self {
+        Self {
+            model: "claude-opus-4.8".to_string(),
+            prompt: "ping".to_string(),
+            max_tokens: 4,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestCredentialModelResponse {
+    pub credential_id: u64,
+    pub ok: bool,
+    pub model: String,
+    pub endpoint: String,
+    pub status: Option<u16>,
+    pub elapsed_ms: u128,
+    pub response_preview: Option<String>,
+    pub error: Option<String>,
+}
+
 // ============ 凭据状态 ============
 
 /// 所有凭据状态响应
@@ -84,6 +116,16 @@ pub struct CredentialStatusItem {
     /// 账号来源渠道（纯备注）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
+    /// 凭据级最大并发上限覆盖（None 表示跟随档位默认）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_in_flight: Option<usize>,
+    /// 凭据级最小请求间隔覆盖（毫秒；None 表示跟随档位默认）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_interval_ms: Option<u64>,
+    /// 有效并发上限（凭据覆盖 ?? 档位默认；考虑自适应降并发前的目标值）
+    pub effective_max_in_flight: usize,
+    /// 有效最小请求间隔毫秒（凭据覆盖 ?? 档位默认）
+    pub effective_min_interval_ms: u64,
     /// 凭据余额（从缓存中读取的最近一次结果，可能为 None）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance: Option<BalanceResponse>,
@@ -108,6 +150,15 @@ pub struct SetDisabledRequest {
 pub struct SetPriorityRequest {
     /// 新优先级值
     pub priority: u32,
+}
+
+/// 设置凭据级最大并发请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetMaxInFlightRequest {
+    /// 凭据级最大并发；`null` 表示清除覆盖、回退到账号档位默认
+    #[serde(default)]
+    pub max_in_flight: Option<usize>,
 }
 
 /// 添加凭据请求
@@ -205,6 +256,9 @@ pub struct AddCredentialRequest {
     /// 账号来源渠道（纯备注，可选）
     #[serde(default)]
     pub source_channel: Option<String>,
+    /// 允许同一上游 Kiro 账户的多把 key（默认 false：同账户会被账号级去重拒绝）
+    #[serde(default, alias = "allow_same_account")]
+    pub allow_same_account: bool,
 }
 
 fn default_auth_method() -> String {
@@ -239,6 +293,10 @@ pub struct UpdateCredentialRequest {
     pub proxy_password: Option<String>,
     /// Profile ARN（空字符串表示清除；Enterprise / IdC 可用来快速切换区域/profile）
     pub profile_arn: Option<String>,
+    /// 凭据级最大并发上限（None 表示不修改；0 或 None 表示回退到档位默认）
+    pub max_in_flight: Option<usize>,
+    /// 凭据级最小请求间隔毫秒（None 表示不修改；Some(0) 表示关闭间隔）
+    pub min_interval_ms: Option<u64>,
 }
 
 /// 添加凭据成功响应
@@ -283,6 +341,12 @@ pub struct BalanceResponse {
     /// 上游 `overageCapability` 原始字符串（用于排查"未知"状态）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overage_capability_raw: Option<String>,
+    /// 上游账号邮箱（用于识别多个 key 是否属于同一账户）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_email: Option<String>,
+    /// 上游账号唯一 ID（用于识别多个 key 是否属于同一账户）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_user_id: Option<String>,
 }
 
 // ============ 可用 Profile 查询 / 自动补齐 ============
@@ -408,6 +472,46 @@ pub struct SetAccountThrottleConfigRequest {
     /// 冷却时长（秒）；缺省表示不修改，1..=86400
     #[serde(default)]
     pub cooldown_secs: Option<u64>,
+}
+
+/// 档位并发配置响应（企业/Pro/Basic 默认并发 + 间隔 + 自适应开关）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConcurrencyConfigResponse {
+    pub tier_max_in_flight_enterprise: usize,
+    pub tier_max_in_flight_pro: usize,
+    pub tier_max_in_flight_basic: usize,
+    pub tier_min_interval_ms_enterprise: u64,
+    pub tier_min_interval_ms_pro: u64,
+    pub tier_min_interval_ms_basic: u64,
+    pub adaptive_concurrency_enabled: bool,
+}
+
+/// 更新档位并发配置；任一字段缺省表示不修改
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetConcurrencyConfigRequest {
+    /// 企业档默认并发，1..=256
+    #[serde(default)]
+    pub tier_max_in_flight_enterprise: Option<usize>,
+    /// Pro/Pro+ 档默认并发，1..=256
+    #[serde(default)]
+    pub tier_max_in_flight_pro: Option<usize>,
+    /// Free/social 档默认并发，1..=256
+    #[serde(default)]
+    pub tier_max_in_flight_basic: Option<usize>,
+    /// 企业档默认最小间隔（毫秒），0..=60000
+    #[serde(default)]
+    pub tier_min_interval_ms_enterprise: Option<u64>,
+    /// Pro/Pro+ 档默认最小间隔（毫秒），0..=60000
+    #[serde(default)]
+    pub tier_min_interval_ms_pro: Option<u64>,
+    /// Free/social 档默认最小间隔（毫秒），0..=60000
+    #[serde(default)]
+    pub tier_min_interval_ms_basic: Option<u64>,
+    /// 自适应降并发开关
+    #[serde(default)]
+    pub adaptive_concurrency_enabled: Option<bool>,
 }
 
 /// 日志治理配置响应

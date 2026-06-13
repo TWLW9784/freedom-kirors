@@ -142,6 +142,29 @@ pub struct Config {
     #[serde(default = "default_kiro_account_min_interval_ms")]
     pub kiro_account_min_interval_ms: u64,
 
+    /// 按账号档位的默认最大并发（凭据未显式设置 `maxInFlight` 时回退到此）。
+    ///
+    /// 索引含义：企业/IdC、Pro/Pro+、Free/social。企业账号官方限额最高，默认放最大。
+    /// 凭据级 `maxInFlight` 优先于此；自适应降并发会在运行时进一步压低实际并发。
+    #[serde(default = "default_tier_max_in_flight_enterprise")]
+    pub tier_max_in_flight_enterprise: usize,
+    #[serde(default = "default_tier_max_in_flight_pro")]
+    pub tier_max_in_flight_pro: usize,
+    #[serde(default = "default_tier_max_in_flight_basic")]
+    pub tier_max_in_flight_basic: usize,
+
+    /// 按账号档位的默认最小请求间隔（毫秒）。企业账号间隔最短以提升吞吐。
+    #[serde(default = "default_tier_min_interval_enterprise")]
+    pub tier_min_interval_ms_enterprise: u64,
+    #[serde(default = "default_tier_min_interval_pro")]
+    pub tier_min_interval_ms_pro: u64,
+    #[serde(default = "default_tier_min_interval_basic")]
+    pub tier_min_interval_ms_basic: u64,
+
+    /// 是否启用自适应降并发（429 时压低该 profile 的并发上限，持续成功后逐步回升）。
+    #[serde(default = "default_adaptive_concurrency_enabled")]
+    pub adaptive_concurrency_enabled: bool,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -232,6 +255,32 @@ fn default_kiro_account_min_interval_ms() -> u64 {
     1800
 }
 
+// 按档默认并发（激进档）：企业 10 / Pro·Pro+ 4 / Free·social 2
+fn default_tier_max_in_flight_enterprise() -> usize {
+    10
+}
+fn default_tier_max_in_flight_pro() -> usize {
+    4
+}
+fn default_tier_max_in_flight_basic() -> usize {
+    2
+}
+
+// 按档默认间隔：企业账号间隔最短以提升吞吐，其余保持较高以压低 429 风险
+fn default_tier_min_interval_enterprise() -> u64 {
+    300
+}
+fn default_tier_min_interval_pro() -> u64 {
+    800
+}
+fn default_tier_min_interval_basic() -> u64 {
+    1800
+}
+
+fn default_adaptive_concurrency_enabled() -> bool {
+    true
+}
+
 fn default_update_auto_apply_time() -> String {
     "03:00".to_string()
 }
@@ -287,6 +336,13 @@ impl Default for Config {
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
             kiro_account_max_in_flight: default_kiro_account_max_in_flight(),
             kiro_account_min_interval_ms: default_kiro_account_min_interval_ms(),
+            tier_max_in_flight_enterprise: default_tier_max_in_flight_enterprise(),
+            tier_max_in_flight_pro: default_tier_max_in_flight_pro(),
+            tier_max_in_flight_basic: default_tier_max_in_flight_basic(),
+            tier_min_interval_ms_enterprise: default_tier_min_interval_enterprise(),
+            tier_min_interval_ms_pro: default_tier_min_interval_pro(),
+            tier_min_interval_ms_basic: default_tier_min_interval_basic(),
+            adaptive_concurrency_enabled: default_adaptive_concurrency_enabled(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             trace_enabled: default_trace_enabled(),
