@@ -78,6 +78,12 @@ pub struct CredentialStatusItem {
     pub disabled_reason: Option<String>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
+    /// 账号所属分组（可属于多个分组）
+    #[serde(default)]
+    pub groups: Vec<String>,
+    /// 账号来源渠道（纯备注）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_channel: Option<String>,
     /// 凭据余额（从缓存中读取的最近一次结果，可能为 None）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance: Option<BalanceResponse>,
@@ -192,6 +198,13 @@ pub struct AddCredentialRequest {
     /// 端点名称（可选，未配置时使用 config.defaultEndpoint）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+
+    /// 账号所属分组（可属于多个分组，可选）
+    #[serde(default)]
+    pub groups: Vec<String>,
+    /// 账号来源渠道（纯备注，可选）
+    #[serde(default)]
+    pub source_channel: Option<String>,
 }
 
 fn default_auth_method() -> String {
@@ -668,7 +681,7 @@ pub struct UpdateCheckInfo {
 
 // ============ 登录API密钥修改 ============
 
-/// 修改登录API密钥请求
+/// 修改登录API密钥（管理面板登录用 adminApiKey）请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateAdminKeyRequest {
@@ -697,6 +710,11 @@ pub struct ClientKeyItem {
     pub total_output_tokens: u64,
     pub total_cache_creation_tokens: u64,
     pub total_cache_read_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换）
+    #[serde(default)]
+    pub is_system: bool,
 }
 
 /// 客户端 Key 列表响应
@@ -714,6 +732,8 @@ pub struct CreateClientKeyRequest {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
 }
 
 /// 创建客户端 Key 响应（明文 Key 仅在此处返回一次）
@@ -732,6 +752,8 @@ pub struct CreateClientKeyResponse {
 pub struct UpdateClientKeyRequest {
     pub name: Option<String>,
     pub description: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
 }
 
 // ============ IdC 设备授权登录 ============
@@ -973,4 +995,58 @@ impl AdminErrorResponse {
     pub fn internal_error(message: impl Into<String>) -> Self {
         Self::new("internal_error", message)
     }
+}
+
+// ============ 账号分组（独立实体）============
+
+/// 单条分组（列表项）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupItem {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub created_at: String,
+    /// 引用计数：有多少个凭据带这个分组（前端展示 / 删除前提醒）
+    pub credential_count: usize,
+    /// 引用计数：有多少把客户端 Key 绑定这个分组
+    pub client_key_count: usize,
+}
+
+/// 分组列表响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupsResponse {
+    pub total: usize,
+    pub groups: Vec<GroupItem>,
+}
+
+/// 创建分组请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateGroupRequest {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// 更新分组请求（改名 / 改备注；两者都可选）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateGroupRequest {
+    /// 新名字；不传或与原名一致则不改名
+    #[serde(default)]
+    pub new_name: Option<String>,
+    /// 新备注；传空字符串清除备注；不传字段则保留
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// 删除分组的可选查询参数
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteGroupQuery {
+    /// 强制删除：即使仍有引用也删；同时级联清理凭据 / Key 的引用
+    #[serde(default)]
+    pub force: bool,
 }

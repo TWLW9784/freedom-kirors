@@ -20,8 +20,10 @@ import {
 } from '@/components/ui/select'
 import { Input } from '@/components/ui/input'
 import { useUpdateCredential } from '@/hooks/use-credentials'
+import { useGroupOptions } from '@/hooks/use-groups'
 import { getProxyPool } from '@/api/credentials'
 import { extractErrorMessage, maskProxyUrl } from '@/lib/utils'
+import { GroupMultiSelect } from '@/components/group-select'
 import type { CredentialStatusItem } from '@/types/api'
 
 interface EditCredentialDialogProps {
@@ -41,6 +43,8 @@ export function EditCredentialDialog({
   const [proxyPassword, setProxyPassword] = useState('')
   const [profileArn, setProfileArn] = useState(credential.profileArn ?? '')
   const [manualMode, setManualMode] = useState(false)
+
+  const groupOptions = useGroupOptions()
 
   const { data: proxyPool } = useQuery({
     queryKey: ['proxy-pool'],

@@ -39,6 +39,10 @@ export interface CredentialStatusItem {
   /** 账号级风控冷却剩余秒数（>0 表示冷却中） */
   throttledRemainingSecs?: number
   endpoint: string
+  /** 账号所属分组（可属于多个分组） */
+  groups?: string[]
+  /** 账号来源渠道（纯备注） */
+  sourceChannel?: string
   /** 后端缓存的最近一次余额（5 分钟内） */
   balance?: BalanceResponse
   /** 余额缓存的更新时间（Unix 秒） */
@@ -130,6 +134,8 @@ export interface AddCredentialRequest {
   kiroApiKey?: string
   endpoint?: string
   email?: string
+  groups?: string[]
+  sourceChannel?: string
 }
 
 // 添加凭据响应
@@ -303,7 +309,7 @@ export interface UpdateCheckInfo {
   warning?: string
 }
 
-// Admin Key 修改
+// 登录API密钥修改（adminApiKey —— 管理面板登录密钥）
 export interface UpdateAdminKeyRequest {
   newKey: string
 }
@@ -371,6 +377,10 @@ export interface ClientKeyItem {
   totalOutputTokens: number
   totalCacheCreationTokens: number
   totalCacheReadTokens: number
+  /** 绑定的账号分组（未绑定时为 undefined） */
+  group?: string
+  /** 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换） */
+  isSystem: boolean
 }
 
 export interface ClientKeysResponse {
@@ -381,6 +391,7 @@ export interface ClientKeysResponse {
 export interface CreateClientKeyRequest {
   name: string
   description?: string
+  group?: string
 }
 
 /** 创建响应：明文 Key 仅在此处返回一次 */
@@ -394,6 +405,7 @@ export interface CreateClientKeyResponse {
 export interface UpdateClientKeyRequest {
   name?: string
   description?: string
+  group?: string
 }
 
 // ============ 用量统计 ============
@@ -409,8 +421,10 @@ export interface StatsTimeFilter {
 }
 
 export interface StatsFilter {
-  /** 不传 = 全部；0 = 管理员API密钥；其它值 = 创建的客户端 Key id */
+  /** 不传 = 全部；其它值 = 客户端 Key id */
   keyId?: number
+  /** 按账号分组筛选（仅影响 timeseries / by-credential，by-model 不支持） */
+  group?: string
 }
 
 export interface OverviewStats {
@@ -476,9 +490,9 @@ export interface TraceRecord {
   traceId: string
   ts: string
   keyId: number
-  /** masterApiKey = 管理员API密钥；clientKey = 创建的客户端 Key */
+  /** masterApiKey = 历史 master 调用（已下线）；clientKey = 客户端 Key */
   keySource: 'masterApiKey' | 'clientKey'
-  /** 创建的客户端 Key 名称；管理员业务 Key 为 null */
+  /** 发起请求的客户端 Key 名称（master 表示主 apiKey；管理员业务 Key 可为 null） */
   keyName?: string | null
   model: string
   isStream: boolean
@@ -492,16 +506,20 @@ export interface TraceRecord {
   durationMs: number
   /** 流式中断时已发送字节数 */
   interruptedAfterBytes: number | null
-  /** 输入 token（互斥口径：未被缓存覆盖的部分） */
-  inputTokens: number
-  /** 输出 token（估算） */
-  outputTokens: number
+  /** 输入 token */
+  inputTokens?: number
+  /** 输出 token */
+  outputTokens?: number
   /** 缓存创建 token */
-  cacheCreationTokens: number
+  cacheCreationTokens?: number
   /** 缓存读取 token */
-  cacheReadTokens: number
+  cacheReadTokens?: number
   /** 总 token = input + output + cache_creation + cache_read */
-  totalTokens: number
+  totalTokens?: number
+  /** 费用（credits） */
+  credits?: number
+  /** 首 Token 延迟（毫秒，仅流式有值） */
+  firstTokenMs?: number | null
   attempts: TraceAttempt[]
 }
 
@@ -510,9 +528,13 @@ export interface TraceQuery {
   status?: string
   errorType?: string
   credentialId?: number
+  /** 按发起请求的客户端 Key 筛选（0 = master apiKey） */
+  keyId?: number
   /** 该凭据在某一跳失败过（即便 trace 最终成功）——用于凭据失败详情 */
   failedAttemptCredentialId?: number
   model?: string
+  /** 按账号分组名筛选（只返回 final_credential_id 属于该分组的 trace） */
+  group?: string
   onlyFailed?: boolean
   limit?: number
   offset?: number

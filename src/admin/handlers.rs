@@ -696,7 +696,8 @@ pub async fn poll_idc_relogin(
 }
 
 /// PUT /api/admin/config/admin-key
-/// 修改登录API密钥并持久化到配置文件
+/// 修改登录API密钥（adminApiKey）并持久化到配置文件。
+/// 该 key 用于管理面板登录，修改后立即生效。
 pub async fn update_admin_key(
     State(state): State<AdminState>,
     Json(payload): Json<UpdateAdminKeyRequest>,
@@ -713,37 +714,13 @@ pub async fn update_admin_key(
             .into_response();
     }
 
-    // 更新内存中的认证 key
+    // 更新内存中的登录API密钥
     *state.admin_api_key.write() = new_key.clone();
 
     // 通过 service 持久化到 config.json（从磁盘加载最新后再写，避免覆盖其他字段）
     state.service.persist_admin_key(&new_key);
 
     Json(SuccessResponse::new("登录API密钥已更新")).into_response()
-}
-
-/// PUT /api/admin/config/api-key
-/// 修改管理员API密钥并持久化到配置文件
-///
-/// 内存中的认证 key 与 anthropic 路由共享，调用后 `/v1/*` 立刻使用新 key。
-pub async fn update_api_key(
-    State(state): State<AdminState>,
-    Json(payload): Json<UpdateAdminKeyRequest>,
-) -> impl IntoResponse {
-    use axum::http::StatusCode;
-    let new_key = payload.new_key.trim().to_string();
-    if new_key.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(super::types::AdminErrorResponse::invalid_request(
-                "新管理员API密钥不能为空",
-            )),
-        )
-            .into_response();
-    }
-    *state.api_key.write() = new_key.clone();
-    state.service.persist_api_key(&new_key);
-    Json(SuccessResponse::new("管理员API密钥已更新")).into_response()
 }
 
 // ============ 客户端 API Key 分发 ============
@@ -762,6 +739,8 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
         total_output_tokens: k.total_output_tokens,
         total_cache_creation_tokens: k.total_cache_creation_tokens,
         total_cache_read_tokens: k.total_cache_read_tokens,
+        group: k.group.clone(),
+        is_system: k.is_system,
     }
 }
 
@@ -797,6 +776,10 @@ pub async fn create_client_key(
             .description
             .map(|d| d.trim().to_string())
             .filter(|d| !d.is_empty()),
+        payload
+            .group
+            .map(|g| g.trim().to_string())
+            .filter(|g| !g.is_empty()),
     );
     Json(CreateClientKeyResponse {
         id: entry.id,
@@ -813,6 +796,15 @@ pub async fn delete_client_key(
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
     use axum::http::StatusCode;
+    if state.client_keys.is_system(id) {
+        return (
+            StatusCode::CONFLICT,
+            Json(super::types::AdminErrorResponse::invalid_request(
+                "系统密钥（config.json apiKey）不可删除",
+            )),
+        )
+            .into_response();
+    }
     if state.client_keys.delete(id) {
         Json(SuccessResponse::new(format!("Key #{} 已删除", id))).into_response()
     } else {
@@ -837,7 +829,13 @@ pub async fn update_client_key(
     let description = payload
         .description
         .map(|d| if d.is_empty() { None } else { Some(d) });
-    if state.client_keys.update_meta(id, payload.name, description) {
+    let group = payload
+        .group
+        .map(|g| {
+            let t = g.trim();
+            if t.is_empty() { None } else { Some(t.to_string()) }
+        });
+    if state.client_keys.update_meta(id, payload.name, description, group) {
         Json(SuccessResponse::new(format!("Key #{} 已更新", id))).into_response()
     } else {
         (
@@ -893,6 +891,41 @@ pub async fn reset_client_key_stats(
     }
 }
 
+/// POST /api/admin/client-keys/:id/rotate
+///
+/// 轮换 Key 值：旧明文立即失效，生成新明文返回（仅此一次可见）。
+/// 保留 id/name/description/group/统计/disabled 不变，无需重新分组绑定。
+pub async fn rotate_client_key(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    use axum::http::StatusCode;
+    match state.client_keys.rotate(id) {
+        Some(entry) => {
+            // 系统密钥轮换后明文变了，需同步写回 config.json apiKey，
+            // 否则下次启动 ensure_system_key 会因旧 apiKey 不在列表而重复导入。
+            if entry.is_system {
+                state.service.persist_api_key(&entry.key);
+            }
+            Json(CreateClientKeyResponse {
+                id: entry.id,
+                key: entry.key,
+                name: entry.name,
+                created_at: entry.created_at,
+            })
+            .into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(super::types::AdminErrorResponse::not_found(format!(
+                "Key #{} 不存在",
+                id
+            ))),
+        )
+            .into_response(),
+    }
+}
+
 // ============ 用量统计 ============
 
 fn parse_range(params: &std::collections::HashMap<String, String>) -> Result<Range, String> {
@@ -910,6 +943,33 @@ fn parse_key_id(params: &HashMap<String, String>) -> Result<Option<u64>, String>
             .map_err(|_| "keyId 必须是数字".to_string()),
         None => Ok(None),
     }
+}
+
+/// 解析可选的分组筛选参数。空字符串视为不传。
+fn parse_group_filter(params: &HashMap<String, String>) -> Option<String> {
+    params
+        .get("group")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// 把 group 名转换为该分组下所有凭据 id 的白名单，给 UsageAggregator 用。
+/// 返回 None 表示未指定分组（不过滤）；返回 Some(空集) 也是合法值——意味着该分组下没有凭据，
+/// 所有 query 都会自然返回空结果。
+fn group_to_cred_ids(
+    state: &AdminState,
+    group: Option<&str>,
+) -> Option<std::collections::HashSet<u64>> {
+    let g = group?;
+    let snapshot = state.service.get_all_credentials();
+    Some(
+        snapshot
+            .credentials
+            .iter()
+            .filter(|c| c.groups.iter().any(|cg| cg == g))
+            .map(|c| c.id)
+            .collect(),
+    )
 }
 
 fn parse_granularity(params: &HashMap<String, String>) -> Result<StatsGranularity, String> {
@@ -999,7 +1059,7 @@ pub async fn stats_overview(State(state): State<AdminState>) -> impl IntoRespons
     Json(response)
 }
 
-/// GET /api/admin/stats/timeseries?range=24h|7d|30d&granularity=hour|day
+/// GET /api/admin/stats/timeseries?range=24h|7d|30d&granularity=hour|day&group=...
 pub async fn stats_timeseries(
     State(state): State<AdminState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
@@ -1008,7 +1068,9 @@ pub async fn stats_timeseries(
         Ok(parts) => parts,
         Err(message) => return stats_bad_request(message),
     };
-    let points = state.usage_aggregator.query_timeseries(window, key_id);
+    let group = parse_group_filter(&params);
+    let cred_ids = group_to_cred_ids(&state, group.as_deref());
+    let points = state.usage_aggregator.query_timeseries(window, key_id, cred_ids.as_ref());
     Json(points).into_response()
 }
 
@@ -1034,14 +1096,24 @@ pub async fn stats_by_credential(
         Ok(parts) => parts,
         Err(message) => return stats_bad_request(message),
     };
-    // 拉一份凭据快照，把 email 附加到响应里方便前端展示
+    let group = parse_group_filter(&params);
+    // 拉一份凭据快照（既给响应附加 email，也用来按 group 构建 cred_ids 白名单，
+    // 避免分别查两次）
     let snapshot = state.service.get_all_credentials();
     let email_map: std::collections::HashMap<u64, Option<String>> = snapshot
         .credentials
         .iter()
         .map(|c| (c.id, c.email.clone()))
         .collect();
-    let data = state.usage_aggregator.query_by_credential(window, key_id);
+    let cred_ids: Option<std::collections::HashSet<u64>> = group.as_deref().map(|g| {
+        snapshot
+            .credentials
+            .iter()
+            .filter(|c| c.groups.iter().any(|cg| cg == g))
+            .map(|c| c.id)
+            .collect()
+    });
+    let data = state.usage_aggregator.query_by_credential(window, key_id, cred_ids.as_ref());
     let enriched: Vec<serde_json::Value> = data
         .into_iter()
         .map(|d| {
@@ -1061,18 +1133,32 @@ pub async fn stats_by_credential(
 
 /// GET /api/admin/traces
 /// 查询请求链路追踪记录（含每跳明细）。
-/// query 参数：status / errorType / credentialId / model / onlyFailed / limit / offset
+/// query 参数：status / errorType / credentialId / keyId / group / model / onlyFailed / limit / offset
 /// 返回：{ records: [...], total: N }
 pub async fn list_traces(
     State(state): State<AdminState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
+    // 解析分组筛选：把 group 名转为凭据 id 白名单（先于查询执行，避免分页错位）
+    let group = params.get("group").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let credential_ids: Option<Vec<u64>> = group.as_ref().map(|g| {
+        state
+            .service
+            .get_all_credentials()
+            .credentials
+            .iter()
+            .filter(|c| c.groups.iter().any(|cg| cg == g))
+            .map(|c| c.id)
+            .collect()
+    });
+
     let query = TraceQuery {
         status: params.get("status").filter(|s| !s.is_empty()).cloned(),
         error_type: params.get("errorType").filter(|s| !s.is_empty()).cloned(),
         credential_id: params
             .get("credentialId")
             .and_then(|s| s.parse::<u64>().ok()),
+        key_id: params.get("keyId").and_then(|s| s.parse::<u64>().ok()),
         failed_attempt_credential_id: params
             .get("failedAttemptCredentialId")
             .and_then(|s| s.parse::<u64>().ok()),
@@ -1081,6 +1167,7 @@ pub async fn list_traces(
             .get("onlyFailed")
             .map(|s| s == "true" || s == "1")
             .unwrap_or(false),
+        credential_ids,
         limit: params
             .get("limit")
             .and_then(|s| s.parse::<usize>().ok())
@@ -1106,12 +1193,20 @@ pub async fn list_traces(
         .into_iter()
         .map(|k| (k.id, k.name))
         .collect();
+    // 入口 Key 名称解析：命中客户端 Key 名称表则取名称，否则回退 #id
+    // （master apiKey 已下线，历史 key_id=0 记录会显示为 #0）
+    let key_label = |key_id: u64| -> String {
+        client_key_name_map
+            .get(&key_id)
+            .cloned()
+            .unwrap_or_else(|| format!("#{}", key_id))
+    };
 
     let enriched: Vec<serde_json::Value> = records
         .into_iter()
         .map(|r| {
             let final_email = email_map.get(&r.final_credential_id).cloned().flatten();
-            let key_name = client_key_name_map.get(&r.key_id).cloned();
+            let key_name = key_label(r.key_id);
             // attempts 里每跳也附 email
             let attempts: Vec<serde_json::Value> = r
                 .attempts
@@ -1150,8 +1245,9 @@ pub async fn list_traces(
                 "outputTokens": r.output_tokens,
                 "cacheCreationTokens": r.cache_creation_tokens,
                 "cacheReadTokens": r.cache_read_tokens,
-                "totalTokens": r.input_tokens + r.output_tokens
-                    + r.cache_creation_tokens + r.cache_read_tokens,
+                "totalTokens": r.input_tokens + r.output_tokens + r.cache_creation_tokens + r.cache_read_tokens,
+                "credits": r.credits,
+                "firstTokenMs": r.first_token_ms,
                 "attempts": attempts,
             })
         })

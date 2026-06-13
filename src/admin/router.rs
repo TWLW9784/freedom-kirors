@@ -112,7 +112,6 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_update_config).put(set_update_config),
         )
         .route("/config/admin-key", put(update_admin_key))
-        .route("/config/api-key", put(update_api_key))
         .route("/system/update/pull", post(pull_update_image))
         .route("/system/update/apply", post(apply_image_update))
         .route("/system/update/rollback", post(rollback_image_update))
