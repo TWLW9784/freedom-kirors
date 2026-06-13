@@ -415,7 +415,7 @@ fn subscription_type_from_title(title: Option<&str>) -> &'static str {
 
 /// GitHub Release 仓库名（owner/repo）。
 /// 在线更新所需的版本号、changelog、二进制资产都从这里取。
-const GITHUB_RELEASES_REPO: &str = "ZyphrZero/kiro.rs";
+const GITHUB_RELEASES_REPO: &str = "TWLW9784/freedom-kirors";
 
 impl AdminService {
     pub fn new(
@@ -1708,6 +1708,12 @@ impl AdminService {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return Err(AdminServiceError::InternalError(format!(
+                    "二次开发仓库 {} 暂无 GitHub Release，在线更新已禁用；请先在该仓库发布 release 后再使用前端更新",
+                    GITHUB_RELEASES_REPO
+                )));
+            }
             return Err(AdminServiceError::InternalError(format!(
                 "GitHub API 返回 {}: {}",
                 status,

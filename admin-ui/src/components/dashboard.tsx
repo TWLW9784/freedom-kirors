@@ -1195,7 +1195,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               </Button>
               <Button variant="ghost" size="icon" asChild title="GitHub 仓库">
                 <a
-                  href="https://github.com/ZyphrZero/kiro.rs"
+                  href="https://github.com/TWLW9784/freedom-kirors"
                   target="_blank"
                   rel="noopener noreferrer"
                   aria-label="GitHub 仓库"

@@ -43,6 +43,7 @@
 - **多凭据调度优化**：增强凭据级并发、最小请求间隔、端点选择、故障冷却和请求追踪能力。
 - **部署安全约束**：默认忽略运行时配置、凭据、客户端 Key、数据库、缓存和备份文件，避免敏感数据进入仓库。
 - **更新日志约束**：每次合并官方仓库、调整本地生产补丁或推送部署仓库时，都必须同步更新 `CHANGELOG.md`，记录变更内容、合并策略、验证结果和敏感文件检查结论。
+- **独立更新源**：在线更新默认使用本仓库的 GitHub Releases（`TWLW9784/freedom-kirors`），不会再从上游官方仓库下载二进制覆盖二次开发版本。
 
 本仓库的目标不是替代上游项目，而是在上游基础上维护一个更贴近实际部署需求的增强版本。合并上游更新时，应优先保留上游架构和安全修复，再把本仓库的生产补丁重新适配进去。
 
@@ -96,7 +97,7 @@ volumes:
 ```bash
 mkdir -p /opt/kiro-rs/data
 cd /opt/kiro-rs
-curl -O https://raw.githubusercontent.com/ZyphrZero/kiro.rs/master/docker-compose.yml
+curl -O https://raw.githubusercontent.com/TWLW9784/freedom-kirors/main/docker-compose.yml
 docker compose up -d
 ```
 

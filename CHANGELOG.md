@@ -16,6 +16,12 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - **敏感文件不上库**：运行时配置、Kiro 凭据、客户端 Key、代理池、trace 数据库、缓存和备份文件必须保持 ignored；推送前做敏感路径和 token 模式检查。
 - **部署状态可追溯**：重要上线动作应记录提交号、构建命令、服务状态和关键接口健康检查结果。
 
+
+### 2026-06-14
+
+- **修正在线更新源**：将前端「在线更新」对应的 GitHub Releases 检查与二进制下载源从上游 `ZyphrZero/kiro.rs` 改为二次开发仓库 `TWLW9784/freedom-kirors`，避免用户在前端点击更新时下载官方二进制覆盖本项目的二开功能。
+- **同步仓库链接**：Admin UI 的 GitHub 链接指向 `TWLW9784/freedom-kirors`；README 补充独立更新源说明。
+
 ### 2026-06-13
 
 - **合并上游 v0.6.6**：同步官方账号分组管理、密钥模型重构、Native web_search 识别收窄等改动，并保留生产部署中的凭据导入去重、实时并发展示、余额展示、压测页、限流监控、代理/端点增强等本地补丁。
