@@ -19,6 +19,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### 2026-06-14
 
+- **并发调度监控弹窗改为人话版**：`limiter-monitor-dialog.tsx` 重写展示层（逻辑零改动）。原来满屏工程术语（limit/梯度/probeCap/RTT/软错误）改为：每个通道一句白话状态（✅健康可提速 / ⏳上游变慢稳住 / ⚠️被限流降速 / 💤空闲）+ 并发占用进度条 + key 翻译为友好通道名 + 逐项 tooltip 解释术语；梯度换算为“上游响应 当前/最快”。
+- **版本 bump 0.6.7 -> 0.6.8**：使发布版本与已上线的前端改动一致。
 - **release workflow 解耦 Docker Hub**：`.github/workflows/release.yaml` 新增 `prepare.docker_enabled` 输出（仅在配置了 `DOCKERHUB_USERNAME` + `DOCKERHUB_TOKEN` 两个 secret 时为 true）；`build-images` / `publish-image-manifest` 以 `if: docker_enabled == 'true'` 门控；`publish-release` 改为 `if: always() && needs.build-artifacts.result == 'success'`，不再硬依赖 Docker job。未配置 Docker secrets 时跳过镜像构建、仍正常发布全平台 GitHub Release 资产；release notes 中 Docker 镜像段落随之条件化。
 - **版本号 bump 到 0.6.7**：用于触发解耦后的全平台 release.yaml 自动构建（7 平台二进制 + SHA256SUMS）。
 - **修正在线更新源**：将前端「在线更新」对应的 GitHub Releases 检查与二进制下载源从上游 `ZyphrZero/kiro.rs` 改为二次开发仓库 `TWLW9784/freedom-kirors`，避免用户在前端点击更新时下载官方二进制覆盖本项目的二开功能。
