@@ -472,9 +472,11 @@ export async function pullUpdateImage(): Promise<ImageUpdateResponse> {
   return data
 }
 
-// 拉取镜像并通过 Docker Compose 应用更新
+// 拉取并应用更新（下载二进制可能耗时较长，给更长超时；响应后进程会自杀重启）
 export async function applyImageUpdate(): Promise<ImageUpdateResponse> {
-  const { data } = await api.post<ImageUpdateResponse>('/system/update/apply')
+  const { data } = await api.post<ImageUpdateResponse>('/system/update/apply', undefined, {
+    timeout: 200000,
+  })
   return data
 }
 

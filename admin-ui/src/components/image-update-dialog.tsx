@@ -172,6 +172,47 @@ export function ImageUpdateDialog({ open, onOpenChange }: ImageUpdateDialogProps
     onError: (err) => toast.error(`验证失败: ${extractErrorMessage(err)}`),
   })
 
+  const [restarting, setRestarting] = useState(false)
+
+  // apply / rollback 都会让进程 2 秒后自杀重启：那一刻前端的 HTTP 连接会被切断，
+  // axios 抛出无 response 的网络错误。这并不是失败——服务正在重启。
+  // 这里统一处理：进入「重启中」态，轮询 check 直到新版本回来。
+  function enterRestarting(targetMsg: string) {
+    setRestarting(true)
+    setLastOutput(targetMsg)
+    let tries = 0
+    const timer = window.setInterval(async () => {
+      tries += 1
+      try {
+        const info = await checkSystemUpdate(false)
+        // 服务回来了
+        queryClient.setQueryData(['system-update-check'], info)
+        queryClient.invalidateQueries({ queryKey: ['update-config'] })
+        window.clearInterval(timer)
+        setRestarting(false)
+        if (!info.hasUpdate) {
+          toast.success(`已更新并重启完成，当前 v${info.currentVersion}`)
+        } else {
+          toast.success('服务已重启')
+        }
+      } catch {
+        // 还没起来，继续等；最多等 ~60 秒
+        if (tries >= 30) {
+          window.clearInterval(timer)
+          setRestarting(false)
+          toast.message('服务重启耗时较长，请手动刷新页面确认版本')
+        }
+      }
+    }, 2000)
+  }
+
+  function isRestartDrop(err: unknown): boolean {
+    // axios：网络错误 / 无响应 / 超时，均视为「连接被重启切断」
+    const e = err as { response?: unknown; code?: string; message?: string }
+    if (e?.response) return false
+    return true
+  }
+
   const pullMutation = useMutation({
     mutationFn: pullUpdateImage,
     onSuccess: (res) => {
@@ -184,25 +225,40 @@ export function ImageUpdateDialog({ open, onOpenChange }: ImageUpdateDialogProps
   const applyMutation = useMutation({
     mutationFn: applyImageUpdate,
     onSuccess: (res) => {
-      setLastOutput(res.output || res.message)
-      toast.success(res.message)
-      queryClient.invalidateQueries({ queryKey: ['update-config'] })
+      // 后端返回成功（进程将在 2 秒后退出），直接进入重启等待
+      enterRestarting(res.output || res.message || '已触发更新，服务正在重启…')
+      toast.success(res.message || '已触发更新，服务正在重启')
     },
-    onError: (err) => toast.error(`更新失败: ${extractErrorMessage(err)}`),
+    onError: (err) => {
+      if (isRestartDrop(err)) {
+        // 连接被重启切断 = 预期行为，不是失败
+        enterRestarting('已触发更新，服务正在重启…')
+        toast.success('已触发更新，服务正在重启')
+      } else {
+        toast.error(`更新失败: ${extractErrorMessage(err)}`)
+      }
+    },
   })
 
   const rollbackMutation = useMutation({
     mutationFn: rollbackImageUpdate,
     onSuccess: (res) => {
-      setLastOutput(res.output || res.message)
-      toast.success(res.message)
-      queryClient.invalidateQueries({ queryKey: ['update-config'] })
+      enterRestarting(res.output || res.message || '已触发回退，服务正在重启…')
+      toast.success(res.message || '已触发回退，服务正在重启')
     },
-    onError: (err) => toast.error(`回退失败: ${extractErrorMessage(err)}`),
+    onError: (err) => {
+      if (isRestartDrop(err)) {
+        enterRestarting('已触发回退，服务正在重启…')
+        toast.success('已触发回退，服务正在重启')
+      } else {
+        toast.error(`回退失败: ${extractErrorMessage(err)}`)
+      }
+    },
   })
 
   const busy =
     isLoading ||
+    restarting ||
     pullMutation.isPending ||
     applyMutation.isPending ||
     rollbackMutation.isPending ||
@@ -533,12 +589,12 @@ export function ImageUpdateDialog({ open, onOpenChange }: ImageUpdateDialogProps
                   : '正在检查更新…'
             }
           >
-            {applyMutation.isPending ? (
+            {applyMutation.isPending || restarting ? (
               <RefreshCw className="h-4 w-4 mr-2 animate-spin" />
             ) : (
               <UploadCloud className="h-4 w-4 mr-2" />
             )}
-            更新并重启
+            {restarting ? '重启中…' : '更新并重启'}
           </Button>
         </DialogFooter>
       </DialogContent>

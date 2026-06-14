@@ -380,8 +380,10 @@ jobs:
           VERSION="${{ needs.prepare.outputs.version }}"
           IMAGE="${{ needs.prepare.outputs.image }}"
 
-          # 优先从 CHANGELOG.md 抽取当前版本的内容（使用 awk 匹配
-          # `## [VERSION]` 到下一个 `## ` 之间的段落，去掉首行标题）
+          # 优先从 CHANGELOG.md 抽取当前版本的内容：
+          #  1) 先找 `## [VERSION]` 到下一个 `## ` 之间的段落（去首行标题）
+          #  2) 若未命中，退而抽取第一个 `### YYYY-MM-DD` 日期小节（去首行标题），
+          #     避免 release notes 退化成一句占位文。
           if [ -f CHANGELOG.md ]; then
             awk -v ver="$VERSION" '
               BEGIN { found = 0 }
@@ -391,6 +393,19 @@ jobs:
               }
               found { print }
             ' CHANGELOG.md > RELEASE_NOTES.md
+
+            # 未命中版本号标题时，抽取第一个日期小节作为 fallback
+            if [ ! -s RELEASE_NOTES.md ]; then
+              awk '
+                BEGIN { found = 0 }
+                /^### [0-9]{4}-[0-9]{2}-[0-9]{2}/ {
+                  if (found) exit
+                  found = 1; next
+                }
+                /^## / { if (found) exit }
+                found { print }
+              ' CHANGELOG.md > RELEASE_NOTES.md
+            fi
           fi
 
           # Docker 镜像块：仅在启用 Docker 发布时写入
