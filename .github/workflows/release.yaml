@@ -33,6 +33,7 @@ jobs:
       image: ${{ steps.meta.outputs.image }}
       prerelease: ${{ steps.meta.outputs.prerelease }}
       target: ${{ steps.meta.outputs.target }}
+      docker_enabled: ${{ steps.meta.outputs.docker_enabled }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -45,6 +46,11 @@ jobs:
           # job outputs would be redacted to an empty string when passed across jobs.
           DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
           REPO_OWNER: ${{ github.repository_owner }}
+          # Docker 推送是可选的：只有同时配置了 DOCKERHUB_USERNAME / DOCKERHUB_TOKEN
+          # 两个 secret 时才构建并推送镜像，否则跳过 Docker 相关 job，
+          # release 仍照常发布（解除对 Docker Hub 的硬依赖）。
+          HAS_DOCKER_USER: ${{ secrets.DOCKERHUB_USERNAME != '' }}
+          HAS_DOCKER_TOKEN: ${{ secrets.DOCKERHUB_TOKEN != '' }}
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
@@ -86,6 +92,14 @@ jobs:
           echo "image=${NAMESPACE}/kiro-rs" >> "$GITHUB_OUTPUT"
           echo "prerelease=${PRERELEASE}" >> "$GITHUB_OUTPUT"
           echo "target=${TARGET}" >> "$GITHUB_OUTPUT"
+
+          if [ "$HAS_DOCKER_USER" = "true" ] && [ "$HAS_DOCKER_TOKEN" = "true" ]; then
+            DOCKER_ENABLED=true
+          else
+            DOCKER_ENABLED=false
+            echo "::notice::Docker Hub secrets 未配置，跳过镜像构建/推送，仅发布 GitHub Release 资产。"
+          fi
+          echo "docker_enabled=${DOCKER_ENABLED}" >> "$GITHUB_OUTPUT"
 
   build-frontend:
     name: Build admin-ui
@@ -242,6 +256,7 @@ jobs:
     needs:
       - prepare
       - build-artifacts
+    if: needs.prepare.outputs.docker_enabled == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -308,6 +323,7 @@ jobs:
     needs:
       - prepare
       - build-images
+    if: needs.prepare.outputs.docker_enabled == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Log in to Docker Hub
@@ -340,6 +356,9 @@ jobs:
       - prepare
       - build-artifacts
       - publish-image-manifest
+    # Docker 相关 job 可能被跳过（未配 secrets）或失败，不应阻断 release 发布。
+    # 只要上游的 build-artifacts 成功就发布；用 always() + 显式检查 build-artifacts 结果。
+    if: ${{ always() && needs.build-artifacts.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -354,6 +373,8 @@ jobs:
 
       - name: Write release notes
         shell: bash
+        env:
+          DOCKER_ENABLED: ${{ needs.prepare.outputs.docker_enabled }}
         run: |
           set -euo pipefail
           VERSION="${{ needs.prepare.outputs.version }}"
@@ -372,29 +393,24 @@ jobs:
             ' CHANGELOG.md > RELEASE_NOTES.md
           fi
 
+          # Docker 镜像块：仅在启用 Docker 发布时写入
+          if [ "$DOCKER_ENABLED" = "true" ]; then
+            DOCKER_BLOCK="$(printf 'Docker image:\n\n```text\n%s:%s\n%s:latest\n```\n\n' "$IMAGE" "$VERSION" "$IMAGE")"
+          else
+            DOCKER_BLOCK=""
+          fi
+
           if [ ! -s RELEASE_NOTES.md ]; then
-            cat > RELEASE_NOTES.md <<EOF
-          Docker image:
-
-          \`\`\`text
-          ${IMAGE}:${VERSION}
-          ${IMAGE}:latest
-          \`\`\`
-
-          Release assets include \`SHA256SUMS.txt\` for checksum verification.
-          EOF
+            {
+              [ -n "$DOCKER_BLOCK" ] && printf '%s' "$DOCKER_BLOCK"
+              echo "Release assets include \`SHA256SUMS.txt\` for checksum verification."
+            } > RELEASE_NOTES.md
           else
             {
               echo
               echo "---"
               echo
-              echo "Docker image:"
-              echo
-              echo '```text'
-              echo "${IMAGE}:${VERSION}"
-              echo "${IMAGE}:latest"
-              echo '```'
-              echo
+              [ -n "$DOCKER_BLOCK" ] && printf '%s' "$DOCKER_BLOCK"
               echo "Release assets include \`SHA256SUMS.txt\` for checksum verification."
             } >> RELEASE_NOTES.md
           fi

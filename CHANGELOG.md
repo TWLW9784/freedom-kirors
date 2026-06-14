@@ -19,6 +19,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### 2026-06-14
 
+- **release workflow 解耦 Docker Hub**：`.github/workflows/release.yaml` 新增 `prepare.docker_enabled` 输出（仅在配置了 `DOCKERHUB_USERNAME` + `DOCKERHUB_TOKEN` 两个 secret 时为 true）；`build-images` / `publish-image-manifest` 以 `if: docker_enabled == 'true'` 门控；`publish-release` 改为 `if: always() && needs.build-artifacts.result == 'success'`，不再硬依赖 Docker job。未配置 Docker secrets 时跳过镜像构建、仍正常发布全平台 GitHub Release 资产；release notes 中 Docker 镜像段落随之条件化。
+- **版本号 bump 到 0.6.7**：用于触发解耦后的全平台 release.yaml 自动构建（7 平台二进制 + SHA256SUMS）。
 - **修正在线更新源**：将前端「在线更新」对应的 GitHub Releases 检查与二进制下载源从上游 `ZyphrZero/kiro.rs` 改为二次开发仓库 `TWLW9784/freedom-kirors`，避免用户在前端点击更新时下载官方二进制覆盖本项目的二开功能。
 - **同步仓库链接**：Admin UI 的 GitHub 链接指向 `TWLW9784/freedom-kirors`；README 补充独立更新源说明。
 - **修复 API Key 凭据模型测试**：API Key 凭据固定使用 `cli` 端点；启动时自动把历史中空端点/`ide` 端点的 API Key 凭据迁移为 `cli`，避免点击模型测试时报 `403 The bearer token included in the request is invalid`。
