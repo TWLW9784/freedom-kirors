@@ -3,6 +3,32 @@
 use crate::admin::proxy_pool::ProxyHealth;
 use serde::{Deserialize, Serialize};
 
+/// 反序列化 `Option<Option<u64>>` 限额字段：字段存在时调用本函数。
+/// `null` 或 `0` 视为清除限额（`Some(None)`）；`>0` 为设置（`Some(Some(v))`）。
+/// 字段缺失时由 `#[serde(default)]` 接管返回 `None`（不修改）。
+pub fn de_opt_opt_u64<'de, D>(deserializer: D) -> Result<Option<Option<u64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v: Option<u64> = Option::deserialize(deserializer)?;
+    Ok(Some(match v {
+        Some(0) | None => None,
+        Some(n) => Some(n),
+    }))
+}
+
+/// 同 [`de_opt_opt_u64`]，针对 credit 的 f64 限额。`null`/`<=0` 视为清除。
+pub fn de_opt_opt_f64<'de, D>(deserializer: D) -> Result<Option<Option<f64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v: Option<f64> = Option::deserialize(deserializer)?;
+    Ok(Some(match v {
+        Some(x) if x > 0.0 => Some(x),
+        _ => None,
+    }))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(default)]
@@ -59,6 +85,8 @@ pub struct CredentialStatusItem {
     pub id: u64,
     /// 优先级（数字越小优先级越高）
     pub priority: u32,
+    /// 负载均衡权重（balanced 模式生效，默认 1）
+    pub weight: u32,
     /// 是否被禁用
     pub disabled: bool,
     /// 连续失败次数
@@ -150,6 +178,14 @@ pub struct SetDisabledRequest {
 pub struct SetPriorityRequest {
     /// 新优先级值
     pub priority: u32,
+}
+
+/// 修改负载均衡权重请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetWeightRequest {
+    /// 新权重值（最小 1）
+    pub weight: u32,
 }
 
 /// 设置凭据级最大并发请求
@@ -814,8 +850,16 @@ pub struct ClientKeyItem {
     pub total_output_tokens: u64,
     pub total_cache_creation_tokens: u64,
     pub total_cache_read_tokens: u64,
+    /// 累计消耗 credit（用于与 credit_limit 对比）
+    pub total_credits: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// Token 上限（未设置不返回）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_limit: Option<u64>,
+    /// Credit 上限（未设置不返回）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit_limit: Option<f64>,
     /// 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换）
     #[serde(default)]
     pub is_system: bool,
@@ -838,6 +882,12 @@ pub struct CreateClientKeyRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub group: Option<String>,
+    /// Token 上限（input+output 总和，超限 429）。None / 0 = 不限。
+    #[serde(default)]
+    pub token_limit: Option<u64>,
+    /// Credit 上限（累计超限 429）。None / 0 = 不限。
+    #[serde(default)]
+    pub credit_limit: Option<f64>,
 }
 
 /// 创建客户端 Key 响应（明文 Key 仅在此处返回一次）
@@ -858,6 +908,12 @@ pub struct UpdateClientKeyRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub group: Option<String>,
+    /// Token 上限：字段缺失=不改；null 或 0 = 清除限额；>0 = 设置。
+    #[serde(default, deserialize_with = "crate::admin::types::de_opt_opt_u64")]
+    pub token_limit: Option<Option<u64>>,
+    /// Credit 上限：字段缺失=不改；null 或 0 = 清除限额；>0 = 设置。
+    #[serde(default, deserialize_with = "crate::admin::types::de_opt_opt_f64")]
+    pub credit_limit: Option<Option<f64>>,
 }
 
 // ============ IdC 设备授权登录 ============

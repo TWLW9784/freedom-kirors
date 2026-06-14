@@ -17,6 +17,34 @@ impl Default for TlsBackend {
     }
 }
 
+/// 用户自定义的单条 prompt 过滤规则。
+///
+/// `kind` 取值：
+/// - `"regex"`：在整个 prompt 上做正则查找替换（`replace` 为空 = 删除匹配）。
+/// - `"lines-containing"` / `"contains"`：移除包含 `pattern` 子串的整行（大小写不敏感）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptFilterRule {
+    /// 唯一标识（可选）
+    #[serde(default)]
+    pub id: String,
+    /// 人类可读名称（可选）
+    #[serde(default)]
+    pub name: String,
+    /// 规则类型："regex" 或 "lines-containing"/"contains"
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    /// 匹配模式（regex 正则或子串）
+    #[serde(rename = "match", default)]
+    pub pattern: String,
+    /// 替换串（仅 regex 生效；空 = 删除匹配）
+    #[serde(default)]
+    pub replace: String,
+    /// 是否启用
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -191,6 +219,25 @@ pub struct Config {
     #[serde(default = "default_usage_log_retention_days")]
     pub usage_log_retention_days: u32,
 
+    /// 是否检测 Claude Code CLI 内置 system prompt 并替换为精简后端提示词。
+    /// 默认 false（不改动上游内容）。开启后可显著省 token 并降低提示词注入面。
+    #[serde(default)]
+    pub filter_claude_code: bool,
+
+    /// 是否剥离 system prompt 中的环境噪声行（gitStatus、近期提交、知识截止、
+    /// `# Environment` / `# auto memory` 段落、`<fast_mode_info>` 等）。默认 false。
+    #[serde(default)]
+    pub filter_env_noise: bool,
+
+    /// 是否移除 `--- SYSTEM PROMPT ---` / `--- END SYSTEM PROMPT ---` 边界标记行。默认 false。
+    #[serde(default)]
+    pub filter_strip_boundaries: bool,
+
+    /// 用户自定义 prompt 过滤规则（regex 替换 或 行级包含过滤）。默认空。
+    /// 在内置过滤之后、按数组顺序逐条应用，仅对 `enabled=true` 的规则生效。
+    #[serde(default)]
+    pub prompt_filter_rules: Vec<PromptFilterRule>,
+
     /// 端点特定的配置
     ///
     /// 键为端点名（如 "ide" / "cli"），值为该端点自由定义的参数对象。
@@ -348,6 +395,10 @@ impl Default for Config {
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
+            filter_claude_code: false,
+            filter_env_noise: false,
+            filter_strip_boundaries: false,
+            prompt_filter_rules: Vec::new(),
             endpoints: HashMap::new(),
             config_path: None,
         }

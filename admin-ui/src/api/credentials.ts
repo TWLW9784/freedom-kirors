@@ -153,6 +153,18 @@ export async function setCredentialPriority(
   return data
 }
 
+// 设置凭据负载均衡权重（balanced 模式生效，最小 1）
+export async function setCredentialWeight(
+  id: number,
+  weight: number
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/${id}/weight`,
+    { weight }
+  )
+  return data
+}
+
 // 设置凭据级最大并发（传 null 清除覆盖、回退账号档位默认）
 export async function setCredentialMaxInFlight(
   id: number,

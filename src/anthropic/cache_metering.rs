@@ -31,6 +31,22 @@ const MAX_TTL_SECS: i64 = 3600;
 /// 默认 TTL（5min，ephemeral 默认值）
 const DEFAULT_TTL_SECS: i64 = 5 * 60;
 
+/// 最小可缓存 prompt token 阈值（与 Anthropic 官方对齐）：
+/// 累计 token 低于该阈值的前缀，Anthropic 不会写入缓存，因此我们也不应
+/// 将这些段计入 cache_read/cache_creation，否则会让短请求误报缓存命中。
+/// Opus 系列阈值更高（4096），其余模型 1024。
+const OPUS_MIN_CACHEABLE_TOKENS: u32 = 4096;
+const DEFAULT_MIN_CACHEABLE_TOKENS: u32 = 1024;
+
+/// 按模型名判定该请求的最小可缓存 token 阈值。
+fn min_cacheable_tokens(model: &str) -> u32 {
+    if model.to_ascii_lowercase().contains("opus") {
+        OPUS_MIN_CACHEABLE_TOKENS
+    } else {
+        DEFAULT_MIN_CACHEABLE_TOKENS
+    }
+}
+
 /// 单个缓存条目
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheEntry {
@@ -320,9 +336,35 @@ struct Segment {
 /// 请求 metadata 里的 session，否则退回 key_id），使不同会话 / 不同客户端 Key 的
 /// 缓存互不命中——同一前缀只在同一会话内复用。
 pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u64) -> CacheUsage {
+    let min_tokens = min_cacheable_tokens(&req.model);
+    compute_cache_usage_with_min(cache, req, key_id, min_tokens)
+}
+
+/// [`compute_cache_usage`] 的内部实现，`min_tokens` 显式传入（方便测试传 0）。
+fn compute_cache_usage_with_min(
+    cache: &CacheMeter,
+    req: &MessagesRequest,
+    key_id: u64,
+    min_tokens: u32,
+) -> CacheUsage {
     let (segments, prompt_total_est) = extract_segments(req, key_id);
     if segments.is_empty() {
         // 无断点：仍带出 prompt_total_est 以便调用方将来扩展，但 covered=0 → 全入 input。
+        return CacheUsage {
+            prompt_total_est: prompt_total_est as i32,
+            ..Default::default()
+        };
+    }
+
+    // 最小可缓存阈值过滤：Anthropic 不缓存累计 token 低于阈值的前缀段。
+    // 丢弃这些段后，若已无可缓存段则直接全入 input，避免短请求误报命中。
+    // 最小可缓存阈值过滤：Anthropic 不缓存累计 token 低于阈值的前缀段。
+    // 丢弃这些段后，若已无可缓存段则直接全入 input，避免短请求误报命中。
+    let segments: Vec<Segment> = segments
+        .into_iter()
+        .filter(|s| s.cumulative_tokens >= min_tokens)
+        .collect();
+    if segments.is_empty() {
         return CacheUsage {
             prompt_total_est: prompt_total_est as i32,
             ..Default::default()
@@ -653,6 +695,11 @@ fn image_source_parts(v: &serde_json::Value) -> (&str, &str) {
 mod tests {
     use super::*;
 
+    /// 测试专用：以 min_tokens=0 调用，保持加阈值前的原有判定行为。
+    fn cu(cache: &CacheMeter, req: &MessagesRequest, key_id: u64) -> CacheUsage {
+        compute_cache_usage_with_min(cache, req, key_id, 0)
+    }
+
     #[test]
     fn lookup_miss_then_record_then_hit() {
         let cache = CacheMeter::new(None);
@@ -742,13 +789,78 @@ mod tests {
         }
     }
 
+    /// 最小可缓存阈值：opus 系列下累计 token < 4096 的前缀不应被缓存。
+    /// 走 public compute_cache_usage（带模型推断阈值）验证过滤生效。
+    #[test]
+    fn min_cacheable_threshold_skips_short_prefix_for_opus() {
+        use super::super::types::{CacheControl, Message, MessagesRequest, SystemMessage};
+        // 短 system：约几十 token，远低于 opus 阈值 4096。
+        let short_req = MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 32,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String("Hello".to_string()),
+            }],
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: "You are a helpful assistant.".to_string(),
+                cache_control: Some(CacheControl {
+                    cache_type: "ephemeral".to_string(),
+                    ttl: None,
+                }),
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        let cache = CacheMeter::new(None);
+        let u = compute_cache_usage(&cache, &short_req, 1);
+        assert_eq!(
+            u.cache_covered_est, 0,
+            "opus 下短前缀低于 4096 阈值，不应被缓存覆盖"
+        );
+        assert_eq!(u.cache_read, 0);
+
+        // 足量 system：重复拼接到远超 4096 token，应被缓存覆盖。
+        let long_req = MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 32,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String("Hello".to_string()),
+            }],
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: "You are a helpful coding assistant. ".repeat(2000),
+                cache_control: Some(CacheControl {
+                    cache_type: "ephemeral".to_string(),
+                    ttl: None,
+                }),
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        let u2 = compute_cache_usage(&cache, &long_req, 1);
+        assert!(
+            u2.cache_covered_est > 0,
+            "opus 下足量前缀应被缓存覆盖，covered={}",
+            u2.cache_covered_est
+        );
+    }
+
     #[test]
     fn compute_cache_usage_first_miss_then_hit() {
         let cache = CacheMeter::new(None);
         let req = build_request_with_system_breakpoint();
 
         // 第一次：所有段都 miss → 覆盖前缀全部算 creation（read == 0）。
-        let u1 = compute_cache_usage(&cache, &req, 1);
+        let u1 = cu(&cache, &req, 1);
         assert!(u1.cache_covered_est > 0, "first call should cover prefix");
         assert_eq!(u1.cache_read, 0, "first call has nothing cached to read");
         // 用真实 total 分摊：全部进 creation，input = total − covered。
@@ -759,7 +871,7 @@ mod tests {
         assert_eq!(in1 + cc1 + cr1, total, "互斥口径必须自洽");
 
         // 第二次：相同请求 → 命中，覆盖前缀全部算 read（creation == 0）。
-        let u2 = compute_cache_usage(&cache, &req, 1);
+        let u2 = cu(&cache, &req, 1);
         assert!(u2.cache_read > 0, "second call should hit");
         let (in2, cc2, cr2) = u2.split_against_total(total);
         assert_eq!(cc2, 0, "second call creation should be 0, got {}", cc2);
@@ -817,7 +929,7 @@ mod tests {
             output_config: None,
             metadata: None,
         };
-        let u = compute_cache_usage(&cache, &req, 1);
+        let u = cu(&cache, &req, 1);
         assert_eq!(u.cache_covered_est, 0);
         assert_eq!(u.split_against_total(123), (123, 0, 0));
     }
@@ -885,12 +997,12 @@ mod tests {
 
         let cache = CacheMeter::new(None);
         // 第一次：用一种插入顺序，应写缓存（miss → read==0）。
-        let u1 = compute_cache_usage(&cache, &make_req(false), 1);
+        let u1 = cu(&cache, &make_req(false), 1);
         assert!(u1.cache_covered_est > 0, "first call should cover prefix");
         assert_eq!(u1.cache_read, 0);
 
         // 第二次：换一种插入顺序但逻辑等价，应命中缓存（read 等于第一次覆盖前缀）。
-        let u2 = compute_cache_usage(&cache, &make_req(true), 1);
+        let u2 = cu(&cache, &make_req(true), 1);
         assert_eq!(
             u2.cache_read, u1.cache_covered_est,
             "schema 顺序不应影响命中：second read 应等于 first covered"
@@ -970,7 +1082,7 @@ mod tests {
             msg_with_cc("assistant", &body, false),
             user_text("next question one"),
         ]);
-        let u1 = compute_cache_usage(&cache, &turn1, 1);
+        let u1 = cu(&cache, &turn1, 1);
         assert!(u1.cache_covered_est > 0);
         assert_eq!(u1.cache_read, 0, "turn1 无历史可命中");
 
@@ -984,7 +1096,7 @@ mod tests {
             msg_with_cc("assistant", &body, false),
             user_text("next question two"),
         ]);
-        let u2 = compute_cache_usage(&cache, &turn2, 1);
+        let u2 = cu(&cache, &turn2, 1);
         assert!(
             u2.cache_read > 0,
             "turn2 应命中 turn1 的历史前缀（即便工具块带 id）"
@@ -1011,7 +1123,7 @@ mod tests {
             msg_with_cc("assistant", &body, false),
             msg_with_cc("user", &body, true),
         ]);
-        let u3 = compute_cache_usage(&cache, &turn3, 1);
+        let u3 = cu(&cache, &turn3, 1);
         assert!(u3.cache_covered_est > 0, "turn3 should create cache");
         assert_eq!(u3.cache_read, 0, "turn3 has no prior cache to read");
 
@@ -1027,7 +1139,7 @@ mod tests {
             msg_with_cc("assistant", &body, false),
             msg_with_cc("user", &body, true),
         ]);
-        let u4 = compute_cache_usage(&cache, &turn4, 1);
+        let u4 = cu(&cache, &turn4, 1);
         assert!(u4.cache_read > 0, "turn4 should hit a prior-turn prefix");
         // turn4 命中的最深前缀 = turn3 的最深段（idx3 前缀，即 turn3 的 covered）。
         assert_eq!(
@@ -1052,7 +1164,7 @@ mod tests {
             msg_with_cc("assistant", &body, false),
             msg_with_cc("user", &body, false),
         ]);
-        let u1 = compute_cache_usage(&cache, &turn1, 1);
+        let u1 = cu(&cache, &turn1, 1);
         assert!(u1.cache_covered_est > 0, "应为历史前缀创建缓存段");
         assert_eq!(u1.cache_read, 0);
 
@@ -1063,7 +1175,7 @@ mod tests {
             msg_with_cc("assistant", &body, false),
             msg_with_cc("user", &body, false),
         ]);
-        let u2 = compute_cache_usage(&cache, &turn2, 1);
+        let u2 = cu(&cache, &turn2, 1);
         assert!(u2.cache_read > 0, "无 cache_control 也应跨轮命中历史前缀");
     }
 
@@ -1104,7 +1216,7 @@ mod tests {
 
         let cache = CacheMeter::new(None);
         // Turn 1：动态头 = "now=1001"，3 条消息。
-        let u1 = compute_cache_usage(
+        let u1 = cu(
             &cache,
             &make_req(
                 "now=1001",
@@ -1121,7 +1233,7 @@ mod tests {
 
         // Turn 2：动态头变成 "now=2002"（不同！），追加一对 a/u。
         // 跳过动态头后，sys[1]+历史前缀逐字节不变 → 必须命中。
-        let u2 = compute_cache_usage(
+        let u2 = cu(
             &cache,
             &make_req(
                 "now=2002",
@@ -1154,14 +1266,14 @@ mod tests {
             ]
         };
         // Key=1 建立缓存。
-        let a = compute_cache_usage(&cache, &req_with_messages(msgs()), 1);
+        let a = cu(&cache, &req_with_messages(msgs()), 1);
         assert!(a.cache_covered_est > 0);
         assert_eq!(a.cache_read, 0);
         // Key=2 相同内容，但隔离种子不同 → 不命中（视为新建）。
-        let b = compute_cache_usage(&cache, &req_with_messages(msgs()), 2);
+        let b = cu(&cache, &req_with_messages(msgs()), 2);
         assert_eq!(b.cache_read, 0, "不同 key_id 不应命中彼此的前缀");
         // Key=1 再来一次相同内容 → 命中自己上次写入的。
-        let c = compute_cache_usage(&cache, &req_with_messages(msgs()), 1);
+        let c = cu(&cache, &req_with_messages(msgs()), 1);
         assert!(c.cache_read > 0, "同一 key_id 应命中自己的前缀");
     }
 
@@ -1199,11 +1311,11 @@ mod tests {
         };
         let cache = CacheMeter::new(None);
         // 同 key_id（都为 0），仅 session 不同——靠 metadata session 隔离。
-        let s1a = compute_cache_usage(&cache, &make("aaa"), 0);
+        let s1a = cu(&cache, &make("aaa"), 0);
         assert_eq!(s1a.cache_read, 0);
-        let s2 = compute_cache_usage(&cache, &make("bbb"), 0);
+        let s2 = cu(&cache, &make("bbb"), 0);
         assert_eq!(s2.cache_read, 0, "不同 session 不应命中");
-        let s1b = compute_cache_usage(&cache, &make("aaa"), 0);
+        let s1b = cu(&cache, &make("aaa"), 0);
         assert!(s1b.cache_read > 0, "相同 session 应命中");
     }
 
@@ -1244,7 +1356,7 @@ mod tests {
             output_config: None,
             metadata: None,
         };
-        let u = compute_cache_usage(&CacheMeter::new(None), &req, 1);
+        let u = cu(&CacheMeter::new(None), &req, 1);
         // 历史段（第一条）的 covered 应严格等于纯文本 estimate——
         // 不含 "user" role、"block:" 前缀、"|" 分隔符的任何 token。
         let pure = estimate_tokens(history_text) as i32;
@@ -1298,7 +1410,7 @@ mod tests {
 
         let cache = CacheMeter::new(None);
         // Turn 1：含图的 user 是历史第一段，其 covered 必须包含图片 token。
-        let u1 = compute_cache_usage(&cache, &make("q1"), 1);
+        let u1 = cu(&cache, &make("q1"), 1);
         let text_only = estimate_tokens("describe") as i32;
         // 最深历史段至少覆盖到 [含图user] 段，covered 应 ≥ 图片 token（远大于纯文本）。
         assert!(
@@ -1310,7 +1422,7 @@ mod tests {
         assert_eq!(u1.cache_read, 0);
 
         // Turn 2：追加一轮，含图历史逐字节不变 → 命中（read 含图片 token）。
-        let u2 = compute_cache_usage(&cache, &make("q2"), 1);
+        let u2 = cu(&cache, &make("q2"), 1);
         assert!(
             u2.cache_read >= img_tokens,
             "含图历史应跨轮命中且 read({}) 含图片 token({})",

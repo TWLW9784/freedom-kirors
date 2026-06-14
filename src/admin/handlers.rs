@@ -99,6 +99,24 @@ pub async fn set_credential_priority(
     }
 }
 
+/// POST /api/admin/credentials/:id/weight
+/// 设置凭据负载均衡权重（balanced 模式生效）
+pub async fn set_credential_weight(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<super::types::SetWeightRequest>,
+) -> impl IntoResponse {
+    let weight = payload.weight.max(1);
+    match state.service.set_weight(id, weight) {
+        Ok(_) => Json(SuccessResponse::new(format!(
+            "凭据 #{} 权重已设置为 {}",
+            id, weight
+        )))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// POST /api/admin/credentials/:id/max-in-flight
 /// 设置凭据级最大并发（max_in_flight 为 null 时清除覆盖、回退档位默认）
 pub async fn set_credential_max_in_flight(
@@ -788,7 +806,10 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
         total_output_tokens: k.total_output_tokens,
         total_cache_creation_tokens: k.total_cache_creation_tokens,
         total_cache_read_tokens: k.total_cache_read_tokens,
+        total_credits: k.total_credits,
         group: k.group.clone(),
+        token_limit: k.token_limit,
+        credit_limit: k.credit_limit,
         is_system: k.is_system,
     }
 }
@@ -829,6 +850,8 @@ pub async fn create_client_key(
             .group
             .map(|g| g.trim().to_string())
             .filter(|g| !g.is_empty()),
+        payload.token_limit.filter(|&t| t > 0),
+        payload.credit_limit.filter(|&c| c > 0.0),
     );
     Json(CreateClientKeyResponse {
         id: entry.id,
@@ -884,7 +907,14 @@ pub async fn update_client_key(
             let t = g.trim();
             if t.is_empty() { None } else { Some(t.to_string()) }
         });
-    if state.client_keys.update_meta(id, payload.name, description, group) {
+    if state.client_keys.update_meta(
+        id,
+        payload.name,
+        description,
+        group,
+        payload.token_limit,
+        payload.credit_limit,
+    ) {
         Json(SuccessResponse::new(format!("Key #{} 已更新", id))).into_response()
     } else {
         (

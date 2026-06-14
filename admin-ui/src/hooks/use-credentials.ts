@@ -3,6 +3,7 @@ import {
   getCredentials,
   setCredentialDisabled,
   setCredentialPriority,
+  setCredentialWeight,
   setCredentialMaxInFlight,
   resetCredentialFailure,
   forceRefreshToken,
@@ -73,6 +74,18 @@ export function useSetPriority() {
   return useMutation({
     mutationFn: ({ id, priority }: { id: number; priority: number }) =>
       setCredentialPriority(id, priority),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 设置凭据负载均衡权重（balanced 模式生效）
+export function useSetWeight() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, weight }: { id: number; weight: number }) =>
+      setCredentialWeight(id, weight),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },

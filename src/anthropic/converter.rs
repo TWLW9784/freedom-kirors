@@ -918,6 +918,9 @@ fn build_history(
             .collect::<Vec<_>>()
             .join("\n");
 
+        // 应用 prompt 过滤（默认全部关闭时原样返回）。在追加 kiro-rs 自身策略前过滤。
+        let system_content = super::prompt_filter::apply(&system_content);
+
         if !system_content.is_empty() {
             // 追加分块写入策略到系统消息
             let system_content = format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY);

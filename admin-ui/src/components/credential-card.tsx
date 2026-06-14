@@ -44,6 +44,7 @@ import { maskProxyUrl, extractErrorMessage, overageFailureMessage } from "@/lib/
 import {
   useSetDisabled,
   useSetPriority,
+  useSetWeight,
   useSetMaxInFlight,
   useResetFailure,
   useDeleteCredential,
@@ -220,6 +221,10 @@ export function CredentialCard({
   const [priorityValue, setPriorityValue] = useState(
     String(credential.priority),
   );
+  const [editingWeight, setEditingWeight] = useState(false);
+  const [weightValue, setWeightValue] = useState(
+    String(credential.weight ?? 1),
+  );
   const [editingMaxInFlight, setEditingMaxInFlight] = useState(false);
   const [maxInFlightValue, setMaxInFlightValue] = useState(
     credential.maxInFlight != null ? String(credential.maxInFlight) : "",
@@ -233,6 +238,7 @@ export function CredentialCard({
 
   const setDisabled = useSetDisabled();
   const setPriority = useSetPriority();
+  const setWeight = useSetWeight();
   const setMaxInFlight = useSetMaxInFlight();
   const resetFailure = useResetFailure();
   const deleteCredential = useDeleteCredential();
@@ -347,6 +353,24 @@ export function CredentialCard({
         onSuccess: (res) => {
           toast.success(res.message);
           setEditingPriority(false);
+        },
+        onError: (err) => toast.error("操作失败: " + (err as Error).message),
+      },
+    );
+  };
+
+  const handleWeightChange = () => {
+    const nw = parseInt(weightValue, 10);
+    if (isNaN(nw) || nw < 1) {
+      toast.error("权重必须是≥ 1 的整数");
+      return;
+    }
+    setWeight.mutate(
+      { id: credential.id, weight: nw },
+      {
+        onSuccess: (res) => {
+          toast.success(res.message);
+          setEditingWeight(false);
         },
         onError: (err) => toast.error("操作失败: " + (err as Error).message),
       },
@@ -600,6 +624,52 @@ export function CredentialCard({
                     title="点击编辑优先级"
                   >
                     {credential.priority}
+                    <Pencil className="h-3 w-3 opacity-70" />
+                  </button>
+                )}
+              </dd>
+            </div>
+            <div className="flex min-w-0 items-center justify-between gap-2">
+              <dt className="shrink-0 text-muted-foreground">权重</dt>
+              <dd className="min-w-0">
+                {editingWeight ? (
+                  <div className="inline-flex max-w-full items-center gap-1">
+                    <Input
+                      type="number"
+                      value={weightValue}
+                      onChange={(e) => setWeightValue(e.target.value)}
+                      className="w-16 h-7 text-sm rounded-md"
+                      min="1"
+                    />
+                    <Button
+                      size="icon"
+                      variant="ghost"
+                      className="h-7 w-7"
+                      onClick={handleWeightChange}
+                      disabled={setWeight.isPending}
+                    >
+                      ✓
+                    </Button>
+                    <Button
+                      size="icon"
+                      variant="ghost"
+                      className="h-7 w-7"
+                      onClick={() => {
+                        setEditingWeight(false);
+                        setWeightValue(String(credential.weight ?? 1));
+                      }}
+                    >
+                      ✕
+                    </Button>
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    className="inline-flex cursor-pointer items-center gap-1 rounded px-1.5 py-0.5 font-medium tabular-nums transition-colors hover:bg-accent hover:text-primary"
+                    onClick={() => setEditingWeight(true)}
+                    title="点击编辑负载均衡权重（balanced 模式生效）"
+                  >
+                    {credential.weight ?? 1}
                     <Pencil className="h-3 w-3 opacity-70" />
                   </button>
                 )}
@@ -911,25 +981,25 @@ export function CredentialCard({
           </div>
 
           {/* 操作区 */}
-          <div className="mt-auto grid grid-cols-2 gap-2 border-t border-border/50 pt-3 min-[420px]:flex min-[420px]:flex-col min-[560px]:flex-row min-[560px]:items-center min-[560px]:justify-between">
-            <div className="grid min-w-0 grid-cols-4 gap-1 col-span-2 min-[420px]:col-span-1 min-[420px]:flex min-[420px]:items-center">
+          <div className="mt-auto flex flex-col gap-2 border-t border-border/50 pt-3 min-[560px]:flex-row min-[560px]:items-center min-[560px]:justify-between">
+            <div className="flex min-w-0 flex-wrap items-center gap-1.5">
               <Button
                 ref={setActivatorNodeRef}
                 size="icon"
                 variant="ghost"
                 data-no-rect-select
-                className="w-full cursor-grab touch-none active:cursor-grabbing min-[420px]:w-9"
+                className="h-9 w-9 shrink-0 cursor-grab touch-none active:cursor-grabbing"
                 title="拖拽调整优先级"
                 {...attributes}
                 {...listeners}
               >
                 <GripVertical className="h-4 w-4 text-muted-foreground" />
               </Button>
-              <span className="mx-1 hidden h-5 w-px bg-border/70 min-[420px]:inline-block" />
+              <span className="mx-0.5 hidden h-5 w-px bg-border/70 min-[420px]:inline-block" />
               <Button
                 size="sm"
                 variant="ghost"
-                className="w-full px-2 min-[420px]:w-auto min-[420px]:px-3"
+                className="shrink-0 px-2.5"
                 onClick={handleForceRefresh}
                 disabled={
                   forceRefresh.isPending ||
@@ -952,7 +1022,7 @@ export function CredentialCard({
               <Button
                 size="sm"
                 variant="ghost"
-                className="w-full px-2 min-[420px]:w-auto min-[420px]:px-3"
+                className="shrink-0 px-2.5"
                 onClick={onRefreshBalance}
                 disabled={loadingBalance || credential.disabled}
                 title={credential.disabled ? "已禁用" : "刷新余额"}
@@ -965,7 +1035,7 @@ export function CredentialCard({
               <Button
                 size="sm"
                 variant="ghost"
-                className="w-full px-2 min-[420px]:w-auto min-[420px]:px-3"
+                className="shrink-0 px-2.5"
                 onClick={handleTestModel}
                 disabled={testingModel || credential.disabled}
                 title={credential.disabled ? "已禁用" : "用该凭据真实调用一次测试模型"}
@@ -979,11 +1049,11 @@ export function CredentialCard({
               </Button>
             </div>
 
-            <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] gap-1 col-span-2 min-[420px]:col-span-1 min-[420px]:flex min-[420px]:items-center">
+            <div className="flex min-w-0 items-center gap-1.5 min-[560px]:shrink-0">
               <Button
                 size="sm"
                 variant="outline"
-                className="w-full min-[420px]:w-auto"
+                className="flex-1 min-[560px]:flex-none"
                 onClick={() => setShowEditDialog(true)}
               >
                 <Pencil className="h-3.5 w-3.5" />

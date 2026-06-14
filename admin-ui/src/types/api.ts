@@ -10,6 +10,8 @@ export interface CredentialsStatusResponse {
 export interface CredentialStatusItem {
   id: number
   priority: number
+  /** 负载均衡权重（balanced 模式生效，默认 1） */
+  weight: number
   disabled: boolean
   failureCount: number
   /** 累计失败次数（所有失败类型，只增不减，仅手动重置归零） */
@@ -400,8 +402,14 @@ export interface ClientKeyItem {
   totalOutputTokens: number
   totalCacheCreationTokens: number
   totalCacheReadTokens: number
+  /** 累计消耗 credit（用于与 creditLimit 对比） */
+  totalCredits: number
   /** 绑定的账号分组（未绑定时为 undefined） */
   group?: string
+  /** Token 上限（input+output 总和，未设置为 undefined） */
+  tokenLimit?: number
+  /** Credit 上限（未设置为 undefined） */
+  creditLimit?: number
   /** 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换） */
   isSystem: boolean
 }
@@ -415,6 +423,10 @@ export interface CreateClientKeyRequest {
   name: string
   description?: string
   group?: string
+  /** Token 上限（0/缺省 = 不限） */
+  tokenLimit?: number
+  /** Credit 上限（0/缺省 = 不限） */
+  creditLimit?: number
 }
 
 /** 创建响应：明文 Key 仅在此处返回一次 */
@@ -429,6 +441,10 @@ export interface UpdateClientKeyRequest {
   name?: string
   description?: string
   group?: string
+  /** Token 上限：缺省=不改；null/0=清除；>0=设置 */
+  tokenLimit?: number | null
+  /** Credit 上限：缺省=不改；null/0=清除；>0=设置 */
+  creditLimit?: number | null
 }
 
 // ============ 用量统计 ============

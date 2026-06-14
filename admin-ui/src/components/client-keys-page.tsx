@@ -30,6 +30,20 @@ function formatTokens(n: number): string {
   return n.toString()
 }
 
+function formatCredits(n: number): string {
+  if (!Number.isFinite(n)) return '0'
+  if (n >= 1000) return n.toFixed(0)
+  if (n >= 1) return n.toFixed(2)
+  return n.toFixed(4)
+}
+
+// 配额用量占比颜色
+function usagePctClass(pct: number): string {
+  if (pct >= 100) return 'text-destructive'
+  if (pct >= 80) return 'text-amber-600 dark:text-amber-400'
+  return 'text-muted-foreground'
+}
+
 function formatRelative(ts?: string): string {
   if (!ts) return '从未使用'
   const t = new Date(ts).getTime()
@@ -56,6 +70,8 @@ export function ClientKeysPage() {
   const [createName, setCreateName] = useState('')
   const [createDesc, setCreateDesc] = useState('')
   const [createGroup, setCreateGroup] = useState('')
+  const [createTokenLimit, setCreateTokenLimit] = useState('')
+  const [createCreditLimit, setCreateCreditLimit] = useState('')
   const [createdKey, setCreatedKey] = useState<CreateClientKeyResponse | null>(null)
   const [showCreatedPlain, setShowCreatedPlain] = useState(true)
 
@@ -64,6 +80,8 @@ export function ClientKeysPage() {
   const [editName, setEditName] = useState('')
   const [editDesc, setEditDesc] = useState('')
   const [editGroup, setEditGroup] = useState('')
+  const [editTokenLimit, setEditTokenLimit] = useState('')
+  const [editCreditLimit, setEditCreditLimit] = useState('')
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -77,12 +95,16 @@ export function ClientKeysPage() {
         name,
         description: createDesc.trim() || undefined,
         group: createGroup.trim() || undefined,
+        tokenLimit: createTokenLimit.trim() ? Number(createTokenLimit) : undefined,
+        creditLimit: createCreditLimit.trim() ? Number(createCreditLimit) : undefined,
       })
       setCreatedKey(res)
       setCreateOpen(false)
       setCreateName('')
       setCreateDesc('')
       setCreateGroup('')
+      setCreateTokenLimit('')
+      setCreateCreditLimit('')
       setShowCreatedPlain(true)
     } catch (err) {
       toast.error('创建失败：' + extractErrorMessage(err))
@@ -164,6 +186,8 @@ export function ClientKeysPage() {
     setEditName(item.name)
     setEditDesc(item.description ?? '')
     setEditGroup(item.group ?? '')
+    setEditTokenLimit(item.tokenLimit != null ? String(item.tokenLimit) : '')
+    setEditCreditLimit(item.creditLimit != null ? String(item.creditLimit) : '')
     setEditOpen(true)
   }
 
@@ -173,7 +197,14 @@ export function ClientKeysPage() {
     try {
       await updateKey.mutateAsync({
         id: editTarget.id,
-        req: { name: editName.trim(), description: editDesc.trim(), group: editGroup.trim() },
+        req: {
+          name: editName.trim(),
+          description: editDesc.trim(),
+          group: editGroup.trim(),
+          // 空字符串 = 清除限额（传 null）；有值 = 设置
+          tokenLimit: editTokenLimit.trim() ? Number(editTokenLimit) : null,
+          creditLimit: editCreditLimit.trim() ? Number(editCreditLimit) : null,
+        },
       })
       toast.success('已更新')
       setEditOpen(false)
@@ -223,7 +254,7 @@ export function ClientKeysPage() {
       ) : (
         <Card>
           <CardContent className="overflow-x-auto p-0">
-            <table className="w-full min-w-[920px] text-sm">
+            <table className="w-full min-w-[1040px] text-sm">
               <thead className="text-[12px] text-muted-foreground border-b border-border/60">
                 <tr className="whitespace-nowrap">
                   <th className="text-left font-medium px-4 py-3">ID</th>
@@ -234,6 +265,7 @@ export function ClientKeysPage() {
                   <th className="text-right font-medium px-4 py-3">总调用</th>
                   <th className="text-right font-medium px-4 py-3">输入</th>
                   <th className="text-right font-medium px-4 py-3">输出</th>
+                  <th className="text-left font-medium px-4 py-3">配额 / 用量</th>
                   <th className="text-left font-medium px-4 py-3">最后使用</th>
                   <th className="text-right font-medium px-4 py-3">操作</th>
                 </tr>
@@ -295,6 +327,39 @@ export function ClientKeysPage() {
                     <td className="px-4 py-3 text-right tabular-nums">{k.totalCalls}</td>
                     <td className="px-4 py-3 text-right tabular-nums">{formatTokens(k.totalInputTokens)}</td>
                     <td className="px-4 py-3 text-right tabular-nums">{formatTokens(k.totalOutputTokens)}</td>
+                    <td className="px-4 py-3 text-[12px]">
+                      {(() => {
+                        const usedTokens = k.totalInputTokens + k.totalOutputTokens
+                        const tokRow = k.tokenLimit != null ? (() => {
+                          const pct = k.tokenLimit > 0 ? (usedTokens / k.tokenLimit) * 100 : 0
+                          return (
+                            <div key="tok" className="flex items-center gap-1 tabular-nums">
+                              <span className="text-muted-foreground">T</span>
+                              <span className={usagePctClass(pct)}>
+                                {formatTokens(usedTokens)}/{formatTokens(k.tokenLimit)}
+                              </span>
+                              <span className={`text-[11px] ${usagePctClass(pct)}`}>({pct.toFixed(0)}%)</span>
+                            </div>
+                          )
+                        })() : null
+                        const crRow = k.creditLimit != null ? (() => {
+                          const pct = k.creditLimit > 0 ? (k.totalCredits / k.creditLimit) * 100 : 0
+                          return (
+                            <div key="cr" className="flex items-center gap-1 tabular-nums">
+                              <span className="text-muted-foreground">C</span>
+                              <span className={usagePctClass(pct)}>
+                                {formatCredits(k.totalCredits)}/{formatCredits(k.creditLimit)}
+                              </span>
+                              <span className={`text-[11px] ${usagePctClass(pct)}`}>({pct.toFixed(0)}%)</span>
+                            </div>
+                          )
+                        })() : null
+                        if (!tokRow && !crRow) {
+                          return <span className="text-[12px] text-muted-foreground">不限</span>
+                        }
+                        return <div className="space-y-0.5">{tokRow}{crRow}</div>
+                      })()}
+                    </td>
                     <td className="px-4 py-3 text-[12px] text-muted-foreground">
                       {formatRelative(k.lastUsedAt)}
                     </td>
@@ -390,6 +455,31 @@ export function ClientKeysPage() {
                 绑定后该 Key 仅会使用含此分组的账号（严格隔离，分组内无可用账号时请求会失败）。
               </p>
             </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="text-[12px] text-muted-foreground">Token 上限（可选）</label>
+                <Input
+                  type="number"
+                  min="0"
+                  placeholder="留空/0 = 不限"
+                  value={createTokenLimit}
+                  onChange={(e) => setCreateTokenLimit(e.target.value)}
+                  disabled={createKey.isPending}
+                />
+              </div>
+              <div>
+                <label className="text-[12px] text-muted-foreground">Credit 上限（可选）</label>
+                <Input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  placeholder="留空/0 = 不限"
+                  value={createCreditLimit}
+                  onChange={(e) => setCreateCreditLimit(e.target.value)}
+                  disabled={createKey.isPending}
+                />
+              </div>
+            </div>
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setCreateOpen(false)} disabled={createKey.isPending}>
                 取消
@@ -460,7 +550,7 @@ export function ClientKeysPage() {
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle>编辑 Key</DialogTitle>
-            <DialogDescription>修改名称与描述（不影响 Key 值与统计）</DialogDescription>
+            <DialogDescription>修改名称、描述与配额上限（不影响 Key 值与统计）</DialogDescription>
           </DialogHeader>
           <form onSubmit={handleEditSave} className="space-y-3 py-2">
             <div>
@@ -483,6 +573,31 @@ export function ClientKeysPage() {
               <p className="mt-1 text-[11px] text-muted-foreground">
                 绑定后仅调度该分组内账号（严格隔离）。选「不绑定」表示解除绑定。
               </p>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="text-[12px] text-muted-foreground">Token 上限</label>
+                <Input
+                  type="number"
+                  min="0"
+                  placeholder="留空/0 = 不限"
+                  value={editTokenLimit}
+                  onChange={(e) => setEditTokenLimit(e.target.value)}
+                  disabled={updateKey.isPending}
+                />
+              </div>
+              <div>
+                <label className="text-[12px] text-muted-foreground">Credit 上限</label>
+                <Input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  placeholder="留空/0 = 不限"
+                  value={editCreditLimit}
+                  onChange={(e) => setEditCreditLimit(e.target.value)}
+                  disabled={updateKey.isPending}
+                />
+              </div>
             </div>
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setEditOpen(false)}>取消</Button>

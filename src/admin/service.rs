@@ -523,6 +523,7 @@ impl AdminService {
                 CredentialStatusItem {
                     id: entry.id,
                     priority: entry.priority,
+                    weight: entry.weight,
                     disabled: entry.disabled,
                     failure_count: entry.failure_count,
                     total_failure_count: entry.total_failure_count,
@@ -708,6 +709,13 @@ impl AdminService {
     pub fn set_priority(&self, id: u64, priority: u32) -> Result<(), AdminServiceError> {
         self.token_manager
             .set_priority(id, priority)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 设置凭据负载均衡权重（balanced 模式生效，最小 1）。
+    pub fn set_weight(&self, id: u64, weight: u32) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_weight(id, weight)
             .map_err(|e| self.classify_error(e, id))
     }
 
@@ -1162,6 +1170,7 @@ impl AdminService {
             client_id: req.client_id,
             client_secret: req.client_secret,
             priority: req.priority,
+            weight: 1,
             region: req.region,
             auth_region: req.auth_region,
             api_region: req.api_region,

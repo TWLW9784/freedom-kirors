@@ -49,6 +49,12 @@ pub struct ClientKey {
     /// 累计 credit 计费量（meteringEvent.usage 累加）
     #[serde(default)]
     pub total_credits: f64,
+    /// Token 上限（input+output 总和，超限返回 429）。None = 不限。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_limit: Option<u64>,
+    /// Credit 上限（累计 total_credits 超限返回 429）。None = 不限。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credit_limit: Option<f64>,
     /// 绑定的账号分组名（可选）
     ///
     /// 设置后，用该 Key 发起的请求只会调度到 groups 包含此分组名的上游账号（严格隔离）。
@@ -155,8 +161,10 @@ impl ClientKeyManager {
         name: String,
         description: Option<String>,
         group: Option<String>,
+        token_limit: Option<u64>,
+        credit_limit: Option<f64>,
     ) -> ClientKey {
-        self.create_with_key(name, description, group, generate_client_key())
+        self.create_with_key(name, description, group, token_limit, credit_limit, generate_client_key())
     }
 
     /// 用指定明文创建 Key（仅供首次启动 bootstrap 用，把 config.json apiKey 直接导入为第一条分发密钥）。
@@ -166,6 +174,8 @@ impl ClientKeyManager {
         name: String,
         description: Option<String>,
         group: Option<String>,
+        token_limit: Option<u64>,
+        credit_limit: Option<f64>,
         plaintext: String,
     ) -> ClientKey {
         let mut inner = self.inner.write();
@@ -189,6 +199,8 @@ impl ClientKeyManager {
             total_cache_creation_tokens: 0,
             total_cache_read_tokens: 0,
             total_credits: 0.0,
+            token_limit,
+            credit_limit,
             group: group.filter(|g| !g.trim().is_empty()),
             is_system: false,
         };
@@ -262,6 +274,8 @@ impl ClientKeyManager {
                     total_cache_creation_tokens: 0,
                     total_cache_read_tokens: 0,
                     total_credits: 0.0,
+                    token_limit: None,
+                    credit_limit: None,
                     group: None,
                     is_system: true,
                 };
@@ -312,6 +326,8 @@ impl ClientKeyManager {
         name: Option<String>,
         description: Option<Option<String>>,
         group: Option<Option<String>>,
+        token_limit: Option<Option<u64>>,
+        credit_limit: Option<Option<f64>>,
     ) -> bool {
         let mut inner = self.inner.write();
         let updated = match inner.entries.get_mut(&id) {
@@ -324,6 +340,12 @@ impl ClientKeyManager {
                 }
                 if let Some(g) = group {
                     e.group = g.filter(|s| !s.trim().is_empty());
+                }
+                if let Some(tl) = token_limit {
+                    e.token_limit = tl;
+                }
+                if let Some(cl) = credit_limit {
+                    e.credit_limit = cl;
                 }
                 true
             }
@@ -338,6 +360,26 @@ impl ClientKeyManager {
     /// 返回指定 Key 绑定的分组名（None 表示未绑定或 Key 不存在）
     pub fn group_of(&self, id: u64) -> Option<String> {
         self.inner.read().entries.get(&id).and_then(|e| e.group.clone())
+    }
+
+    /// 检查指定 Key 是否已超过配额上限。
+    /// 返回 `Some("token")` / `Some("credit")` 表示超哪类限额；None = 未超限。
+    /// token 计量口径 = total_input_tokens + total_output_tokens（不含缓存 token）。
+    pub fn over_limit(&self, id: u64) -> Option<&'static str> {
+        let inner = self.inner.read();
+        let e = inner.entries.get(&id)?;
+        if let Some(tl) = e.token_limit {
+            let used = e.total_input_tokens.saturating_add(e.total_output_tokens);
+            if used >= tl {
+                return Some("token");
+            }
+        }
+        if let Some(cl) = e.credit_limit {
+            if e.total_credits >= cl {
+                return Some("credit");
+            }
+        }
+        None
     }
 
     /// 列出所有当前被引用的分组名（仅去重，不带计数）。
@@ -558,7 +600,7 @@ mod tests {
     #[test]
     fn create_and_verify() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None, None);
+        let entry = mgr.create("test".to_string(), None, None, None, None);
         assert!(entry.key.starts_with(CLIENT_KEY_PREFIX));
         assert_eq!(mgr.verify_and_touch(&entry.key), Some(entry.id));
         // 不带前缀的拒绝
@@ -568,7 +610,7 @@ mod tests {
     #[test]
     fn disabled_key_rejected() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None, None);
+        let entry = mgr.create("test".to_string(), None, None, None, None);
         mgr.set_disabled(entry.id, true);
         assert_eq!(mgr.verify_and_touch(&entry.key), None);
         mgr.set_disabled(entry.id, false);
@@ -578,7 +620,7 @@ mod tests {
     #[test]
     fn record_usage_accumulates() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None, None);
+        let entry = mgr.create("test".to_string(), None, None, None, None);
         mgr.record_usage(entry.id, 100, 50, 0, 0, 0.0);
         mgr.record_usage(entry.id, 200, 30, 5, 10, 1.5);
         let list = mgr.list();
@@ -598,7 +640,7 @@ mod tests {
     #[test]
     fn rotate_replaces_key_but_keeps_metadata_and_stats() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("kb".to_string(), Some("desc".into()), Some("groupA".into()));
+        let entry = mgr.create("kb".to_string(), Some("desc".into()), Some("groupA".into()), None, None);
         // 累计一些统计
         mgr.record_usage(entry.id, 100, 50, 5, 10, 1.5);
         let old_key = entry.key.clone();
@@ -642,7 +684,7 @@ mod tests {
     fn ensure_system_key_migrates_misplaced_id_to_zero() {
         // 模拟旧版 bootstrap 把 apiKey 误建在 id=1 上的场景
         let mgr = ClientKeyManager::new();
-        mgr.create_with_key("默认密钥".into(), None, None, "sk-kiro-abc".into());
+        mgr.create_with_key("默认密钥".into(), None, None, None, None, "sk-kiro-abc".into());
         assert_eq!(mgr.list().first().map(|k| k.id), Some(1));
         // 修复后启动：应迁移到 id=0
         mgr.ensure_system_key("默认密钥".into(), None, "sk-kiro-abc".into());

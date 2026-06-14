@@ -20,7 +20,7 @@ use super::{
         reset_client_key_stats, reset_failure_count, reset_success_count, rollback_image_update,
         set_account_throttle_config, set_client_key_disabled, set_concurrency_config,
         set_credential_disabled, set_credential_max_in_flight, set_credential_overage,
-        set_credential_priority, set_global_proxy, set_load_balancing_mode,
+        set_credential_priority, set_credential_weight, set_global_proxy, set_load_balancing_mode,
         set_log_governance_config, set_proxy_enabled, set_update_config, start_idc_login,
         start_idc_relogin, start_social_login, start_social_relogin, stats_by_credential,
         stats_by_model, stats_overview, stats_timeseries, test_credential_model,
@@ -63,6 +63,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         )
         .route("/credentials/{id}/disabled", post(set_credential_disabled))
         .route("/credentials/{id}/priority", post(set_credential_priority))
+        .route("/credentials/{id}/weight", post(set_credential_weight))
         .route(
             "/credentials/{id}/max-in-flight",
             post(set_credential_max_in_flight),

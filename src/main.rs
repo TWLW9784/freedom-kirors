@@ -44,7 +44,7 @@ async fn main() {
     ensure_config_files(&config_path, &credentials_path);
 
     // 加载配置
-    let config = Config::load(&config_path).unwrap_or_else(|e| {
+    let mut config = Config::load(&config_path).unwrap_or_else(|e| {
         tracing::error!("加载配置失败: {}", e);
         std::process::exit(1);
     });
@@ -74,6 +74,20 @@ async fn main() {
                 ..Default::default()
             };
             credentials_list.insert(0, api_key_cred);
+        }
+    }
+
+    // 环境变量覆盖 Admin API 密钥（便于容器化部署，无需写入配置文件）
+    // 支持 ADMIN_API_KEY（首选）与 ADMIN_PASSWORD（兼容常见命名）两个名字。
+    if let Some(admin_key_env) = std::env::var("ADMIN_API_KEY")
+        .ok()
+        .or_else(|| std::env::var("ADMIN_PASSWORD").ok())
+    {
+        if admin_key_env.trim().is_empty() {
+            tracing::warn!("ADMIN_API_KEY/ADMIN_PASSWORD 环境变量已设置但为空，忽略");
+        } else {
+            tracing::info!("检测到 ADMIN_API_KEY/ADMIN_PASSWORD 环境变量，覆盖配置中的 admin_api_key");
+            config.admin_api_key = Some(admin_key_env);
         }
     }
 
@@ -175,6 +189,14 @@ async fn main() {
         auth_type: config.count_tokens_auth_type.clone(),
         proxy: proxy_config,
         tls_backend: config.tls_backend,
+    });
+
+    // 初始化 system prompt 过滤设置（默认全部关闭，零行为变化）
+    anthropic::prompt_filter::init(anthropic::prompt_filter::PromptFilterSettings {
+        filter_claude_code: config.filter_claude_code,
+        filter_strip_boundaries: config.filter_strip_boundaries,
+        filter_env_noise: config.filter_env_noise,
+        rules: config.prompt_filter_rules.clone(),
     });
 
     // 客户端 Key 管理器 + 用量记录器 + 聚合器（与凭据文件同目录）

@@ -81,6 +81,12 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "is_zero")]
     pub priority: u32,
 
+    /// 负载均衡权重（仅 balanced 模式生效，默认 1）。
+    /// 权重越大的账号承担越多流量：balanced 按 success_count/weight 排序选最小。
+    #[serde(default = "default_weight")]
+    #[serde(skip_serializing_if = "is_default_weight")]
+    pub weight: u32,
+
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -175,6 +181,16 @@ pub struct KiroCredentials {
 /// 判断是否为零（用于跳过序列化）
 fn is_zero(value: &u32) -> bool {
     *value == 0
+}
+
+/// 负载均衡权重默认值（serde 反序列化缺失时）。
+fn default_weight() -> u32 {
+    1
+}
+
+/// weight 为默认值（1）或 0（未显式设置）时不序列化，保持配置文件整洁。
+fn is_default_weight(value: &u32) -> bool {
+    *value == 0 || *value == 1
 }
 
 /// 仅显示长度，不暴露明文。例如 `Some(42 chars)` 或 `None`。
@@ -580,6 +596,7 @@ mod tests {
     #[test]
     fn test_to_json() {
         let creds = KiroCredentials {
+            weight: 1,
             id: None,
             access_token: Some("token".to_string()),
             refresh_token: None,
@@ -773,6 +790,7 @@ groups: vec![],
     #[test]
     fn test_region_field_serialization() {
         let creds = KiroCredentials {
+            weight: 1,
             id: None,
             access_token: None,
             refresh_token: Some("test".to_string()),
@@ -810,6 +828,7 @@ groups: vec![],
     #[test]
     fn test_region_field_none_not_serialized() {
         let creds = KiroCredentials {
+            weight: 1,
             id: None,
             access_token: None,
             refresh_token: Some("test".to_string()),
@@ -930,6 +949,7 @@ groups: vec![],
     fn test_region_roundtrip() {
         // 测试序列化和反序列化的往返一致性
         let original = KiroCredentials {
+            weight: 1,
             id: Some(42),
             access_token: Some("token".to_string()),
             refresh_token: Some("refresh".to_string()),

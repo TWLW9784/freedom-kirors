@@ -854,6 +854,8 @@ pub struct CredentialEntrySnapshot {
     pub id: u64,
     /// 优先级
     pub priority: u32,
+    /// 负载均衡权重（balanced 模式生效）
+    pub weight: u32,
     /// 是否被禁用
     pub disabled: bool,
     /// 连续失败次数
@@ -1296,11 +1298,17 @@ impl MultiTokenManager {
 
         match mode {
             "balanced" => {
-                // Least-Used 策略：选择成功次数最少的凭据
-                // 平局时按优先级排序（数字越小优先级越高）
-                let entry = available
-                    .iter()
-                    .min_by_key(|e| (e.success_count, e.credentials.priority))?;
+                // 加权 Least-Used：按 success_count / weight 升序选择（权重越大承担越多流量）。
+                // 用交叉相乘避免浮点/除零：a/wa < b/wb  ⇔  a*wb < b*wa（u128 防溢出）。
+                // 平局时按优先级（数字越小越高）。
+                let entry = available.iter().min_by(|a, b| {
+                    let wa = a.credentials.weight.max(1) as u128;
+                    let wb = b.credentials.weight.max(1) as u128;
+                    let lhs = (a.success_count as u128) * wb;
+                    let rhs = (b.success_count as u128) * wa;
+                    lhs.cmp(&rhs)
+                        .then(a.credentials.priority.cmp(&b.credentials.priority))
+                })?;
 
                 Some((entry.id, entry.credentials.clone()))
             }
@@ -2183,6 +2191,7 @@ impl MultiTokenManager {
                 .map(|e| CredentialEntrySnapshot {
                     id: e.id,
                     priority: e.credentials.priority,
+                    weight: e.credentials.weight.max(1),
                     disabled: e.disabled,
                     failure_count: e.failure_count,
                     total_failure_count: e.total_failure_count,
@@ -2400,6 +2409,20 @@ impl MultiTokenManager {
         // 立即按新优先级重新选择当前凭据（无论持久化是否成功）
         self.select_highest_priority();
         // 持久化更改
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 设置凭据负载均衡权重（balanced 模式生效，最小 1）。
+    pub fn set_weight(&self, id: u64, weight: u32) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.weight = weight.max(1);
+        }
         self.persist_credentials()?;
         Ok(())
     }

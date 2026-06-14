@@ -34,6 +34,11 @@ impl ErrorResponse {
     pub fn authentication_error() -> Self {
         Self::new("authentication_error", "Invalid API key")
     }
+
+    /// 创建限流（配额超限）错误响应
+    pub fn rate_limit_error(message: impl Into<String>) -> Self {
+        Self::new("rate_limit_error", message)
+    }
 }
 
 // === Models 端点类型 ===

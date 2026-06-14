@@ -117,6 +117,15 @@ pub async fn auth_middleware(
     // 所有 Key 统一走客户端 Key 管理器校验
     if let Some(mgr) = &state.client_keys {
         if let Some(id) = mgr.verify_and_touch(&presented) {
+            // 配额封顶：命中 Key 超出 token / credit 上限时拒绝（429）。
+            if let Some(kind) = mgr.over_limit(id) {
+                let msg = match kind {
+                    "token" => "Client API key token quota exceeded",
+                    _ => "Client API key credit quota exceeded",
+                };
+                let error = ErrorResponse::rate_limit_error(msg);
+                return (StatusCode::TOO_MANY_REQUESTS, Json(error)).into_response();
+            }
             let group = mgr.group_of(id);
             request.extensions_mut().insert(KeyContext {
                 key_id: id,
