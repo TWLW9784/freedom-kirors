@@ -765,11 +765,15 @@ impl AdminService {
         id: u64,
         req: TestCredentialModelRequest,
     ) -> Result<TestCredentialModelResponse, AdminServiceError> {
-        let model = if req.model.trim().is_empty() {
+        let raw_model = if req.model.trim().is_empty() {
             "claude-opus-4.8".to_string()
         } else {
             req.model.trim().to_string()
         };
+        // 归一化模型名：复用 Anthropic 业务路径的 map_model，把横杠写法
+        // （如 claude-opus-4-8）统一成上游 Kiro 认的点号写法（claude-opus-4.8）。
+        // 映射不中时保留原始输入，避免误伤未知/新模型。
+        let model = crate::anthropic::map_model(&raw_model).unwrap_or(raw_model);
         let prompt = if req.prompt.trim().is_empty() {
             "ping".to_string()
         } else {
@@ -783,6 +787,29 @@ impl AdminService {
             .prepare_admin_request_token(id)
             .await
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        // 兑底：Enterprise/IdC 凭据若真实 profileArn 尚未回填（刚添加/刚登录），
+        // 先解析一次再测试，避免带占位符请求被上游判为 bearer token invalid (403)。
+        // 解析失败（网络/瞬态）不中断测试，按原 profileArn 继续。
+        let credentials = if credentials.is_api_key_credential() {
+            credentials
+        } else {
+            match self.token_manager.resolve_profile_arn_for(id, &token).await {
+                Ok(_) => self
+                    .token_manager
+                    .prepare_admin_request_token(id)
+                    .await
+                    .map(|(_, c)| c)
+                    .unwrap_or(credentials),
+                Err(e) => {
+                    tracing::warn!(
+                        "模型测试前解析 profileArn 失败（按原 profileArn 继续）: {}",
+                        e
+                    );
+                    credentials
+                }
+            }
+        };
 
         let endpoint_name = credentials
             .endpoint
@@ -3158,6 +3185,17 @@ impl AdminService {
                 // 主动刷新余额（含订阅等级 / 邮箱）并写入缓存，登录后立即可见
                 if let Err(e) = self.get_balance(credential_id).await {
                     tracing::warn!("IdC 登录后刷新余额失败（不影响登录）: {}", e);
+                }
+
+                // 主动解析并回填真实 profileArn：Enterprise/IdC 账号的流式端点强制要求
+                // 真实 profileArn，否则带占位符请求会被上游判为 bearer token invalid (403)。
+                // 登录成功后立即解析，避免「刚添加凭据后做模型测试撞 403」的时序窗口。
+                if let Err(e) = self
+                    .token_manager
+                    .resolve_profile_arn_after_login(credential_id)
+                    .await
+                {
+                    tracing::warn!("IdC 登录后解析 profileArn 失败（首个请求会重试）: {}", e);
                 }
 
                 tracing::info!("IdC 设备授权登录成功，已添加凭据 #{}", credential_id);

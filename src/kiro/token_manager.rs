@@ -2648,6 +2648,19 @@ impl MultiTokenManager {
     /// - 上游无 profile（如纯 BuilderID 账号）→ 返回 `None`，由调用方回退到占位符。
     ///
     /// 返回应当用于本次请求的 profileArn（`Some` 表示真实 ARN）。
+    /// 登录/添加凭据后主动解析 profileArn：自动准备有效 token 再调用
+    /// [`resolve_profile_arn_for`]，避免调用方还要自己处理 token 刷新。
+    ///
+    /// 用于 IdC / Social 登录成功后立即回填真实 profileArn，消除
+    /// 「刚添加凭据、profileArn 尚未回填」窗口期内模型测试撞 403 的问题。
+    pub async fn resolve_profile_arn_after_login(
+        &self,
+        id: u64,
+    ) -> anyhow::Result<Option<String>> {
+        let (token, _credentials) = self.prepare_request_token(id).await?;
+        self.resolve_profile_arn_for(id, &token).await
+    }
+
     pub async fn resolve_profile_arn_for(
         &self,
         id: u64,

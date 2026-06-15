@@ -24,6 +24,7 @@
 
 pub mod cache_metering;
 mod converter;
+pub use converter::map_model;
 mod handlers;
 mod middleware;
 pub mod prompt_filter;

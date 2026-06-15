@@ -46,13 +46,18 @@ export function useCredentialBalance(id: number | null) {
   })
 }
 
-// 查询凭据当前可用的模型列表（按需实时查询上游）
+// 查询凭据当前可用的模型列表（按需查询上游，结果缓存避免频繁重复加载）
 export function useCredentialModels(id: number | null) {
   return useQuery({
     queryKey: ['credential-models', id],
     queryFn: () => getCredentialModels(id!),
     enabled: id !== null,
     retry: false, // 失败不重试，避免对被封禁/异常账号反复请求
+    // 模型列表变动极低：5 分钟内视为新鲜，重复打开弹窗直接用缓存，不再打上游。
+    staleTime: 5 * 60 * 1000,
+    gcTime: 30 * 60 * 1000,
+    refetchOnWindowFocus: false,
+    refetchOnMount: false,
   })
 }
 

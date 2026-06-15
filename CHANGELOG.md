@@ -17,6 +17,20 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - **部署状态可追溯**：重要上线动作应记录提交号、构建命令、服务状态和关键接口健康检查结果。
 
 
+## [0.6.10] - 2026-06-15
+
+主题：**IdC 凭据 profileArn 即时回填 + 模型测试 403 兜底 + 模型列表缓存**。
+
+### 修复
+
+- **IdC 登录后即时回填 profileArn**：之前 IdC 设备授权登录成功后，真实 profileArn 要等第一次实际请求才懒解析，中间约 2 分钟窗口内做模型测试会带占位 profileArn 打上游，吃 403 `bearer token invalid`。现在登录成功后立即主动调用 `resolve_profile_arn_for` 解析并回填，秒级完成。
+- **模型测试 403 兜底**：`test_credential_model` 在发请求前先确保真实 profileArn 已解析（即使即时回填因瞬态网络失败，这里再兜一次底），彻底消除新加 IdC 凭据后测试撞 403 的问题。
+
+### 优化
+
+- **可用模型列表缓存**：前端 `useCredentialModels` 加 5 分钟 staleTime + 30 分钟 gcTime，重复打开「可用模型」弹窗不再每次都打上游查询；模型列表变动极少，既快又省上游调用。
+
+
 ## [0.6.9] - 2026-06-14
 
 主题：**修复在线更新体验两个问题**——点「更新并重启」误报失败、release 更新内容为空。
