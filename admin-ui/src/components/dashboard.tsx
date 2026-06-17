@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, type FormEvent } from "react";
+import { useState, useEffect, useRef } from "react";
 import {
   RefreshCw,
   LogOut,
@@ -19,7 +19,6 @@ import {
   Settings,
   UploadCloud,
   MoreHorizontal,
-  ChevronDown,
   Activity,
   ChevronLeft,
   ChevronRight,
@@ -29,9 +28,12 @@ import {
   Copy,
   Wand2,
   Zap,
+  Tags,
+  ChevronDown,
+  LayoutGrid,
+  List,
   Search,
   X,
-  Tags,
 } from "lucide-react";
 
 function GithubIcon({ className }: { className?: string }) {
@@ -48,7 +50,7 @@ function GithubIcon({ className }: { className?: string }) {
 }
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { storage } from "@/lib/storage";
+import { storage, type CredentialView } from "@/lib/storage";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -80,6 +82,7 @@ import {
   BatchVerifyDialog,
   type VerifyResult,
 } from "@/components/batch-verify-dialog";
+import { detectTier, type Tier } from "@/components/subscription-badge";
 import { ProxyPoolDialog } from "@/components/proxy-pool-dialog";
 import { ImageUpdateDialog } from "@/components/image-update-dialog";
 import { useConfirm } from "@/components/ui/confirm-dialog";
@@ -93,8 +96,8 @@ import {
   useSetPriority,
 } from "@/hooks/use-credentials";
 import { useUpdateCheck } from "@/hooks/use-update-check";
+import { useFailureStats } from "@/hooks/use-traces";
 import { useGroupOptions } from "@/hooks/use-groups";
-import { useFailureStats, useRecentStats } from "@/hooks/use-traces";
 import { useRectSelect } from "@/hooks/use-rect-select";
 import {
   Select,
@@ -103,6 +106,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   DndContext,
   PointerSensor,
@@ -115,6 +119,7 @@ import {
   SortableContext,
   arrayMove,
   rectSortingStrategy,
+  verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
 import {
   getCredentialBalance,
@@ -131,7 +136,7 @@ import {
   formatNumber,
   overageFailureMessage,
 } from "@/lib/utils";
-import type { BalanceResponse, CredentialStatusItem } from "@/types/api";
+import type { BalanceResponse } from "@/types/api";
 
 interface DashboardProps {
   onLogout: () => void;
@@ -139,103 +144,24 @@ interface DashboardProps {
   embedded?: boolean;
 }
 
-type CredentialFilter =
-  | "all"
-  | "enabled"
-  | "disabled"
-  | "available-pro"
-  | "pro"
-  | "pro-plus"
-  | "power"
-  | "free"
-  | "subscription-unknown"
-  | "throttled";
-
-type CredentialSortKey =
-  | "priority"
-  | "lastUsed"
-  | "remaining"
-  | "failures";
-
-type SortDirection = "asc" | "desc";
-
-const credentialFilterLabels: Record<CredentialFilter, string> = {
-  all: "全部",
-  enabled: "已启用",
-  disabled: "已禁用",
-  "available-pro": "可用 PRO/PRO+/POWER",
-  pro: "PRO",
-  "pro-plus": "PRO+",
-  power: "POWER",
+// 订阅分级筛选的可选项（key 与 detectTier 返回值一致）
+const TIER_OPTIONS: { value: Tier; label: string }[] = [
+  { value: "free", label: "FREE" },
+  { value: "pro", label: "PRO" },
+  { value: "pro_plus", label: "PRO+" },
+  { value: "power", label: "POWER" },
+  { value: "unknown", label: "未知/未查询" },
+];
+const TIER_LABELS: Record<Tier, string> = {
   free: "FREE",
-  "subscription-unknown": "未知/未查",
-  throttled: "风控冷却",
+  pro: "PRO",
+  pro_plus: "PRO+",
+  power: "POWER",
+  unknown: "未知",
 };
 
-const credentialSortLabels: Record<CredentialSortKey, string> = {
-  priority: "优先级",
-  lastUsed: "最近使用",
-  remaining: "剩余额度",
-  failures: "失败次数",
-};
-
-function credentialSearchText(c: CredentialStatusItem): string {
-  return [
-    c.id,
-    c.email,
-    c.authMethod,
-    c.endpoint,
-    c.proxyUrl,
-    c.disabledReason,
-    c.balance?.subscriptionTitle,
-  ]
-    .filter(Boolean)
-    .join(" ")
-    .toLowerCase();
-}
-
-function getSubscriptionTitle(c: CredentialStatusItem): string {
-  return (c.balance?.subscriptionTitle || "").toUpperCase();
-}
-
-function isProCredential(c: CredentialStatusItem): boolean {
-  const t = getSubscriptionTitle(c);
-  return t.includes("PRO") && !t.includes("PRO+") && !t.includes("POWER");
-}
-
-function isProPlusCredential(c: CredentialStatusItem): boolean {
-  return getSubscriptionTitle(c).includes("PRO+");
-}
-
-function isPowerCredential(c: CredentialStatusItem): boolean {
-  return getSubscriptionTitle(c).includes("POWER");
-}
-
-function isAnyProCredential(c: CredentialStatusItem): boolean {
-  const t = getSubscriptionTitle(c);
-  return t.includes("PRO") || t.includes("POWER");
-}
-
-function isFreeCredential(c: CredentialStatusItem): boolean {
-  return getSubscriptionTitle(c).includes("FREE");
-}
-
-function hasKnownSubscription(c: CredentialStatusItem): boolean {
-  return Boolean(c.balance?.subscriptionTitle);
-}
-
-function getCredentialSortValue(c: CredentialStatusItem, key: CredentialSortKey): string | number {
-  switch (key) {
-    case "priority":
-      return c.priority;
-    case "failures":
-      return c.totalFailureCount ?? c.failureCount ?? 0;
-    case "lastUsed":
-      return c.lastUsedAt ? new Date(c.lastUsedAt).getTime() : 0;
-    case "remaining":
-      return c.balance?.remaining ?? 0;
-  }
-}
+// 每页数量可选项；另有“全部”（pageSize = 0）由下拉单独追加
+const PAGE_SIZE_OPTIONS = [12, 24, 48, 96] as const;
 
 export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const confirm = useConfirm();
@@ -243,7 +169,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false);
   const [batchEditDialogOpen, setBatchEditDialogOpen] = useState(false);
   const [idcLoginDialogOpen, setIdcLoginDialogOpen] = useState(false);
-  const [enterpriseLoginDialogOpen, setEnterpriseLoginDialogOpen] = useState(false);
+  const [enterpriseLoginDialogOpen, setEnterpriseLoginDialogOpen] =
+    useState(false);
   const [socialLoginDialogOpen, setSocialLoginDialogOpen] = useState(false);
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false);
   const [proxyPoolDialogOpen, setProxyPoolDialogOpen] = useState(false);
@@ -255,6 +182,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false);
   const [verifying, setVerifying] = useState(false);
+  const [verifyDeleting, setVerifyDeleting] = useState(false);
   const [verifyProgress, setVerifyProgress] = useState({
     current: 0,
     total: 0,
@@ -280,11 +208,22 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   });
   const cancelVerifyRef = useRef(false);
   const [currentPage, setCurrentPage] = useState(1);
-  const [credentialSearch, setCredentialSearch] = useState("");
-  const [credentialFilter, setCredentialFilter] = useState<CredentialFilter>("all");
-  const [credentialSortKey, setCredentialSortKey] = useState<CredentialSortKey>("priority");
-  const [credentialSortDirection, setCredentialSortDirection] = useState<SortDirection>("asc");
-  const itemsPerPage = 12;
+  // 展示形态（卡片 / 列表）与每页数量，均持久化到 localStorage
+  const [viewMode, setViewMode] = useState<CredentialView>(() =>
+    storage.getCredentialView(),
+  );
+  const [pageSize, setPageSize] = useState<number>(() =>
+    storage.getCredentialPageSize(),
+  );
+  const changeViewMode = (v: CredentialView) => {
+    setViewMode(v);
+    storage.setCredentialView(v);
+  };
+  const changePageSize = (n: number) => {
+    setPageSize(n);
+    storage.setCredentialPageSize(n);
+    setCurrentPage(1);
+  };
   const [darkMode, setDarkMode] = useState(() => {
     if (typeof window !== "undefined") {
       return document.documentElement.classList.contains("dark");
@@ -304,102 +243,64 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const setPriority = useSetPriority();
   const { data: updateCheck } = useUpdateCheck();
   const { data: failureStatsMap } = useFailureStats();
-  const { data: recentStatsMap } = useRecentStats();
   const groupOptions = useGroupOptions();
-  const [groupFilter, setGroupFilter] = useState("");
 
-  const allCredentials = data?.credentials || [];
-  const totalInFlight = allCredentials.reduce(
-    (sum, c) => sum + (c.inFlight ?? 0),
-    0,
-  );
-  const activeInFlightCredentials = allCredentials.filter(
-    (c) => (c.inFlight ?? 0) > 0,
-  ).length;
-  const concurrencyVersion = "RAM实时并发 v2026-06-07-1325";
-  const subscriptionStats = (() => {
-    let pro = 0, proPlus = 0, power = 0, free = 0, unknown = 0;
-    let availablePro = 0, availableProPlus = 0, availablePower = 0, availableFree = 0;
-    for (const c of allCredentials) {
-      if (isPowerCredential(c)) {
-        power += 1;
-        if (!c.disabled) availablePower += 1;
-      } else if (isProPlusCredential(c)) {
-        proPlus += 1;
-        if (!c.disabled) availableProPlus += 1;
-      } else if (isProCredential(c)) {
-        pro += 1;
-        if (!c.disabled) availablePro += 1;
-      } else if (isFreeCredential(c)) {
-        free += 1;
-        if (!c.disabled) availableFree += 1;
-      } else {
-        unknown += 1;
-      }
-    }
-    const availableAnyPro = availablePro + availableProPlus + availablePower;
-    return { pro, proPlus, power, free, unknown, availablePro, availableProPlus, availablePower, availableFree, availableAnyPro };
-  })();
-  const normalizedSearch = credentialSearch.trim().toLowerCase();
-  const filteredCredentials = allCredentials.filter((c) => {
-    const matchesSearch =
-      !normalizedSearch || credentialSearchText(c).includes(normalizedSearch);
-    if (!matchesSearch) return false;
+  // 分组筛选：'' = 全部；'__none__' = 仅显示未分组；其他 = 按分组名筛选
+  const [groupFilter, setGroupFilter] = useState<string>("");
+  // 订阅分级筛选（多选）：空集合 = 全部分级；否则只显示集合内的分级
+  const [tierFilter, setTierFilter] = useState<Set<Tier>>(new Set());
+  // 模糊搜索：按来源渠道（备注）/ 邮箱做大小写不敏感的子串匹配；空串 = 不限
+  const [searchQuery, setSearchQuery] = useState("");
+  const toggleTier = (t: Tier) => {
+    setTierFilter((prev) => {
+      const next = new Set(prev);
+      if (next.has(t)) next.delete(t);
+      else next.add(t);
+      return next;
+    });
+  };
 
+  // 应用分组 + 分级筛选后的凭据全集（分页前先过滤，确保翻页粒度正确）
+  const filteredCredentials = (() => {
+    const all = data?.credentials ?? [];
+    let out = all;
     if (groupFilter) {
-      if (groupFilter === "__none__") {
-        if ((c.groups?.length ?? 0) > 0) return false;
-      } else if (!c.groups?.includes(groupFilter)) {
-        return false;
-      }
+      out =
+        groupFilter === "__none__"
+          ? out.filter((c) => !c.groups || c.groups.length === 0)
+          : out.filter((c) => c.groups?.includes(groupFilter));
     }
+    if (tierFilter.size > 0) {
+      out = out.filter((c) =>
+        tierFilter.has(detectTier(c.balance?.subscriptionTitle)),
+      );
+    }
+    const q = searchQuery.trim().toLowerCase();
+    if (q) {
+      out = out.filter(
+        (c) =>
+          (c.sourceChannel ?? "").toLowerCase().includes(q) ||
+          (c.email ?? "").toLowerCase().includes(q),
+      );
+    }
+    return out;
+  })();
 
-    switch (credentialFilter) {
-      case "enabled":
-        return !c.disabled;
-      case "disabled":
-        return c.disabled;
-      case "pro":
-        return isProCredential(c);
-      case "pro-plus":
-        return isProPlusCredential(c);
-      case "power":
-        return isPowerCredential(c);
-      case "free":
-        return isFreeCredential(c);
-      case "subscription-unknown":
-        return !hasKnownSubscription(c);
-      case "available-pro":
-        return !c.disabled && isAnyProCredential(c);
-      case "throttled":
-        return (c.throttledRemainingSecs ?? 0) > 0;
-      case "all":
-      default:
-        return true;
-    }
-  });
-  const filteredSortedCredentials = [...filteredCredentials].sort((a, b) => {
-    const av = getCredentialSortValue(a, credentialSortKey);
-    const bv = getCredentialSortValue(b, credentialSortKey);
-    let cmp = 0;
-    if (typeof av === "number" && typeof bv === "number") {
-      cmp = av - bv;
-    } else {
-      cmp = String(av).localeCompare(String(bv), "zh-CN", { numeric: true });
-    }
-    if (cmp === 0) cmp = a.id - b.id;
-    return credentialSortDirection === "asc" ? cmp : -cmp;
-  });
-  const totalPages = Math.max(1, Math.ceil(filteredSortedCredentials.length / itemsPerPage));
-  const safeCurrentPage = Math.min(currentPage, totalPages);
-  const startIndex = (safeCurrentPage - 1) * itemsPerPage;
-  const endIndex = startIndex + itemsPerPage;
-  const serverPageCreds = filteredSortedCredentials.slice(startIndex, endIndex);
-  const canManualSort =
-    credentialSortKey === "priority" &&
-    credentialSortDirection === "asc" &&
-    credentialFilter === "all" &&
-    !normalizedSearch;
+  // 切换分组 / 分级筛选 / 搜索时复位到第 1 页，避免空页
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [groupFilter, tierFilter, searchQuery]);
+
+  // pageSize === 0 表示“全部”：单页容纳全部已筛选凭据
+  const effectivePageSize =
+    pageSize === 0 ? Math.max(filteredCredentials.length, 1) : pageSize;
+  const totalPages = Math.max(
+    1,
+    Math.ceil(filteredCredentials.length / effectivePageSize),
+  );
+  const startIndex = (currentPage - 1) * effectivePageSize;
+  const endIndex = startIndex + effectivePageSize;
+  const serverPageCreds = filteredCredentials.slice(startIndex, endIndex);
   // 拖拽排序的本地乐观顺序：仅当 id 集合与当前页一致时生效，否则回落到服务端顺序，
   // 避免翻页 / 数据变更后顺序错乱。
   const [pageOrder, setPageOrder] = useState<number[] | null>(null);
@@ -420,10 +321,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const currentPageAllSelected =
     currentPageIds.length > 0 &&
     currentPageIds.every((id) => selectedIds.has(id));
-  const filteredCredentialIds = filteredSortedCredentials.map((c) => c.id);
-  const filteredAllSelected =
-    filteredCredentialIds.length > 0 &&
-    filteredCredentialIds.every((id) => selectedIds.has(id));
+  const allFilteredIds = filteredCredentials.map((c) => c.id);
+  const allFilteredSelected =
+    allFilteredIds.length > 0 &&
+    allFilteredIds.every((id) => selectedIds.has(id));
 
   // 翻页时清掉本地排序覆盖，回到服务端顺序
   useEffect(() => {
@@ -435,10 +336,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   );
 
   const handleDragEnd = (event: DragEndEvent) => {
-    if (!canManualSort) {
-      toast.info("当前处于筛选/排序视图，切回“全部 + 优先级升序”后可拖拽调整优先级");
-      return;
-    }
     const { active, over } = event;
     if (!over || active.id === over.id) return;
     const ids = currentCredentials.map((c) => c.id);
@@ -529,11 +426,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
 
   useEffect(() => {
     setCurrentPage(1);
-  }, [data?.credentials.length, credentialSearch, credentialFilter, credentialSortKey, credentialSortDirection, groupFilter]);
-
-  useEffect(() => {
-    if (currentPage > totalPages) setCurrentPage(totalPages);
-  }, [currentPage, totalPages]);
+  }, [data?.credentials.length]);
 
   useEffect(() => {
     if (!data?.credentials) {
@@ -562,27 +455,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const toggleDarkMode = () => {
     setDarkMode(!darkMode);
     document.documentElement.classList.toggle("dark");
-  };
-
-  const handleUpdateAdminKey = async (event: FormEvent) => {
-    event.preventDefault();
-    const key = newAdminKey.trim();
-    if (!key) {
-      toast.error("请输入新的登录 API Key");
-      return;
-    }
-    setUpdatingAdminKey(true);
-    try {
-      await updateAdminKey({ newKey: key });
-      storage.setApiKey(key);
-      toast.success("登录 API Key 已更新");
-      setAdminKeyDialogOpen(false);
-      setNewAdminKey("");
-    } catch (error) {
-      toast.error(extractErrorMessage(error));
-    } finally {
-      setUpdatingAdminKey(false);
-    }
   };
 
   const handleRefresh = () => {
@@ -626,17 +498,18 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     });
   };
 
-  /** 全选 / 取消全选当前筛选结果，支持跨页批量导出。 */
-  const toggleSelectFiltered = () => {
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
-      if (filteredAllSelected) {
-        filteredCredentialIds.forEach((id) => next.delete(id));
-      } else {
-        filteredCredentialIds.forEach((id) => next.add(id));
-      }
-      return next;
-    });
+  /** 全选 / 取消全选所有筛选后的凭据（跨页） */
+  const toggleSelectAllFiltered = () => {
+    if (allFilteredSelected) {
+      // 取消：仅清除筛选范围内的，保留筛选范围外的已选项
+      setSelectedIds((prev) => {
+        const next = new Set(prev);
+        allFilteredIds.forEach((id) => next.delete(id));
+        return next;
+      });
+    } else {
+      setSelectedIds(new Set(allFilteredIds));
+    }
   };
 
   const handleBatchDelete = async () => {
@@ -800,34 +673,46 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     }
     setQueryingInfo(true);
     setQueryInfoProgress({ current: 0, total: ids.length });
-    let s = 0,
-      f = 0;
-    for (let i = 0; i < ids.length; i++) {
-      const id = ids[i];
-      setLoadingBalanceIds((prev) => {
-        const n = new Set(prev);
-        n.add(id);
-        return n;
-      });
-      try {
-        const balance = await getCredentialBalance(id);
-        s++;
-        setBalanceMap((prev) => {
-          const n = new Map(prev);
-          n.set(id, balance);
-          return n;
-        });
-      } catch {
-        f++;
-      } finally {
+    // 有界并发（worker pool，与批量验活一致），逐条更新余额与进度
+    let s = 0;
+    let f = 0;
+    let finalized = 0;
+    let next = 0;
+    const CONCURRENCY = 8;
+    const worker = async () => {
+      while (true) {
+        const i = next++;
+        if (i >= ids.length) return;
+        const id = ids[i];
         setLoadingBalanceIds((prev) => {
           const n = new Set(prev);
-          n.delete(id);
+          n.add(id);
           return n;
         });
+        try {
+          const balance = await getCredentialBalance(id);
+          s++;
+          setBalanceMap((prev) => {
+            const n = new Map(prev);
+            n.set(id, balance);
+            return n;
+          });
+        } catch {
+          f++;
+        } finally {
+          setLoadingBalanceIds((prev) => {
+            const n = new Set(prev);
+            n.delete(id);
+            return n;
+          });
+        }
+        finalized++;
+        setQueryInfoProgress({ current: finalized, total: ids.length });
       }
-      setQueryInfoProgress({ current: i + 1, total: ids.length });
-    }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(CONCURRENCY, ids.length) }, () => worker()),
+    );
     setQueryingInfo(false);
     if (f === 0) toast.success(`查询完成：成功 ${s}/${ids.length}`);
     else toast.warning(`查询完成：成功 ${s} 个，失败 ${f} 个`);
@@ -867,46 +752,66 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     cancelVerifyRef.current = false;
     const ids = Array.from(selectedIds);
     setVerifyProgress({ current: 0, total: ids.length });
-    let successCount = 0;
+
+    // id → email，便于结果列表直接看到是哪个账号
+    const emailById = new Map<number, string | undefined>();
+    for (const c of data?.credentials ?? []) emailById.set(c.id, c.email);
+
     const init = new Map<number, VerifyResult>();
-    ids.forEach((id) => init.set(id, { id, status: "pending" }));
+    ids.forEach((id) =>
+      init.set(id, { id, status: "pending", email: emailById.get(id) }),
+    );
     setVerifyResults(init);
     setVerifyDialogOpen(true);
-    for (let i = 0; i < ids.length; i++) {
-      if (cancelVerifyRef.current) {
-        toast.info("已取消验活");
-        break;
-      }
-      const id = ids[i];
-      setVerifyResults((prev) => {
-        const n = new Map(prev);
-        n.set(id, { id, status: "verifying" });
-        return n;
-      });
-      try {
-        const balance = await getCredentialBalance(id);
-        successCount++;
+
+    // 有界并发（无 2s 间隔）。worker pool 领取下一个 id，逐条更新结果。
+    let successCount = 0;
+    let finalized = 0;
+    let next = 0;
+    const CONCURRENCY = 8;
+    const worker = async () => {
+      while (true) {
+        if (cancelVerifyRef.current) return;
+        const i = next++;
+        if (i >= ids.length) return;
+        const id = ids[i];
         setVerifyResults((prev) => {
           const n = new Map(prev);
-          n.set(id, {
-            id,
-            status: "success",
-            usage: `${balance.currentUsage}/${balance.usageLimit}`,
+          n.set(id, { id, status: "verifying", email: emailById.get(id) });
+          return n;
+        });
+        try {
+          const balance = await getCredentialBalance(id);
+          successCount++;
+          setVerifyResults((prev) => {
+            const n = new Map(prev);
+            n.set(id, {
+              id,
+              status: "success",
+              usage: `${balance.currentUsage}/${balance.usageLimit}`,
+              email: emailById.get(id),
+            });
+            return n;
           });
-          return n;
-        });
-      } catch (err) {
-        setVerifyResults((prev) => {
-          const n = new Map(prev);
-          n.set(id, { id, status: "failed", error: extractErrorMessage(err) });
-          return n;
-        });
+        } catch (err) {
+          setVerifyResults((prev) => {
+            const n = new Map(prev);
+            n.set(id, {
+              id,
+              status: "failed",
+              error: extractErrorMessage(err),
+              email: emailById.get(id),
+            });
+            return n;
+          });
+        }
+        finalized++;
+        setVerifyProgress({ current: finalized, total: ids.length });
       }
-      setVerifyProgress({ current: i + 1, total: ids.length });
-      if (i < ids.length - 1 && !cancelVerifyRef.current) {
-        await new Promise((r) => setTimeout(r, 2000));
-      }
-    }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(CONCURRENCY, ids.length) }, () => worker()),
+    );
     setVerifying(false);
     if (!cancelVerifyRef.current)
       toast.success(`验活完成：成功 ${successCount}/${ids.length}`);
@@ -915,6 +820,53 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const handleCancelVerify = () => {
     cancelVerifyRef.current = true;
     setVerifying(false);
+  };
+
+  // 在批量验活窗口删除单个失败凭据
+  const handleDeleteVerifyResult = (id: number) => {
+    deleteCredential(id, {
+      onSuccess: () => {
+        setVerifyResults((prev) => {
+          const n = new Map(prev);
+          n.delete(id);
+          return n;
+        });
+        toast.success(`凭据 #${id} 已删除`);
+      },
+      onError: (err) => toast.error("删除失败: " + extractErrorMessage(err)),
+    });
+  };
+
+  // 一键删除批量验活窗口里全部失败凭据（并发删除）
+  const handleDeleteFailedVerify = () => {
+    const failedIds = Array.from(verifyResults.values())
+      .filter((r) => r.status === "failed")
+      .map((r) => r.id);
+    if (failedIds.length === 0) return;
+    setVerifyDeleting(true);
+    let remaining = failedIds.length;
+    let ok = 0;
+    failedIds.forEach((id) => {
+      deleteCredential(id, {
+        onSuccess: () => {
+          ok++;
+          setVerifyResults((prev) => {
+            const n = new Map(prev);
+            n.delete(id);
+            return n;
+          });
+        },
+        onError: (err) =>
+          toast.error(`删除 #${id} 失败: ` + extractErrorMessage(err)),
+        onSettled: () => {
+          remaining--;
+          if (remaining === 0) {
+            setVerifyDeleting(false);
+            toast.success(`已删除 ${ok}/${failedIds.length} 个失败凭据`);
+          }
+        },
+      });
+    });
   };
 
   // 一键超额：把所有已超额（未禁用）凭据标记为 QuotaExceeded 并禁用
@@ -977,7 +929,9 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           `成功 ${ok} 个，失败 ${fail} 个：${overageFailureMessage(res.failureMessages?.[0])}`,
         );
       else if (fail > 0)
-        toast.error(`全部失败：${overageFailureMessage(res.failureMessages?.[0])}`);
+        toast.error(
+          `全部失败：${overageFailureMessage(res.failureMessages?.[0])}`,
+        );
       else toast.info("没有需要操作的凭据");
       queryClient.invalidateQueries({ queryKey: ["credentials"] });
     } catch (err) {
@@ -1043,10 +997,27 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   };
 
   const [exportingKam, setExportingKam] = useState(false);
-  const compactObject = <T extends Record<string, unknown>>(obj: T) =>
-    Object.fromEntries(
-      Object.entries(obj).filter(([, value]) => value !== undefined && value !== null && value !== ""),
-    );
+
+  const handleUpdateAdminKey = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const key = newAdminKey.trim();
+    if (!key) {
+      toast.error("新登录API密钥不能为空");
+      return;
+    }
+    setUpdatingAdminKey(true);
+    try {
+      await updateAdminKey({ newKey: key });
+      storage.setApiKey(key);
+      toast.success("登录API密钥已更新，已自动切换到新 Key");
+      setAdminKeyDialogOpen(false);
+      setNewAdminKey("");
+    } catch (error) {
+      toast.error(`更新失败: ${extractErrorMessage(error)}`);
+    } finally {
+      setUpdatingAdminKey(false);
+    }
+  };
 
   const handleExportKam = async () => {
     if (selectedIds.size === 0) {
@@ -1057,40 +1028,12 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     setExportingKam(true);
     try {
       const exportData = await exportKamCredentials(ids);
-      const normalizedAccounts = (exportData.accounts || []).map((account) => {
-        const cred = account.credentials ?? {};
-        return compactObject({
-          email: account.email,
-          nickname: account.nickname,
-          idp: account.idp,
-          userId: account.userId,
-          profileArn: account.profileArn,
-          machineId: account.machineId,
-          endpoint: account.endpoint,
-          priority: account.priority,
-          status: account.status,
-          accessToken: cred.accessToken,
-          refreshToken: cred.refreshToken,
-          clientId: cred.clientId,
-          clientSecret: cred.clientSecret,
-          authMethod: cred.authMethod,
-          provider: cred.provider,
-          region: cred.region,
-          authRegion: cred.authRegion,
-          apiRegion: cred.apiRegion,
-          startUrl: cred.startUrl,
-          expiresAt: cred.expiresAt,
-          proxyUrl: cred.proxyUrl,
-          proxyUsername: cred.proxyUsername,
-          proxyPassword: cred.proxyPassword,
-        });
-      });
-      const accountCount = normalizedAccounts.length;
+      const accountCount = exportData.accounts?.length ?? 0;
       if (accountCount === 0) {
         toast.warning("勾选的凭据中没有可导出的（缺少 refreshToken）");
         return;
       }
-      const json = JSON.stringify(normalizedAccounts, null, 2);
+      const json = JSON.stringify(exportData, null, 2);
       const blob = new Blob([json], { type: "application/json" });
       const url = URL.createObjectURL(blob);
       const ts = new Date()
@@ -1100,7 +1043,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         .slice(0, 19);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `kiro-credentials-export-${accountCount}-${ts}.json`;
+      a.download = `kiro-account-manager-export-${ts}.json`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -1108,8 +1051,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       const skipped = ids.length - accountCount;
       toast.success(
         skipped > 0
-          ? `已导出 ${accountCount} 个凭据，${skipped} 个不可导出已跳过`
-          : `已导出 ${accountCount} 个凭据`,
+          ? `已导出 ${accountCount} 个账号，${skipped} 个无效已跳过`
+          : `已导出 ${accountCount} 个账号`,
       );
     } catch (err) {
       toast.error("导出失败: " + extractErrorMessage(err));
@@ -1117,7 +1060,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       setExportingKam(false);
     }
   };
-
 
   const handleToggleLoadBalancing = () => {
     const cur = loadBalancingData?.mode || "priority";
@@ -1195,7 +1137,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               </Button>
               <Button variant="ghost" size="icon" asChild title="GitHub 仓库">
                 <a
-                  href="https://github.com/TWLW9784/freedom-kirors"
+                  href="https://github.com/ZyphrZero/kiro.rs"
                   target="_blank"
                   rel="noopener noreferrer"
                   aria-label="GitHub 仓库"
@@ -1242,7 +1184,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   </span>
                 )}
               </Button>
-              <DropdownMenu>
+              <DropdownMenu modal={false}>
                 <DropdownMenuTrigger asChild>
                   <Button variant="ghost" size="icon" title="设置">
                     <Settings className="h-4 w-4" />
@@ -1292,17 +1234,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           </div>
         </div>
 
-        <div className="mb-4 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-700 dark:text-emerald-300">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="font-medium">当前并发已接入：RAM {totalInFlight}</div>
-            <div className="text-xs opacity-80">
-              活跃凭据 {activeInFlightCredentials} 个 · {concurrencyVersion}
-            </div>
-          </div>
-        </div>
-
         {/* 统计卡片 */}
-        <div className="mb-5 grid grid-cols-2 gap-2 sm:mb-6 sm:grid-cols-3 sm:gap-4 md:grid-cols-4">
+        <div className="mb-5 grid grid-cols-3 gap-2 sm:mb-6 sm:gap-4">
           <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
             <CardContent className="p-3 sm:p-5">
               <div className="text-[11px] font-medium text-muted-foreground sm:text-[13px]">
@@ -1336,32 +1269,49 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               </div>
             </CardContent>
           </Card>
-          <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
-            <CardContent className="p-5">
-              <div className="text-[13px] font-medium text-muted-foreground">
-                实时并发 RAM
-              </div>
-              <div className="mt-2 flex items-center gap-2">
-                <span className="text-3xl font-semibold tracking-tight tabular-nums text-emerald-600 dark:text-emerald-400">
-                  {formatNumber(totalInFlight)}
-                </span>
-                <Badge variant={totalInFlight > 0 ? "success" : "secondary"}>
-                  当前
-                </Badge>
-              </div>
-            </CardContent>
-          </Card>
         </div>
 
         {/* 工具栏 */}
-        <div className="mb-5 flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between">
+        <div className="mb-5 flex flex-col gap-3">
           <div className="flex min-w-0 flex-wrap items-center gap-2">
             <h2 className="text-lg font-semibold tracking-tight">凭据列表</h2>
             {data?.credentials && data.credentials.length > 0 && (
               <Badge variant="secondary">
-                {filteredSortedCredentials.length}/{data.credentials.length}
+                {groupFilter || tierFilter.size > 0
+                  ? `${filteredCredentials.length} / ${data.credentials.length}`
+                  : data.credentials.length}
               </Badge>
             )}
+            {groupFilter && (
+              <Badge variant="outline" className="gap-1">
+                筛选：{groupFilter === "__none__" ? "未分组" : groupFilter}
+                <button
+                  type="button"
+                  className="ml-1 text-muted-foreground hover:text-foreground"
+                  onClick={() => setGroupFilter("")}
+                  title="清除筛选"
+                >
+                  ×
+                </button>
+              </Badge>
+            )}
+            {tierFilter.size > 0 && (
+              <Badge variant="outline" className="gap-1">
+                分级：
+                {Array.from(tierFilter)
+                  .map((t) => TIER_LABELS[t])
+                  .join("、")}
+                <button
+                  type="button"
+                  className="ml-1 text-muted-foreground hover:text-foreground"
+                  onClick={() => setTierFilter(new Set())}
+                  title="清除分级筛选"
+                >
+                  ×
+                </button>
+              </Badge>
+            )}
+
             {currentCredentials.length > 0 && (
               <Button
                 size="sm"
@@ -1370,17 +1320,24 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 onClick={toggleSelectCurrentPage}
                 title={currentPageAllSelected ? "取消选择当前页" : "全选当前页"}
               >
-                {currentPageAllSelected ? "取消本页" : "全选本页"}
+                {currentPageAllSelected ? "取消全选" : "全选当前页"}
               </Button>
             )}
-            {filteredSortedCredentials.length > currentCredentials.length && (
+            {filteredCredentials.length > currentCredentials.length && (
               <Button
                 size="sm"
                 variant="ghost"
-                onClick={toggleSelectFiltered}
-                title={filteredAllSelected ? "取消选择当前筛选结果" : "选择当前筛选结果的所有页"}
+                className="px-2 sm:px-3"
+                onClick={toggleSelectAllFiltered}
+                title={
+                  allFilteredSelected
+                    ? "取消选择全部筛选结果"
+                    : `全选所有 ${filteredCredentials.length} 个筛选结果`
+                }
               >
-                {filteredAllSelected ? "取消筛选结果" : `全选筛选结果 (${filteredSortedCredentials.length})`}
+                {allFilteredSelected
+                  ? "取消全选所有页"
+                  : `全选所有页 (${filteredCredentials.length})`}
               </Button>
             )}
             {selectedIds.size > 0 && (
@@ -1408,355 +1365,372 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
             )}
           </div>
 
-          <div className="grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto sm:flex-wrap sm:items-center sm:justify-end">
-            {/* 选中态批量操作 */}
-            {selectedIds.size > 0 && (
-              <>
-                <Button
-                  onClick={handleBatchVerify}
-                  size="sm"
-                  variant="outline"
-                  className="w-full sm:w-auto"
-                >
-                  <CheckCircle2 className="h-3.5 w-3.5" />
-                  批量验活
-                </Button>
-                <Button
-                  onClick={handleBatchForceRefresh}
-                  size="sm"
-                  variant="outline"
-                  className="w-full sm:w-auto"
-                  disabled={batchRefreshing}
-                >
-                  <RefreshCw
-                    className={`h-3.5 w-3.5 ${batchRefreshing ? "animate-spin" : ""}`}
-                  />
-                  {batchRefreshing
-                    ? `刷新中… ${batchRefreshProgress.current}/${batchRefreshProgress.total}`
-                    : "刷新 Token"}
-                </Button>
-                <Button
-                  onClick={handleBatchResetFailure}
-                  size="sm"
-                  variant="outline"
-                  className="w-full sm:w-auto"
-                >
-                  <RotateCcw className="h-3.5 w-3.5" />
-                  恢复异常
-                </Button>
-                <Button
-                  onClick={() => setBatchEditDialogOpen(true)}
-                  size="sm"
-                  variant="outline"
-                  title="批量编辑分组 / 来源渠道"
-                >
-                  <Tags className="h-3.5 w-3.5" />
-                  分组/来源
-                </Button>
-                <Button
-                  onClick={handleExportKam}
-                  size="sm"
-                  variant="outline"
-                  className="w-full sm:w-auto"
-                  disabled={exportingKam}
-                  title="导出勾选的凭据为规范化 JSON，可直接批量导入"
-                >
-                  <FileDown className="h-3.5 w-3.5" />
-                  {exportingKam ? "导出中…" : "导出 JSON"}
-                </Button>
-                <Button
-                  onClick={handleBatchDelete}
-                  size="sm"
-                  variant="destructive"
-                  className="w-full sm:w-auto"
-                  disabled={selectedIds.size === 0}
-                >
-                  <Trash2 className="h-3.5 w-3.5" />
-                  删除
-                </Button>
-                <span className="mx-1 hidden h-5 w-px bg-border/70 sm:inline-block" />
-              </>
-            )}
-
-            {/* 分组筛选 */}
-            <Select value={groupFilter || 'all'} onValueChange={(v) => setGroupFilter(v === 'all' ? '' : v)}>
-              <SelectTrigger
-                className="h-8 w-full rounded-full border-border bg-card/60 px-3 backdrop-blur sm:w-[160px]"
-                title="按分组筛选凭据"
+          {/* 第二行：筛选（左） + 操作（右） */}
+          <div className="flex w-full flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
+            {/* 筛选器 — 左（移动端两列网格并排，桌面端内联） */}
+            <div className="grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto sm:flex-wrap sm:items-center">
+              {/* 模糊搜索：来源渠道（备注）/ 邮箱；移动端整行、桌面端 200px */}
+              <div className="relative col-span-2 sm:col-span-1 sm:w-[200px]">
+                <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="搜索来源渠道 / 备注 / 邮箱"
+                  className="h-8 w-full rounded-full border border-border bg-card/60 pl-5 pr-5 text-base backdrop-blur placeholder:text-muted-foreground/70 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring sm:text-sm"
+                />
+                {searchQuery && (
+                  <button
+                    type="button"
+                    onClick={() => setSearchQuery("")}
+                    className="absolute right-2 top-1/2 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                    title="清除搜索"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                )}
+              </div>
+              <Select
+                value={groupFilter || "all"}
+                onValueChange={(v) => setGroupFilter(v === "all" ? "" : v)}
               >
-                <SelectValue placeholder="全部分组" />
-              </SelectTrigger>
-              <SelectContent align="end">
-                <SelectItem value="all">全部分组</SelectItem>
-                <SelectItem value="__none__">未分组</SelectItem>
-                {groupOptions.map((g) => (
-                  <SelectItem key={g} value={g}>
-                    {g}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-
-            {/* 刷新当前页余额 */}
-            <Button
-              size="sm"
-              variant="outline"
-              className="w-full sm:w-auto"
-              disabled={queryingInfo || !data?.credentials?.length}
-              onClick={handleQueryCurrentPageInfo}
-            >
-              <RefreshCw
-                className={`h-3.5 w-3.5 ${queryingInfo ? "animate-spin" : ""}`}
-              />
-              {queryingInfo
-                ? `刷新中… ${queryInfoProgress.current}/${queryInfoProgress.total}`
-                : "刷新当前页余额"}
-            </Button>
-
-            {/* 主操作 */}
-            <Button
-              onClick={() => setAddDialogOpen(true)}
-              size="sm"
-              className="w-full sm:w-auto"
-            >
-              <Plus className="h-3.5 w-3.5" />
-              添加凭据
-            </Button>
-
-            {/* 导入 / 登录折叠菜单 */}
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button size="sm" variant="outline" className="w-full sm:w-auto">
-                  <Upload className="h-3.5 w-3.5" />
-                  导入 / 登录
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end">
-                <DropdownMenuLabel>登录</DropdownMenuLabel>
-                <DropdownMenuItem
-                  onSelect={() => setSocialLoginDialogOpen(true)}
+                <SelectTrigger
+                  className="h-8 w-full rounded-full border-border bg-card/60 px-3 backdrop-blur sm:w-[140px]"
+                  title="按分组筛选凭据"
                 >
-                  <LogIn />
-                  Kiro 账号登录
-                </DropdownMenuItem>
-                <DropdownMenuItem onSelect={() => setIdcLoginDialogOpen(true)}>
-                  <Key />
-                  AWS SSO (IdC) 登录
-                </DropdownMenuItem>
-                <DropdownMenuItem onSelect={() => setEnterpriseLoginDialogOpen(true)}>
-                  <Building2 />
-                  Enterprise (IAM Identity Center) 登录
-                </DropdownMenuItem>
-                <DropdownMenuSeparator />
-                <DropdownMenuLabel>导入</DropdownMenuLabel>
-                <DropdownMenuItem
-                  onSelect={() => setBatchImportDialogOpen(true)}
-                >
-                  <Upload />
-                  批量导入
-                </DropdownMenuItem>
-                <DropdownMenuItem onSelect={() => setKamImportDialogOpen(true)}>
-                  <FileUp />
-                  Kiro Account Manager 导入
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
+                  <SelectValue placeholder="全部分组" />
+                </SelectTrigger>
+                <SelectContent align="end">
+                  <SelectItem value="all">全部分组</SelectItem>
+                  <SelectItem value="__none__">未分组</SelectItem>
+                  {groupOptions.map((g) => (
+                    <SelectItem key={g} value={g}>
+                      {g}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
 
-            {/* 维护 / 危险操作折叠菜单 */}
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  title="更多操作"
-                  className="w-full sm:w-auto"
+              {/* 订阅分级筛选（多选） */}
+              <DropdownMenu modal={false}>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    title="按订阅分级筛选凭据（可多选，依据最近一次余额缓存）"
+                    className="inline-flex h-8 w-full items-center justify-between gap-1 rounded-full border border-border bg-card/60 px-3 text-sm backdrop-blur hover:bg-accent sm:w-[136px]"
+                  >
+                    <span className="truncate">
+                      {tierFilter.size > 0
+                        ? `分级 ·${tierFilter.size}`
+                        : "全部分级"}
+                    </span>
+                    <ChevronDown className="h-3.5 w-3.5 opacity-60" />
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="min-w-[10rem]">
+                  <DropdownMenuLabel>订阅分级</DropdownMenuLabel>
+                  {TIER_OPTIONS.map((t) => (
+                    <DropdownMenuItem
+                      key={t.value}
+                      onSelect={(e) => {
+                        e.preventDefault();
+                        toggleTier(t.value);
+                      }}
+                      className="gap-2"
+                    >
+                      <Checkbox checked={tierFilter.has(t.value)} />
+                      <span>{t.label}</span>
+                    </DropdownMenuItem>
+                  ))}
+                  {tierFilter.size > 0 && (
+                    <>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem
+                        onSelect={(e) => {
+                          e.preventDefault();
+                          setTierFilter(new Set());
+                        }}
+                        className="text-muted-foreground"
+                      >
+                        清除分级筛选
+                      </DropdownMenuItem>
+                    </>
+                  )}
+                </DropdownMenuContent>
+              </DropdownMenu>
+
+              {/* 卡片 / 列表 视图切换（iOS 分段控件） */}
+              <div className="col-span-2 inline-flex h-8 shrink-0 items-center justify-self-start rounded-full border border-border bg-card/60 p-0.5 backdrop-blur sm:col-span-1">
+                <button
+                  type="button"
+                  onClick={() => changeViewMode("card")}
+                  aria-pressed={viewMode === "card"}
+                  title="卡片视图"
+                  className={`inline-flex h-7 items-center gap-1 rounded-full px-2.5 text-[13px] transition-colors ${
+                    viewMode === "card"
+                      ? "bg-background text-foreground shadow-apple-sm"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
                 >
-                  <MoreHorizontal className="h-3.5 w-3.5" />
-                  <span className="sm:hidden">更多</span>
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end">
-                <DropdownMenuLabel>维护</DropdownMenuLabel>
-                <DropdownMenuItem onSelect={() => setProxyPoolDialogOpen(true)}>
-                  <Globe />
-                  IP 代理池管理
-                </DropdownMenuItem>
-                <DropdownMenuItem
-                  disabled={
-                    resetAllSuccess.isPending || !data?.credentials?.length
-                  }
-                  onSelect={(e) => {
-                    e.preventDefault();
-                    resetAllSuccess.mutate(undefined, {
-                      onSuccess: (res) => toast.success(res.message),
-                      onError: (err) =>
-                        toast.error("重置失败: " + (err as Error).message),
-                    });
-                  }}
+                  <LayoutGrid className="h-3.5 w-3.5" />
+                  <span className="hidden sm:inline">卡片</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => changeViewMode("list")}
+                  aria-pressed={viewMode === "list"}
+                  title="列表视图"
+                  className={`inline-flex h-7 items-center gap-1 rounded-full px-2.5 text-[13px] transition-colors ${
+                    viewMode === "list"
+                      ? "bg-background text-foreground shadow-apple-sm"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
                 >
-                  <RotateCcw
-                    className={resetAllSuccess.isPending ? "animate-spin" : ""}
-                  />
-                  重置成功次数
-                </DropdownMenuItem>
-                <DropdownMenuItem
-                  disabled={
-                    enablingOverage ||
-                    refreshingOverage ||
-                    overageRetryableCount === 0
-                  }
-                  onSelect={(e) => {
-                    e.preventDefault();
-                    if (overageEnableableCount > 0) {
-                      handleEnableOverageAll();
-                    } else {
-                      handleRefreshOverageStatus();
+                  <List className="h-3.5 w-3.5" />
+                  <span className="hidden sm:inline">列表</span>
+                </button>
+              </div>
+            </div>
+
+            {/* 操作 — 右（移动端整宽两列网格，桌面端右对齐内联） */}
+            <div className="ml-auto grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto sm:flex-wrap sm:items-center">
+              {selectedIds.size > 0 && (
+                <>
+                  <Button
+                    onClick={() => setBatchEditDialogOpen(true)}
+                    size="sm"
+                    variant="outline"
+                    title="批量编辑分组 / 来源渠道"
+                  >
+                    <Tags className="h-3.5 w-3.5" />
+                    分组/来源
+                  </Button>
+                  <Button
+                    onClick={handleBatchDelete}
+                    size="sm"
+                    variant="destructive"
+                    className="w-full sm:w-auto"
+                    disabled={selectedIds.size === 0}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                    删除
+                  </Button>
+                  <span className="mx-1 hidden h-5 w-px bg-border/70 sm:inline-block" />
+                </>
+              )}
+
+              {/* 主操作 */}
+              <Button
+                onClick={() => setAddDialogOpen(true)}
+                size="sm"
+                className="w-full sm:w-auto"
+              >
+                <Plus className="h-3.5 w-3.5" />
+                添加凭据
+              </Button>
+
+              {/* 导入 / 登录折叠菜单 */}
+              <DropdownMenu modal={false}>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="w-full sm:w-auto"
+                  >
+                    <Upload className="h-3.5 w-3.5" />
+                    登录 / 导入 / 导出
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  <DropdownMenuLabel>登录</DropdownMenuLabel>
+                  <DropdownMenuItem
+                    onSelect={() => setSocialLoginDialogOpen(true)}
+                  >
+                    <LogIn />
+                    Kiro 账号登录
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={() => setIdcLoginDialogOpen(true)}
+                  >
+                    <Key />
+                    AWS SSO (IdC) 登录
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={() => setEnterpriseLoginDialogOpen(true)}
+                  >
+                    <Building2 />
+                    Enterprise (IAM Identity Center) 登录
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuLabel>导入</DropdownMenuLabel>
+                  <DropdownMenuItem
+                    onSelect={() => setBatchImportDialogOpen(true)}
+                  >
+                    <Upload />
+                    批量导入
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={() => setKamImportDialogOpen(true)}
+                  >
+                    <FileUp />
+                    Kiro Account Manager 导入
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={handleExportKam}
+                    disabled={exportingKam}
+                  >
+                    <FileDown />
+                    {exportingKam ? "导出中…" : "Kiro Account Manager 导出"}
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+
+              {/* 维护 / 危险操作折叠菜单 */}
+              <DropdownMenu modal={false}>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    title="更多操作"
+                    className="w-full sm:w-auto"
+                  >
+                    <MoreHorizontal className="h-3.5 w-3.5" />
+                    <span className="sm:hidden">更多</span>
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  <DropdownMenuLabel>批量操作</DropdownMenuLabel>
+                  <DropdownMenuItem
+                    onSelect={handleBatchVerify}
+                    disabled={selectedIds.size === 0}
+                  >
+                    <CheckCircle2 />
+                    批量验活
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={(e) => {
+                      e.preventDefault();
+                      handleBatchForceRefresh();
+                    }}
+                    disabled={selectedIds.size === 0 || batchRefreshing}
+                  >
+                    <RefreshCw
+                      className={batchRefreshing ? "animate-spin" : ""}
+                    />
+                    {batchRefreshing
+                      ? `刷新中… ${batchRefreshProgress.current}/${batchRefreshProgress.total}`
+                      : "刷新 Token"}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={handleBatchResetFailure}
+                    disabled={selectedIds.size === 0}
+                  >
+                    <RotateCcw />
+                    恢复异常
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuLabel>维护</DropdownMenuLabel>
+                  <DropdownMenuItem
+                    onSelect={(e) => {
+                      e.preventDefault();
+                      handleQueryCurrentPageInfo();
+                    }}
+                    disabled={queryingInfo || !data?.credentials?.length}
+                  >
+                    <RefreshCw className={queryingInfo ? "animate-spin" : ""} />
+                    {queryingInfo
+                      ? `刷新中… ${queryInfoProgress.current}/${queryInfoProgress.total}`
+                      : "刷新当前页余额"}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={() => setProxyPoolDialogOpen(true)}
+                  >
+                    <Globe />
+                    IP 代理池管理
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    disabled={
+                      resetAllSuccess.isPending || !data?.credentials?.length
                     }
-                  }}
-                  title={
-                    overageRetryableCount === 0
-                      ? `全部 ${overageStats.enabled} 个 PRO/ENTERPRISE 凭据均已开启超额`
-                      : `已开 ${overageStats.enabled} 个 / 未开 ${overageStats.disabledOff} 个 / 待确定 ${overageStats.unknown} 个`
-                  }
-                >
-                  <Zap
-                    className={
-                      enablingOverage || refreshingOverage
-                        ? "animate-pulse text-emerald-500"
-                        : "text-emerald-500"
+                    onSelect={(e) => {
+                      e.preventDefault();
+                      resetAllSuccess.mutate(undefined, {
+                        onSuccess: (res) => toast.success(res.message),
+                        onError: (err) =>
+                          toast.error("重置失败: " + (err as Error).message),
+                      });
+                    }}
+                  >
+                    <RotateCcw
+                      className={
+                        resetAllSuccess.isPending ? "animate-spin" : ""
+                      }
+                    />
+                    重置成功次数
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    disabled={
+                      enablingOverage ||
+                      refreshingOverage ||
+                      overageRetryableCount === 0
                     }
-                  />
-                  {refreshingOverage
-                    ? `刷新中… ${refreshingOverageProgress.current}/${refreshingOverageProgress.total}`
-                    : overageRetryableCount === 0
-                      ? `全部已开启超额（${overageStats.enabled}）`
-                      : overageEnableableCount > 0
-                        ? `一键开启超额（${overageEnableableCount}）`
-                        : `重试拉取超额状态（${overageStats.unknown}）`}
-                </DropdownMenuItem>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem
-                  destructive
-                  disabled={disablingQuota || quotaExceededCount === 0}
-                  onSelect={(e) => {
-                    e.preventDefault();
-                    handleDisableQuotaExceeded();
-                  }}
-                >
-                  <AlertTriangle />
-                  一键超额禁用 ({quotaExceededCount})
-                </DropdownMenuItem>
-                <DropdownMenuItem
-                  destructive
-                  disabled={disabledCredentialCount === 0}
-                  onSelect={(e) => {
-                    e.preventDefault();
-                    handleClearAll();
-                  }}
-                >
-                  <Trash2 />
-                  清除已禁用 ({disabledCredentialCount})
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
+                    onSelect={(e) => {
+                      e.preventDefault();
+                      if (overageEnableableCount > 0) {
+                        handleEnableOverageAll();
+                      } else {
+                        handleRefreshOverageStatus();
+                      }
+                    }}
+                    title={
+                      overageRetryableCount === 0
+                        ? `全部 ${overageStats.enabled} 个 PRO/ENTERPRISE 凭据均已开启超额`
+                        : `已开 ${overageStats.enabled} 个 / 未开 ${overageStats.disabledOff} 个 / 待确定 ${overageStats.unknown} 个`
+                    }
+                  >
+                    <Zap
+                      className={
+                        enablingOverage || refreshingOverage
+                          ? "animate-pulse text-emerald-500"
+                          : "text-emerald-500"
+                      }
+                    />
+                    {refreshingOverage
+                      ? `刷新中… ${refreshingOverageProgress.current}/${refreshingOverageProgress.total}`
+                      : overageRetryableCount === 0
+                        ? `全部已开启超额（${overageStats.enabled}）`
+                        : overageEnableableCount > 0
+                          ? `一键开启超额（${overageEnableableCount}）`
+                          : `重试拉取超额状态（${overageStats.unknown}）`}
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem
+                    destructive
+                    disabled={disablingQuota || quotaExceededCount === 0}
+                    onSelect={(e) => {
+                      e.preventDefault();
+                      handleDisableQuotaExceeded();
+                    }}
+                  >
+                    <AlertTriangle />
+                    一键超额禁用 ({quotaExceededCount})
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    destructive
+                    disabled={disabledCredentialCount === 0}
+                    onSelect={(e) => {
+                      e.preventDefault();
+                      handleClearAll();
+                    }}
+                  >
+                    <Trash2 />
+                    清除已禁用 ({disabledCredentialCount})
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
           </div>
         </div>
-
-        {/* 排序 / 筛选 */}
-        {data?.credentials && data.credentials.length > 0 && (
-          <Card className="mb-5">
-            <CardContent className="p-4 space-y-3">
-              {/* 单行工具栏：状态筛选 + 搜索 + 排序 + 重置 */}
-              <div className="flex flex-wrap items-center gap-2">
-                {/* 状态 / 订阅筛选（单个下拉，取代原来的七按钮平铺 + 重复下拉）*/}
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
-                    <Button type="button" size="sm" variant="outline" className="h-10">
-                      筛选：{credentialFilterLabels[credentialFilter]}
-                      <ChevronDown className="h-3.5 w-3.5" />
-                    </Button>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent align="start">
-                    <DropdownMenuLabel>状态 / 订阅筛选</DropdownMenuLabel>
-                    {(Object.keys(credentialFilterLabels) as CredentialFilter[]).map((key) => (
-                      <DropdownMenuItem key={key} onSelect={() => setCredentialFilter(key)}>
-                        <span className="w-4 text-center">{credentialFilter === key ? "✓" : ""}</span>
-                        {credentialFilterLabels[key]}
-                        {key === "available-pro" && ` (${subscriptionStats.availableAnyPro})`}
-                        {key === "pro" && ` (${subscriptionStats.pro})`}
-                        {key === "pro-plus" && ` (${subscriptionStats.proPlus})`}
-                        {key === "power" && ` (${subscriptionStats.power})`}
-                        {key === "free" && ` (${subscriptionStats.free})`}
-                        {key === "subscription-unknown" && ` (${subscriptionStats.unknown})`}
-                      </DropdownMenuItem>
-                    ))}
-                  </DropdownMenuContent>
-                </DropdownMenu>
-
-                {/* 搜索框 */}
-                <div className="relative min-w-0 flex-1 basis-full sm:basis-auto sm:min-w-[240px]">
-                  <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-                  <Input
-                    value={credentialSearch}
-                    onChange={(e) => setCredentialSearch(e.target.value)}
-                    placeholder="搜索邮箱 / ID / 端点"
-                    className="h-10 pl-9"
-                  />
-                </div>
-
-                {/* 排序 */}
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
-                    <Button type="button" size="sm" variant="outline" className="h-10">
-                      排序：{credentialSortLabels[credentialSortKey]} · {credentialSortDirection === "asc" ? "升序" : "降序"}
-                      <ChevronDown className="h-3.5 w-3.5" />
-                    </Button>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent align="end">
-                    <DropdownMenuLabel>排序</DropdownMenuLabel>
-                    {(Object.keys(credentialSortLabels) as CredentialSortKey[]).map((key) => (
-                      <DropdownMenuItem key={key} onSelect={() => setCredentialSortKey(key)}>
-                        <span className="w-4 text-center">{credentialSortKey === key ? "✓" : ""}</span>
-                        {credentialSortLabels[key]}
-                      </DropdownMenuItem>
-                    ))}
-                    <DropdownMenuSeparator />
-                    <DropdownMenuItem onSelect={() => setCredentialSortDirection("asc")}>
-                      <span className="w-4 text-center">{credentialSortDirection === "asc" ? "✓" : ""}</span>
-                      升序
-                    </DropdownMenuItem>
-                    <DropdownMenuItem onSelect={() => setCredentialSortDirection("desc")}>
-                      <span className="w-4 text-center">{credentialSortDirection === "desc" ? "✓" : ""}</span>
-                      降序
-                    </DropdownMenuItem>
-                  </DropdownMenuContent>
-                </DropdownMenu>
-
-                {/* 重置 */}
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  className="h-10"
-                  disabled={!credentialSearch && credentialFilter === "all" && credentialSortKey === "priority" && credentialSortDirection === "asc"}
-                  onClick={() => {
-                    setCredentialSearch("");
-                    setCredentialFilter("all");
-                    setCredentialSortKey("priority");
-                    setCredentialSortDirection("asc");
-                  }}
-                >
-                  <X className="h-3.5 w-3.5" />
-                  重置
-                </Button>
-              </div>
-              <div className="text-xs text-muted-foreground">
-                显示 {filteredSortedCredentials.length} / {data.credentials.length}；POWER {subscriptionStats.power}（可用 {subscriptionStats.availablePower}），PRO+ {subscriptionStats.proPlus}（可用 {subscriptionStats.availableProPlus}），PRO {subscriptionStats.pro}（可用 {subscriptionStats.availablePro}），FREE {subscriptionStats.free}，未知 {subscriptionStats.unknown}
-                {!canManualSort && "；当前视图不改写拖拽优先级"}
-              </div>
-            </CardContent>
-          </Card>
-        )}
 
         {/* 列表 */}
         {data?.credentials.length === 0 ? (
@@ -1770,28 +1744,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               </p>
             </CardContent>
           </Card>
-        ) : filteredSortedCredentials.length === 0 ? (
-          <Card>
-            <CardContent className="py-16 text-center">
-              <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-secondary text-muted-foreground">
-                <Search className="h-5 w-5" />
-              </div>
-              <p className="text-sm text-muted-foreground">没有匹配当前筛选条件的凭据</p>
-              <Button
-                className="mt-4"
-                variant="outline"
-                size="sm"
-                onClick={() => {
-                  setCredentialSearch("");
-                  setCredentialFilter("all");
-                  setCredentialSortKey("priority");
-                  setCredentialSortDirection("asc");
-                }}
-              >
-                清空筛选
-              </Button>
-            </CardContent>
-          </Card>
         ) : (
           <>
             <DndContext
@@ -1801,13 +1753,24 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
             >
               <SortableContext
                 items={currentPageIds}
-                strategy={rectSortingStrategy}
+                strategy={
+                  viewMode === "list"
+                    ? verticalListSortingStrategy
+                    : rectSortingStrategy
+                }
               >
-                <div className="grid min-w-0 gap-3 sm:gap-4 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-[repeat(auto-fit,minmax(360px,1fr))]">
+                <div
+                  className={
+                    viewMode === "list"
+                      ? "flex select-none flex-col gap-2"
+                      : "grid select-none gap-3 sm:gap-4 md:grid-cols-2 lg:grid-cols-3"
+                  }
+                >
                   {currentCredentials.map((credential) => (
                     <CredentialCard
                       key={credential.id}
                       credential={credential}
+                      view={viewMode}
                       selected={selectedIds.has(credential.id)}
                       onToggleSelect={() => toggleSelect(credential.id)}
                       balance={
@@ -1820,44 +1783,72 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                         handleRefreshBalance(credential.id)
                       }
                       failureStats={failureStatsMap?.[String(credential.id)]}
-                      recentStats={recentStatsMap?.[String(credential.id)]}
                     />
                   ))}
                 </div>
               </SortableContext>
             </DndContext>
 
-            {totalPages > 1 && (
-              <div className="mt-6 flex flex-wrap items-center justify-center gap-2 sm:mt-8">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
-                  disabled={safeCurrentPage === 1}
-                >
-                  <ChevronLeft className="h-3.5 w-3.5" />
-                  上一页
-                </Button>
-                <div className="order-first w-full px-3 text-center text-sm tabular-nums text-muted-foreground sm:order-none sm:w-auto">
-                  第{" "}
-                  <span className="font-medium text-foreground">
-                    {safeCurrentPage}
-                  </span>{" "}
-                  / {totalPages} 页
-                  <span className="mx-1.5 text-muted-foreground/50">·</span>共{" "}
-                  {filteredSortedCredentials.length} 个
+            {filteredCredentials.length > 0 && (
+              <div className="mt-6 flex flex-col items-center justify-center gap-3 sm:mt-8 sm:flex-row sm:gap-5">
+                {/* 每页数量 */}
+                <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                  <span className="whitespace-nowrap">每页</span>
+                  <Select
+                    value={String(pageSize)}
+                    onValueChange={(v) => changePageSize(Number(v))}
+                  >
+                    <SelectTrigger
+                      className="h-8 w-[92px] rounded-full border-border bg-card/60 px-3 backdrop-blur"
+                      title="设置每页显示数量"
+                    >
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent align="center">
+                      {PAGE_SIZE_OPTIONS.map((n) => (
+                        <SelectItem key={n} value={String(n)}>
+                          {n} 个
+                        </SelectItem>
+                      ))}
+                      <SelectItem value="0">全部</SelectItem>
+                    </SelectContent>
+                  </Select>
                 </div>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() =>
-                    setCurrentPage((p) => Math.min(totalPages, p + 1))
-                  }
-                  disabled={safeCurrentPage === totalPages}
-                >
-                  下一页
-                  <ChevronRight className="h-3.5 w-3.5" />
-                </Button>
+
+                {/* 翻页控件（仅多页时显示） */}
+                {totalPages > 1 && (
+                  <div className="flex flex-wrap items-center justify-center gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                      disabled={currentPage === 1}
+                    >
+                      <ChevronLeft className="h-3.5 w-3.5" />
+                      上一页
+                    </Button>
+                    <div className="order-first w-full px-3 text-center text-sm tabular-nums text-muted-foreground sm:order-none sm:w-auto">
+                      第{" "}
+                      <span className="font-medium text-foreground">
+                        {currentPage}
+                      </span>{" "}
+                      / {totalPages} 页
+                      <span className="mx-1.5 text-muted-foreground/50">·</span>
+                      共 {filteredCredentials.length} 个
+                    </div>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() =>
+                        setCurrentPage((p) => Math.min(totalPages, p + 1))
+                      }
+                      disabled={currentPage === totalPages}
+                    >
+                      下一页
+                      <ChevronRight className="h-3.5 w-3.5" />
+                    </Button>
+                  </div>
+                )}
               </div>
             )}
           </>
@@ -1876,7 +1867,9 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       <BatchEditCredentialDialog
         open={batchEditDialogOpen}
         onOpenChange={setBatchEditDialogOpen}
-        credentials={(data?.credentials ?? []).filter((c) => selectedIds.has(c.id))}
+        credentials={(data?.credentials ?? []).filter((c) =>
+          selectedIds.has(c.id),
+        )}
         groupOptions={groupOptions}
         onDone={deselectAll}
       />
@@ -2040,8 +2033,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         progress={verifyProgress}
         results={verifyResults}
         onCancel={handleCancelVerify}
+        onDelete={handleDeleteVerifyResult}
+        onDeleteFailed={handleDeleteFailedVerify}
+        deleting={verifyDeleting}
       />
-
     </div>
   );
 }
