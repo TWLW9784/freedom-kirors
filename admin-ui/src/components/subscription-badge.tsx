@@ -1,4 +1,4 @@
-import { Sparkles, Crown, Zap, Gem, Tag } from 'lucide-react'
+import { Sparkles, Crown, Zap, Gem, Tag, Rocket } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 interface SubscriptionBadgeProps {
@@ -8,7 +8,7 @@ interface SubscriptionBadgeProps {
   className?: string
 }
 
-export type Tier = 'free' | 'pro' | 'pro_plus' | 'power' | 'unknown'
+export type Tier = 'free' | 'pro' | 'pro_plus' | 'pro_max' | 'power' | 'unknown'
 
 interface TierStyle {
   /** 容器背景与文字颜色 */
@@ -24,6 +24,9 @@ export function detectTier(title?: string | null): Tier {
   if (!title) return 'unknown'
   const upper = title.toUpperCase()
   if (upper.includes('POWER')) return 'power'
+  // ProMax 须在 PRO+ / PRO 之前判，避免 "PRO MAX" 含 "PRO" 被误判
+  if (upper.includes('PRO MAX') || upper.includes('PROMAX') || upper.includes('PRO_MAX'))
+    return 'pro_max'
   if (upper.includes('PRO+') || upper.includes('PRO PLUS')) return 'pro_plus'
   if (upper.includes('PRO')) return 'pro'
   if (upper.includes('FREE')) return 'free'
@@ -48,6 +51,14 @@ function getTierStyle(tier: Tier, original?: string | null): TierStyle {
         label: 'PRO+',
         container:
           'bg-gradient-to-br from-amber-400 to-orange-500 text-white shadow-[0_2px_8px_-2px_rgba(245,158,11,0.5)] border-transparent',
+      }
+    case 'pro_max':
+      // 青绿渐变 — ProMax，介于 Pro+ 与 Power 之间
+      return {
+        Icon: Rocket,
+        label: 'PRO MAX',
+        container:
+          'bg-gradient-to-br from-teal-400 to-emerald-600 text-white shadow-[0_2px_8px_-2px_rgba(16,185,129,0.5)] border-transparent',
       }
     case 'pro':
       // 苹果蓝渐变 — 标准 Pro

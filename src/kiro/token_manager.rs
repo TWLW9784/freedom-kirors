@@ -3248,6 +3248,15 @@ impl MultiTokenManager {
                     anyhow::bail!(msg);
                 }
             }
+            // balanced 软启动：新号 success_count 不从 0 起，而是取现有号的均值。
+            // 否则加权 least-used 会把几乎全部流量砸到新号直到追平历史累计，
+            // 与限速并发叠加形成对上游不友好的脉冲。无现有号时为 0。
+            let seed_success_count = if entries.is_empty() {
+                0
+            } else {
+                let sum: u128 = entries.iter().map(|e| e.success_count as u128).sum();
+                (sum / entries.len() as u128) as u64
+            };
             entries.push(CredentialEntry {
                 id: new_id,
                 credentials: validated_cred,
@@ -3256,7 +3265,7 @@ impl MultiTokenManager {
                 refresh_failure_count: 0,
                 disabled: false,
                 disabled_reason: None,
-                success_count: 0,
+                success_count: seed_success_count,
                 last_used_at: None,
                 throttled_until: None,
                 in_flight: 0,
@@ -4062,6 +4071,46 @@ mod tests {
         assert!(id > 0);
         assert_eq!(manager.total_count(), 1);
         assert_eq!(manager.available_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_add_credential_soft_start_seeds_mean_success_count() {
+        // balanced 软启动：现有两号累计 success_count=10/20，新加号应播种为均值 15，
+        // 而不是从 0 起（否则会被加权 least-used 砸流量）。
+        let config = Config::default();
+        let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+
+        let mut k1 = KiroCredentials::default();
+        k1.kiro_api_key = Some("ksk_a".to_string());
+        k1.auth_method = Some("api_key".to_string());
+        let id1 = manager.add_credential(k1).await.unwrap();
+
+        let mut k2 = KiroCredentials::default();
+        k2.kiro_api_key = Some("ksk_b".to_string());
+        k2.auth_method = Some("api_key".to_string());
+        let id2 = manager.add_credential(k2).await.unwrap();
+
+        for _ in 0..10 {
+            manager.report_success(id1);
+        }
+        for _ in 0..20 {
+            manager.report_success(id2);
+        }
+
+        let mut k3 = KiroCredentials::default();
+        k3.kiro_api_key = Some("ksk_c".to_string());
+        k3.auth_method = Some("api_key".to_string());
+        let id3 = manager.add_credential(k3).await.unwrap();
+
+        let seeded = manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|a| a.id == id3)
+            .map(|a| a.success_count)
+            .expect("新号应在快照中");
+        // 均值 = (10 + 20) / 2 = 15
+        assert_eq!(seeded, 15, "新号 success_count 应播种为现有号均值");
     }
 
     #[tokio::test]

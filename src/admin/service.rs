@@ -467,6 +467,10 @@ fn subscription_type_from_title(title: Option<&str>) -> &'static str {
         "Free"
     } else if u.contains("PRO+") || u.contains("PRO PLUS") || u.contains("PRO_PLUS") {
         "Pro_Plus"
+    } else if u.contains("PRO MAX") || u.contains("PROMAX") || u.contains("PRO_MAX") {
+        // ProMax：介于 Pro 与 Power 之间的新订阅（额度 5000）。必须在通用 PRO 判断之前拦，
+        // 否则 "PRO MAX" 含 "PRO" 会被误归为普通 Pro。
+        "Pro_Max"
     } else if u.contains("POWER") || u.contains("ENTERPRISE") || u.contains("TEAM") {
         "Enterprise"
     } else if u.contains("PRO") {
@@ -3557,6 +3561,15 @@ mod tests {
         assert_eq!(subscription_type_from_title(Some("KIRO FREE")), "Free");
         assert_eq!(subscription_type_from_title(Some("KIRO PRO+")), "Pro_Plus");
         assert_eq!(subscription_type_from_title(Some("KIRO PRO")), "Pro");
+        // ProMax：介于 Pro 与 Power，不能被误归为普通 Pro
+        assert_eq!(
+            subscription_type_from_title(Some("KIRO PRO MAX")),
+            "Pro_Max"
+        );
+        assert_eq!(
+            subscription_type_from_title(Some("KIRO PROMAX")),
+            "Pro_Max"
+        );
         assert_eq!(
             subscription_type_from_title(Some("KIRO POWER")),
             "Enterprise"

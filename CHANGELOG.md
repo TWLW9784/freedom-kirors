@@ -5,6 +5,19 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
 
+## [0.6.15] - 2026-06-28
+
+主题：**balanced 软启动 + 识别 ProMax 新订阅**。
+
+### 优化
+
+- **balanced 模式冷启动软启动**：新增凭据入库时 `success_count` 不再从 0 起，而是取现有号的均值。之前新号从 0 起会被加权 least-used 砸几乎全部流量，直到追平历史累计，与限速并发叠加形成对上游不友好的脉冲。现在新号从均值起步，平滑接入流量。
+
+### 新增
+
+- **识别 ProMax 新订阅**（额度 5000，介于 Pro 与 Power 之间）：后端 `subscription_type_from_title` 新增 `Pro_Max` 分类（在通用 PRO 判断之前拦，避免 "PRO MAX" 含 "PRO" 被误归为普通 Pro）；前端 `detectTier` / 订阅徽章 / 分级筛选新增 `pro_max`（青绿渐变 + Rocket 图标，标签 PRO MAX）。额度数值仍由上游 Kiro API 透传，本改动只负责识别与展示。
+
+
 ## [0.6.14] - 2026-06-28
 
 主题：**修复凭据去重漏判 + 配置持久化竞态 + 清理哑配置**。
