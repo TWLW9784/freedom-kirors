@@ -5,6 +5,27 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
 
+## [0.6.11] - 2026-06-28
+
+主题：**档位 RPM/并发限速可观测性修复 + RPM 突发模式可选开关**。
+
+### 新增
+
+- **RPM 突发模式开关（`rpmBurstEnabled`，默认关）**：参照 Kiro-Go 增加可选的 60s 滑动窗口令牌桶限速。
+  - **关（默认）**：固定最小间隔，严格匀速、天然削峰，对上游速率限制更友好。
+  - **开（Kiro-Go 风格）**：60s 滑动窗口内未满 `60000/minIntervalMs` 个即放行，同 RPM 上限下允许瞬时突发。
+  - 运行时即时生效、持久化 config.json、向后兼容（旧配置默认 false 走原行为）。`/admin` 并发配置对话框「自适应降并发」下新增开关。
+
+### 修复
+
+- **并发快照显示 bug**：`effective_min_interval_ms`/`effective_max_in_flight` 之前读启动时 Config 缓存副本（`set_concurrency_config` 只更新原子变量），导致运行时改间隔/并发后凭证卡片仍显示旧值。现改为读实时原子值，与真实限速逻辑统一；凭证级 `minIntervalMs` 覆盖仍优先。
+
+### 其他
+
+- 档位默认调整为 Enterprise 并发 32 / 最小间隔 300ms（理论 RPM 200）。
+- 压测探针/凭证卡片并发与RPM展示优化、缓存命中率统计工具 `tools/cache_hit_rate.py`。
+
+
 ## [Freedom 二次开发版] - 2026-06-13
 
 主题：**基于上游 v0.6.6 的生产部署增强版**。本节记录 `TWLW9784/freedom-kirors` 相对上游 `ZyphrZero/kiro.rs` 的二次开发、生产补丁和部署维护变更。后续每次合并官方仓库、调整本地生产补丁或推送部署仓库，都必须同步补充本节或新增日期小节，避免代码变化无记录。

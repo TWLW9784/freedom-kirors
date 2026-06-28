@@ -20,8 +20,10 @@ import {
 } from '@/components/ui/select'
 import { Input } from '@/components/ui/input'
 import { useUpdateCredential } from '@/hooks/use-credentials'
+import { useGroupOptions } from '@/hooks/use-groups'
 import { getProxyPool } from '@/api/credentials'
 import { extractErrorMessage, maskProxyUrl } from '@/lib/utils'
+import { GroupMultiSelect } from '@/components/group-select'
 import type { CredentialStatusItem } from '@/types/api'
 
 interface EditCredentialDialogProps {
@@ -40,7 +42,11 @@ export function EditCredentialDialog({
   const [proxyUsername, setProxyUsername] = useState('')
   const [proxyPassword, setProxyPassword] = useState('')
   const [profileArn, setProfileArn] = useState(credential.profileArn ?? '')
+  const [groups, setGroups] = useState<string[]>(credential.groups ?? [])
+  const [sourceChannel, setSourceChannel] = useState(credential.sourceChannel ?? '')
   const [manualMode, setManualMode] = useState(false)
+
+  const groupOptions = useGroupOptions()
 
   const { data: proxyPool } = useQuery({
     queryKey: ['proxy-pool'],
@@ -56,6 +62,8 @@ export function EditCredentialDialog({
       setProxyUsername('')
       setProxyPassword('')
       setProfileArn(credential.profileArn ?? '')
+      setGroups(credential.groups ?? [])
+      setSourceChannel(credential.sourceChannel ?? '')
       setManualMode(false)
     }
   }, [open, credential])
@@ -74,6 +82,8 @@ export function EditCredentialDialog({
           proxyUsername: proxyUsername || undefined,
           proxyPassword: proxyPassword || undefined,
           profileArn,
+          groups,
+          sourceChannel: sourceChannel.trim(),
         },
       },
       {
@@ -128,7 +138,6 @@ export function EditCredentialDialog({
               </p>
             </div>
 
-
             {/* Profile ARN 快速切换 */}
             <div className="space-y-2">
               <label htmlFor="profileArn" className="text-sm font-medium">
@@ -144,6 +153,37 @@ export function EditCredentialDialog({
               />
               <p className="text-xs text-muted-foreground">
                 只切换 profile 时改这里即可；留空保存可清除。区域会按 ARN 自动选择。
+              </p>
+            </div>
+
+            {/* 账号分组 */}
+            <div className="space-y-2">
+              <label className="text-sm font-medium">账号分组</label>
+              <GroupMultiSelect
+                value={groups}
+                options={groupOptions}
+                onChange={setGroups}
+                disabled={isPending}
+              />
+              <p className="text-xs text-muted-foreground">
+                可选。绑定了某分组的客户端 Key 只会调度到含该分组的账号
+              </p>
+            </div>
+
+            {/* 账号来源渠道 */}
+            <div className="space-y-2">
+              <label htmlFor="sourceChannel" className="text-sm font-medium">
+                账号来源渠道（备注）
+              </label>
+              <Input
+                id="sourceChannel"
+                placeholder="例: 官方, 转售商A, 采购平台X"
+                value={sourceChannel}
+                onChange={(e) => setSourceChannel(e.target.value)}
+                disabled={isPending}
+              />
+              <p className="text-xs text-muted-foreground">
+                可选。纯备注，标记账号来源/渠道，便于追踪
               </p>
             </div>
 

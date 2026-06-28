@@ -21,14 +21,13 @@ use super::{
     types::{
         AddCredentialRequest, AddProxyRequest, AssignProxyRequest, AssignRoundRobinRequest,
         BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
-        ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest,
-        CreateClientKeyRequest, CreateClientKeyResponse, GlobalProxyResponse,
-        SetAccountThrottleConfigRequest, SetConcurrencyConfigRequest, SetDisabledRequest,
-        SetGlobalProxyRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
-        SetMaxInFlightRequest, SetPriorityRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
-        StartSocialLoginRequest, SuccessResponse, TestCredentialModelRequest,
-        UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
-        UpdateRefreshTokenRequest,
+        ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest, CreateClientKeyRequest,
+        CreateClientKeyResponse, GlobalProxyResponse, SetAccountThrottleConfigRequest,
+        SetConcurrencyConfigRequest, SetDisabledRequest, SetGlobalProxyRequest,
+        SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetMaxInFlightRequest,
+        SetPriorityRequest, SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest,
+        SuccessResponse, TestCredentialModelRequest, UpdateAdminKeyRequest, UpdateClientKeyRequest,
+        UpdateCredentialRequest, UpdateRefreshTokenRequest,
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
 };
@@ -725,8 +724,8 @@ pub async fn social_oauth_callback(
     Path(tail): Path<String>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Html<String> {
-    use crate::kiro::auth::social::OAuthCallbackData;
     use super::service::RemoteCallbackOutcome;
+    use crate::kiro::auth::social::OAuthCallbackData;
 
     // OAuth 错误回调（如用户拒绝授权）
     if params.contains_key("error") {
@@ -760,16 +759,22 @@ pub async fn social_oauth_callback(
         state: oauth_state.clone(),
     };
 
-    match state.service.deliver_remote_social_callback(&oauth_state, data) {
-        RemoteCallbackOutcome::Delivered => {
-            Html(render_callback_page(true, "登录回调已收到，请返回 Kiro Admin 标签页查看结果"))
-        }
-        RemoteCallbackOutcome::AlreadyCompleted => {
-            Html(render_callback_page(true, "该登录回调已处理过，请返回 Kiro Admin 标签页"))
-        }
-        RemoteCallbackOutcome::Expired => {
-            Html(render_callback_page(false, "登录会话已过期，请回到管理面板重新发起登录"))
-        }
+    match state
+        .service
+        .deliver_remote_social_callback(&oauth_state, data)
+    {
+        RemoteCallbackOutcome::Delivered => Html(render_callback_page(
+            true,
+            "登录回调已收到，请返回 Kiro Admin 标签页查看结果",
+        )),
+        RemoteCallbackOutcome::AlreadyCompleted => Html(render_callback_page(
+            true,
+            "该登录回调已处理过，请返回 Kiro Admin 标签页",
+        )),
+        RemoteCallbackOutcome::Expired => Html(render_callback_page(
+            false,
+            "登录会话已过期，请回到管理面板重新发起登录",
+        )),
         RemoteCallbackOutcome::NotFound => Html(render_callback_page(
             false,
             "未找到对应的登录会话（可能未配置回调地址或会话已失效），请回到管理面板重新发起",
@@ -1095,12 +1100,14 @@ pub async fn update_client_key(
     let description = payload
         .description
         .map(|d| if d.is_empty() { None } else { Some(d) });
-    let group = payload
-        .group
-        .map(|g| {
-            let t = g.trim();
-            if t.is_empty() { None } else { Some(t.to_string()) }
-        });
+    let group = payload.group.map(|g| {
+        let t = g.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t.to_string())
+        }
+    });
     if state.client_keys.update_meta(
         id,
         payload.name,
@@ -1343,7 +1350,9 @@ pub async fn stats_timeseries(
     };
     let group = parse_group_filter(&params);
     let cred_ids = group_to_cred_ids(&state, group.as_deref());
-    let points = state.usage_aggregator.query_timeseries(window, key_id, cred_ids.as_ref());
+    let points = state
+        .usage_aggregator
+        .query_timeseries(window, key_id, cred_ids.as_ref());
     Json(points).into_response()
 }
 
@@ -1386,7 +1395,9 @@ pub async fn stats_by_credential(
             .map(|c| c.id)
             .collect()
     });
-    let data = state.usage_aggregator.query_by_credential(window, key_id, cred_ids.as_ref());
+    let data = state
+        .usage_aggregator
+        .query_by_credential(window, key_id, cred_ids.as_ref());
     let enriched: Vec<serde_json::Value> = data
         .into_iter()
         .map(|d| {
@@ -1413,7 +1424,10 @@ pub async fn list_traces(
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
     // 解析分组筛选：把 group 名转为凭据 id 白名单（先于查询执行，避免分页错位）
-    let group = params.get("group").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let group = params
+        .get("group")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let credential_ids: Option<Vec<u64>> = group.as_ref().map(|g| {
         state
             .service
@@ -1580,10 +1594,7 @@ pub async fn trace_recent_stats(State(state): State<AdminState>) -> impl IntoRes
 
 // ============ 账号分组（独立实体）============
 
-fn group_to_item(
-    g: &super::groups::Group,
-    state: &AdminState,
-) -> super::types::GroupItem {
+fn group_to_item(g: &super::groups::Group, state: &AdminState) -> super::types::GroupItem {
     super::types::GroupItem {
         name: g.name.clone(),
         description: g.description.clone(),
@@ -1612,10 +1623,7 @@ pub async fn create_group(
     State(state): State<AdminState>,
     Json(payload): Json<super::types::CreateGroupRequest>,
 ) -> impl IntoResponse {
-    match state
-        .groups
-        .create(payload.name, payload.description)
-    {
+    match state.groups.create(payload.name, payload.description) {
         Ok(g) => Json(group_to_item(&g, &state)).into_response(),
         Err(e) => {
             let msg = e.to_string();
@@ -1708,7 +1716,9 @@ pub async fn update_group(
         if let Err(e) = state.groups.update_description(&current_name, desc_opt) {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(super::types::AdminErrorResponse::invalid_request(e.to_string())),
+                Json(super::types::AdminErrorResponse::invalid_request(
+                    e.to_string(),
+                )),
             )
                 .into_response();
         }
@@ -1766,11 +1776,7 @@ pub async fn delete_group(
     }
 
     if query.force {
-        if let Err(e) = state
-            .service
-            .token_manager()
-            .remove_credential_group(&name)
-        {
+        if let Err(e) = state.service.token_manager().remove_credential_group(&name) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(super::types::AdminErrorResponse::internal_error(format!(
@@ -1844,7 +1850,10 @@ pub async fn stop_stress_test(
 ) -> impl IntoResponse {
     let found = crate::admin::stress_test::stop_session(&session_id);
     if found {
-        (StatusCode::OK, Json(serde_json::json!({ "status": "stopping" })))
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "stopping" })),
+        )
     } else {
         (
             StatusCode::NOT_FOUND,
@@ -1852,4 +1861,3 @@ pub async fn stop_stress_test(
         )
     }
 }
-

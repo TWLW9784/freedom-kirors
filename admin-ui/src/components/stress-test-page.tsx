@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import { toast } from 'sonner'
-import { Play, Square, Download, TrendingUp, AlertCircle } from 'lucide-react'
+import { Play, Square, Download, TrendingUp, AlertCircle, Gauge, Zap } from 'lucide-react'
 import { Card } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Progress } from '@/components/ui/progress'
@@ -8,13 +8,20 @@ import { Badge } from '@/components/ui/badge'
 import { useCredentials } from '@/hooks/use-credentials'
 import { storage } from '@/lib/storage'
 
+type TestMode = 'concurrency' | 'rpm'
+
 interface StressTestConfig {
   credentialIds: number[]
   model: string
+  maxTokens: number
+  mode: TestMode
+  // 并发测试参数
   concurrency: number
   requestsPerCredential: number
-  maxTokens: number
   strategy: 'concurrent' | 'sequential'
+  // RPM 速率测试参数
+  targetRpm: number
+  durationSecs: number
 }
 
 interface CredentialResult {
@@ -33,15 +40,21 @@ interface CredentialResult {
 interface StressTestStatus {
   sessionId: string
   model: string
+  mode: TestMode
   strategy: string
   concurrency: number
+  targetRpm: number
+  durationSecs: number
   running: boolean
   finished: boolean
   totalRequests: number
   completedRequests: number
+  dispatchedRequests: number
+  inflightRequests: number
   progress: number
   elapsedMs: number
   rps: number
+  actualRpm: number
   results: CredentialResult[]
 }
 
@@ -59,16 +72,21 @@ export function StressTestPage() {
   const [config, setConfig] = useState<StressTestConfig>({
     credentialIds: [],
     model: 'claude-opus-4.8',
+    maxTokens: 4,
+    mode: 'concurrency',
     concurrency: 8,
     requestsPerCredential: 50,
-    maxTokens: 4,
     strategy: 'concurrent',
+    targetRpm: 60,
+    durationSecs: 60,
   })
   const [testing, setTesting] = useState(false)
   const [progress, setProgress] = useState(0)
   const [completedReqs, setCompletedReqs] = useState(0)
   const [totalReqs, setTotalReqs] = useState(0)
   const [rps, setRps] = useState(0)
+  const [actualRpm, setActualRpm] = useState(0)
+  const [inflight, setInflight] = useState(0)
   const [results, setResults] = useState<CredentialResult[]>([])
   const sessionIdRef = useRef<string | null>(null)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -96,6 +114,8 @@ export function StressTestPage() {
     setCompletedReqs(status.completedRequests)
     setTotalReqs(status.totalRequests)
     setRps(status.rps)
+    setActualRpm(status.actualRpm)
+    setInflight(status.inflightRequests)
     setResults(status.results)
   }
 
@@ -117,6 +137,10 @@ export function StressTestPage() {
     }
   }
 
+  const estimatedTotal = config.mode === 'rpm'
+    ? Math.max(1, Math.round((config.targetRpm * config.durationSecs) / 60))
+    : selectedIds.length * config.requestsPerCredential
+
   const handleStart = async () => {
     if (selectedIds.length === 0) {
       toast.error('请至少选择一个凭证')
@@ -127,8 +151,10 @@ export function StressTestPage() {
     setProgress(0)
     setResults([])
     setCompletedReqs(0)
-    setTotalReqs(selectedIds.length * config.requestsPerCredential)
+    setTotalReqs(estimatedTotal)
     setRps(0)
+    setActualRpm(0)
+    setInflight(0)
 
     const testConfig = { ...config, credentialIds: selectedIds }
 
@@ -177,10 +203,19 @@ export function StressTestPage() {
     if (results.length === 0) return
     const report = {
       model: config.model,
-      strategy: config.strategy,
-      concurrency: config.concurrency,
-      requestsPerCredential: config.requestsPerCredential,
+      mode: config.mode,
       maxTokens: config.maxTokens,
+      ...(config.mode === 'concurrency'
+        ? {
+            strategy: config.strategy,
+            concurrency: config.concurrency,
+            requestsPerCredential: config.requestsPerCredential,
+          }
+        : {
+            targetRpm: config.targetRpm,
+            durationSecs: config.durationSecs,
+            actualRpm,
+          }),
       totalRequests: totalReqs,
       completedRequests: completedReqs,
       rps,
@@ -192,7 +227,7 @@ export function StressTestPage() {
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = `stress-test-${Date.now()}.json`
+    a.download = `stress-test-${config.mode}-${Date.now()}.json`
     a.click()
     URL.revokeObjectURL(url)
   }
@@ -219,6 +254,45 @@ export function StressTestPage() {
         <h3 className="text-lg font-semibold mb-4">测试配置</h3>
 
         <div className="space-y-4">
+          {/* 测试模式（顶层区分：并发 vs RPM） */}
+          <div>
+            <label className="text-sm font-medium mb-2 block">测试类型</label>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <button
+                type="button"
+                disabled={testing}
+                onClick={() => setConfig({ ...config, mode: 'concurrency' })}
+                className={`flex items-start gap-3 rounded-lg border p-3 text-left transition disabled:opacity-60 ${
+                  config.mode === 'concurrency' ? 'border-primary bg-primary/5 ring-1 ring-primary' : 'hover:bg-accent/50'
+                }`}
+              >
+                <Zap className="w-5 h-5 mt-0.5 text-amber-500 shrink-0" />
+                <span>
+                  <span className="block font-medium">并发测试</span>
+                  <span className="block text-xs text-muted-foreground mt-0.5">
+                    固定请求量按并发数尽快打满，衡量峰值吞吐与延迟分布
+                  </span>
+                </span>
+              </button>
+              <button
+                type="button"
+                disabled={testing}
+                onClick={() => setConfig({ ...config, mode: 'rpm' })}
+                className={`flex items-start gap-3 rounded-lg border p-3 text-left transition disabled:opacity-60 ${
+                  config.mode === 'rpm' ? 'border-primary bg-primary/5 ring-1 ring-primary' : 'hover:bg-accent/50'
+                }`}
+              >
+                <Gauge className="w-5 h-5 mt-0.5 text-blue-500 shrink-0" />
+                <span>
+                  <span className="block font-medium">RPM 速率测试</span>
+                  <span className="block text-xs text-muted-foreground mt-0.5">
+                    按固定每分钟请求数匀速发出，持续指定时长，衡量稳定速率下的表现
+                  </span>
+                </span>
+              </button>
+            </div>
+          </div>
+
           {/* 选择凭证 */}
           <div>
             <label className="text-sm font-medium mb-2 block">选择凭证</label>
@@ -256,8 +330,8 @@ export function StressTestPage() {
             </p>
           </div>
 
-          {/* 测试参数 */}
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+          {/* 公共参数：模型 + max_tokens */}
+          <div className="grid grid-cols-2 gap-4">
             <div>
               <label className="text-sm font-medium mb-2 block">模型</label>
               <select
@@ -271,33 +345,6 @@ export function StressTestPage() {
                 <option value="claude-3-5-sonnet-v2">claude-3-5-sonnet-v2</option>
               </select>
             </div>
-
-            <div>
-              <label className="text-sm font-medium mb-2 block">并发数</label>
-              <input
-                type="number"
-                value={config.concurrency}
-                onChange={(e) => setConfig({ ...config, concurrency: parseInt(e.target.value) || 1 })}
-                min={1}
-                max={256}
-                className="w-full border rounded px-3 py-2 text-sm"
-                disabled={testing}
-              />
-            </div>
-
-            <div>
-              <label className="text-sm font-medium mb-2 block">每凭证请求数</label>
-              <input
-                type="number"
-                value={config.requestsPerCredential}
-                onChange={(e) => setConfig({ ...config, requestsPerCredential: parseInt(e.target.value) || 1 })}
-                min={1}
-                max={1000}
-                className="w-full border rounded px-3 py-2 text-sm"
-                disabled={testing}
-              />
-            </div>
-
             <div>
               <label className="text-sm font-medium mb-2 block">max_tokens</label>
               <select
@@ -313,31 +360,98 @@ export function StressTestPage() {
             </div>
           </div>
 
-          {/* 测试策略 */}
-          <div>
-            <label className="text-sm font-medium mb-2 block">测试策略</label>
-            <div className="flex gap-2">
-              <Button
-                size="sm"
-                variant={config.strategy === 'concurrent' ? 'default' : 'outline'}
-                onClick={() => setConfig({ ...config, strategy: 'concurrent' })}
-                disabled={testing}
-              >
-                并发测试
-              </Button>
-              <Button
-                size="sm"
-                variant={config.strategy === 'sequential' ? 'default' : 'outline'}
-                onClick={() => setConfig({ ...config, strategy: 'sequential' })}
-                disabled={testing}
-              >
-                顺序测试
-              </Button>
-            </div>
-            <p className="text-xs text-muted-foreground mt-1">
-              并发：所有凭证请求混合后按并发数同时发出 | 顺序：逐个凭证测试
-            </p>
-          </div>
+          {/* 并发测试参数 */}
+          {config.mode === 'concurrency' && (
+            <>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="text-sm font-medium mb-2 block">并发数</label>
+                  <input
+                    type="number"
+                    value={config.concurrency}
+                    onChange={(e) => setConfig({ ...config, concurrency: parseInt(e.target.value) || 1 })}
+                    min={1}
+                    max={256}
+                    className="w-full border rounded px-3 py-2 text-sm"
+                    disabled={testing}
+                  />
+                </div>
+                <div>
+                  <label className="text-sm font-medium mb-2 block">每凭证请求数</label>
+                  <input
+                    type="number"
+                    value={config.requestsPerCredential}
+                    onChange={(e) => setConfig({ ...config, requestsPerCredential: parseInt(e.target.value) || 1 })}
+                    min={1}
+                    max={1000}
+                    className="w-full border rounded px-3 py-2 text-sm"
+                    disabled={testing}
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="text-sm font-medium mb-2 block">并发子策略</label>
+                <div className="flex gap-2">
+                  <Button
+                    size="sm"
+                    variant={config.strategy === 'concurrent' ? 'default' : 'outline'}
+                    onClick={() => setConfig({ ...config, strategy: 'concurrent' })}
+                    disabled={testing}
+                  >
+                    混合并发
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant={config.strategy === 'sequential' ? 'default' : 'outline'}
+                    onClick={() => setConfig({ ...config, strategy: 'sequential' })}
+                    disabled={testing}
+                  >
+                    逐凭证
+                  </Button>
+                </div>
+                <p className="text-xs text-muted-foreground mt-1">
+                  混合并发：所有凭证请求混合后按并发数同时发出 | 逐凭证：逐个凭证测试，便于排查单号问题
+                </p>
+              </div>
+            </>
+          )}
+
+          {/* RPM 速率测试参数 */}
+          {config.mode === 'rpm' && (
+            <>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="text-sm font-medium mb-2 block">目标 RPM（每分钟请求数）</label>
+                  <input
+                    type="number"
+                    value={config.targetRpm}
+                    onChange={(e) => setConfig({ ...config, targetRpm: parseInt(e.target.value) || 1 })}
+                    min={1}
+                    max={600000}
+                    className="w-full border rounded px-3 py-2 text-sm"
+                    disabled={testing}
+                  />
+                </div>
+                <div>
+                  <label className="text-sm font-medium mb-2 block">持续时长（秒）</label>
+                  <input
+                    type="number"
+                    value={config.durationSecs}
+                    onChange={(e) => setConfig({ ...config, durationSecs: parseInt(e.target.value) || 1 })}
+                    min={1}
+                    max={3600}
+                    className="w-full border rounded px-3 py-2 text-sm"
+                    disabled={testing}
+                  />
+                </div>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                匀速派发：约每 {(60000 / Math.max(1, config.targetRpm)).toFixed(0)} ms 一个请求，凭证轮询均摊；
+                预计总请求 ≈ <span className="font-medium">{estimatedTotal}</span> 个
+              </p>
+            </>
+          )}
 
           {/* 控制按钮 */}
           <div className="flex gap-2 pt-2">
@@ -364,6 +478,12 @@ export function StressTestPage() {
           <div className="flex flex-wrap gap-x-6 gap-y-1 text-sm text-muted-foreground">
             <span>{progress.toFixed(1)}% 完成 ({completedReqs} / {totalReqs} 请求)</span>
             <span>实时 RPS: {rps.toFixed(1)}</span>
+            {config.mode === 'rpm' && (
+              <>
+                <span>实际 RPM: {actualRpm.toFixed(0)} / 目标 {config.targetRpm}</span>
+                <span>在途: {inflight}</span>
+              </>
+            )}
           </div>
         </Card>
       )}
@@ -386,10 +506,16 @@ export function StressTestPage() {
             <Card className="p-4">
               <div className="flex items-center justify-between">
                 <div>
-                  <p className="text-sm text-muted-foreground">平均延迟 (P50)</p>
-                  <p className="text-2xl font-bold">{avgLatency.toFixed(0)}ms</p>
+                  <p className="text-sm text-muted-foreground">
+                    {config.mode === 'rpm' ? '实际 RPM' : '平均延迟 (P50)'}
+                  </p>
+                  <p className="text-2xl font-bold">
+                    {config.mode === 'rpm' ? actualRpm.toFixed(0) : `${avgLatency.toFixed(0)}ms`}
+                  </p>
                 </div>
-                <AlertCircle className="w-8 h-8 text-blue-500" />
+                {config.mode === 'rpm'
+                  ? <Gauge className="w-8 h-8 text-blue-500" />
+                  : <AlertCircle className="w-8 h-8 text-blue-500" />}
               </div>
             </Card>
 

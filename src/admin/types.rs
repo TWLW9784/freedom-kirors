@@ -126,6 +126,8 @@ pub struct CredentialStatusItem {
     /// 最近一次 429 / 账号风控发生时观测到的并发
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_throttle_in_flight: Option<u64>,
+    /// 最近 60 秒内该凭据发起的请求数（实时 RPM，滑动窗口）
+    pub recent_rpm: u64,
     /// 是否配置了凭据级代理
     pub has_proxy: bool,
     /// 代理 URL（用于前端展示）
@@ -329,6 +331,12 @@ pub struct UpdateCredentialRequest {
     pub proxy_password: Option<String>,
     /// Profile ARN（空字符串表示清除；Enterprise / IdC 可用来快速切换区域/profile）
     pub profile_arn: Option<String>,
+    /// 账号所属分组（None 表示不修改，Some 表示整体替换）
+    #[serde(default)]
+    pub groups: Option<Vec<String>>,
+    /// 账号来源渠道（None 表示不修改，空串表示清除）
+    #[serde(default)]
+    pub source_channel: Option<String>,
     /// 凭据级最大并发上限（None 表示不修改；0 或 None 表示回退到档位默认）
     pub max_in_flight: Option<usize>,
     /// 凭据级最小请求间隔毫秒（None 表示不修改；Some(0) 表示关闭间隔）
@@ -585,6 +593,7 @@ pub struct ConcurrencyConfigResponse {
     pub tier_min_interval_ms_pro: u64,
     pub tier_min_interval_ms_basic: u64,
     pub adaptive_concurrency_enabled: bool,
+    pub rpm_burst_enabled: bool,
 }
 
 /// 更新档位并发配置；任一字段缺省表示不修改
@@ -612,6 +621,9 @@ pub struct SetConcurrencyConfigRequest {
     /// 自适应降并发开关
     #[serde(default)]
     pub adaptive_concurrency_enabled: Option<bool>,
+    /// RPM 突发滑动窗口模式开关（true=允许突发，false=固定间隔匀速）
+    #[serde(default)]
+    pub rpm_burst_enabled: Option<bool>,
 }
 
 /// 日志治理配置响应

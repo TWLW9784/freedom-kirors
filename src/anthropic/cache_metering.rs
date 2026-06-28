@@ -28,8 +28,15 @@ use std::sync::Arc;
 const DEFAULT_CAPACITY: usize = 4096;
 /// 最长 TTL（1h，与 Anthropic ttl="1h" 对齐）
 const MAX_TTL_SECS: i64 = 3600;
-/// 默认 TTL（5min，ephemeral 默认值）
-const DEFAULT_TTL_SECS: i64 = 5 * 60;
+/// 默认 TTL（1h）：客户端未显式指定 cache_control.ttl 时使用。
+///
+/// 不再用 Anthropic ephemeral 的 5min 默认值——本中转层是「会话级」前缀复用，
+/// 真实编码会话里用户读代码 / 思考的停顿经常 > 5min；若用 5min 过期，下一轮本
+/// 该命中（cache_read）的历史前缀会被提前淘汰、退化成 cache_creation，凭空拉低
+/// 命中率。实测「可缓存请求」复用率已达 ~91%，剩余流失主因正是跨轮 TTL 过期。
+/// 提到 1h（= 上限）后，绝大多数同一会话的连续轮次都落在存活窗口内。
+/// 客户端若显式传 ttl="5m" 仍尊重（parse_ttl 原样解析），此处只改「未指定」默认。
+const DEFAULT_TTL_SECS: i64 = 60 * 60;
 
 /// 最小可缓存 prompt token 阈值（与 Anthropic 官方对齐）：
 /// 累计 token 低于该阈值的前缀，Anthropic 不会写入缓存，因此我们也不应
@@ -746,8 +753,8 @@ mod tests {
     fn parse_ttl_handles_known_values() {
         assert_eq!(parse_ttl(Some("1h")), 3600);
         assert_eq!(parse_ttl(Some("5m")), 300);
-        assert_eq!(parse_ttl(None), 300);
-        assert_eq!(parse_ttl(Some("garbage")), 300);
+        assert_eq!(parse_ttl(None), 3600);
+        assert_eq!(parse_ttl(Some("garbage")), 3600);
     }
 
     #[test]

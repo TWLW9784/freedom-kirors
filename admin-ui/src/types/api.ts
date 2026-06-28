@@ -34,6 +34,8 @@ export interface CredentialStatusItem {
   peakInFlight: number
   /** 最近一次 429 / 风控触发时观测到的并发 */
   lastThrottleInFlight?: number | null
+  /** 最近 60 秒内该凭据发起的请求数（实时 RPM，滑动窗口） */
+  recentRpm?: number
   hasProxy: boolean
   proxyUrl?: string
   refreshFailureCount: number
@@ -51,6 +53,8 @@ export interface CredentialStatusItem {
   minIntervalMs?: number | null
   /** 实际生效的最大并发（凭据覆盖 ?? 档位默认） */
   effectiveMaxInFlight?: number
+  /** 实际生效的最小请求间隔毫秒（凭据覆盖 ?? 档位默认） */
+  effectiveMinIntervalMs?: number
   /** 后端缓存的最近一次余额（5 分钟内） */
   balance?: BalanceResponse
   /** 余额缓存的更新时间（Unix 秒） */
@@ -178,6 +182,8 @@ export interface UpdateCredentialRequest {
   proxyUsername?: string
   proxyPassword?: string
   profileArn?: string
+  groups?: string[]
+  sourceChannel?: string
 }
 
 // 更新 refreshToken 请求

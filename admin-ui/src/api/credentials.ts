@@ -512,6 +512,7 @@ export interface ConcurrencyConfig {
   tierMinIntervalMsPro: number
   tierMinIntervalMsBasic: number
   adaptiveConcurrencyEnabled: boolean
+  rpmBurstEnabled: boolean
 }
 
 // 获取档位并发配置

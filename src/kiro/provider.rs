@@ -243,6 +243,7 @@ impl KiroProvider {
             &key,
             configured,
             min_interval,
+            self.token_manager.rpm_burst_enabled(),
         )
         .await;
 

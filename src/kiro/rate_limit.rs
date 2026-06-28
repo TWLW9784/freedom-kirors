@@ -77,6 +77,8 @@ struct Inner {
     probe_cap: usize,
     /// 最近一次发起请求的时间，用于最小间隔限速。
     last_start: Option<Instant>,
+    /// 最近 60 秒内的请求发起时间点，用于「突发滑动窗口」RPM 限速（仅 rpm_burst 模式使用）。
+    recent_starts: std::collections::VecDeque<Instant>,
     /// 近期最优 RTT（秒）。
     rtt_min: Option<f64>,
     /// 当前 RTT EWMA（秒）。
@@ -141,6 +143,7 @@ impl AdaptiveLimiter {
                 limit: c as f64,
                 probe_cap: Inner::recompute_probe_cap(c),
                 last_start: None,
+                recent_starts: std::collections::VecDeque::new(),
                 rtt_min: None,
                 rtt_current: None,
                 success_count: 0,
@@ -187,8 +190,12 @@ impl AdaptiveLimiter {
     }
 
     /// 获取一个并发名额；超过当前 target 时异步等待。
-    /// 获得名额后按 `min_interval` 做最小间隔限速，再返回 RAII permit。
-    async fn acquire(self: &Arc<Self>, min_interval: Duration) -> LimiterPermit {
+    /// 获得名额后按限速策略节流，再返回 RAII permit。
+    ///
+    /// `min_interval`：同一 key 两次发起的最小间隔。
+    /// `rpm_burst`：false=固定间隔（匀速削峰）；true=60s 滑动窗口令牌桶（允许突发）。
+    /// 两种模式的速率上限都是 `60000/min_interval_ms`，只是整形不同。
+    async fn acquire(self: &Arc<Self>, min_interval: Duration, rpm_burst: bool) -> LimiterPermit {
         let notified = self.notify.notified();
         tokio::pin!(notified);
         loop {
@@ -209,31 +216,68 @@ impl AdaptiveLimiter {
             limiter: Arc::clone(self),
         };
 
-        // 最小间隔限速：同一 key 两次发起至少间隔 min_interval。
-        if !min_interval.is_zero() {
-            let wait = {
-                let mut g = self.inner.lock();
-                let now = Instant::now();
-                match g.last_start {
-                    Some(prev) => {
-                        let elapsed = now.saturating_duration_since(prev);
-                        if elapsed < min_interval {
-                            min_interval - elapsed
+        if min_interval.is_zero() {
+            return permit;
+        }
+
+        if rpm_burst {
+            // 突发滑动窗口：60s 窗口内最多 `60000/min_interval_ms` 个。
+            // 窗口未满立即放行（允许突发）；满则等到最早的请求滞出窗口。
+            const WINDOW: Duration = Duration::from_secs(60);
+            let cap = (WINDOW.as_millis() as u64 / min_interval.as_millis().max(1) as u64).max(1)
+                as usize;
+            loop {
+                let wait = {
+                    let mut g = self.inner.lock();
+                    let now = Instant::now();
+                    while let Some(&front) = g.recent_starts.front() {
+                        if now.saturating_duration_since(front) >= WINDOW {
+                            g.recent_starts.pop_front();
                         } else {
-                            g.last_start = Some(now);
-                            Duration::ZERO
+                            break;
                         }
                     }
-                    None => {
+                    if g.recent_starts.len() < cap {
+                        g.recent_starts.push_back(now);
+                        Duration::ZERO
+                    } else {
+                        // 窗口满：等最早的请求滞出窗口。
+                        let front = *g.recent_starts.front().unwrap();
+                        WINDOW.saturating_sub(now.saturating_duration_since(front))
+                            + Duration::from_millis(1)
+                    }
+                };
+                if wait.is_zero() {
+                    break;
+                }
+                tokio::time::sleep(wait).await;
+            }
+            return permit;
+        }
+
+        // 最小间隔限速：同一 key 两次发起至少间隔 min_interval。
+        let wait = {
+            let mut g = self.inner.lock();
+            let now = Instant::now();
+            match g.last_start {
+                Some(prev) => {
+                    let elapsed = now.saturating_duration_since(prev);
+                    if elapsed < min_interval {
+                        min_interval - elapsed
+                    } else {
                         g.last_start = Some(now);
                         Duration::ZERO
                     }
                 }
-            };
-            if !wait.is_zero() {
-                tokio::time::sleep(wait).await;
-                self.inner.lock().last_start = Some(Instant::now());
+                None => {
+                    g.last_start = Some(now);
+                    Duration::ZERO
+                }
             }
+        };
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+            self.inner.lock().last_start = Some(Instant::now());
         }
 
         permit
@@ -414,9 +458,10 @@ pub async fn acquire_permit(
     key: &str,
     configured: usize,
     min_interval: Duration,
+    rpm_burst: bool,
 ) -> LimiterPermit {
     let limiter = limiters.get_or_update(key, configured);
-    limiter.acquire(min_interval).await
+    limiter.acquire(min_interval, rpm_burst).await
 }
 
 #[cfg(test)]
@@ -506,10 +551,10 @@ mod tests {
     #[tokio::test]
     async fn acquire_blocks_beyond_target_and_releases() {
         let l = Arc::new(AdaptiveLimiter::new(1));
-        let p1 = l.acquire(Duration::ZERO).await;
+        let p1 = l.acquire(Duration::ZERO, false).await;
         assert_eq!(l.inner.lock().in_flight, 1);
         let l2 = Arc::clone(&l);
-        let handle = tokio::spawn(async move { l2.acquire(Duration::ZERO).await });
+        let handle = tokio::spawn(async move { l2.acquire(Duration::ZERO, false).await });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!handle.is_finished());
         drop(p1);

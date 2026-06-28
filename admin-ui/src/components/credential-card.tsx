@@ -14,7 +14,9 @@ import {
   Clock,
   ScrollText,
   Boxes,
+  Gauge,
   Wallet,
+  FlaskConical,
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -28,6 +30,7 @@ import {
   DropdownMenuTrigger,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import { SubscriptionBadge } from "@/components/subscription-badge";
@@ -50,7 +53,7 @@ import {
   useResetSuccessCount,
   useClearThrottle,
 } from "@/hooks/use-credentials";
-import { setCredentialOverage } from "@/api/credentials";
+import { setCredentialOverage, testCredentialModel, getCredentialModels } from "@/api/credentials";
 import { useQueryClient } from "@tanstack/react-query";
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
@@ -207,6 +210,10 @@ export function CredentialCard({
   const [showReloginDialog, setShowReloginDialog] = useState(false);
   const [showFailuresDialog, setShowFailuresDialog] = useState(false);
   const [showModelsDialog, setShowModelsDialog] = useState(false);
+  const [testingModel, setTestingModel] = useState(false);
+  const [moreMenuOpen, setMoreMenuOpen] = useState(false);
+  const [modelOptions, setModelOptions] = useState<string[]>([]);
+  const [loadingModels, setLoadingModels] = useState(false);
 
   const setDisabled = useSetDisabled();
   const setPriority = useSetPriority();
@@ -320,6 +327,41 @@ export function CredentialCard({
       onSuccess: (res) => toast.success(res.message),
       onError: (err) => toast.error("刷新失败: " + extractErrorMessage(err)),
     });
+
+  const handleTestModel = async (model?: string) => {
+    setTestingModel(true);
+    try {
+      const res = await testCredentialModel(credential.id, model);
+      if (res.ok) {
+        toast.success(
+          `#${credential.id} 模型测试成功：${res.model} · ${res.endpoint} · ${res.status ?? "OK"} · ${res.elapsedMs}ms`,
+        );
+      } else {
+        toast.error(
+          `#${credential.id} 模型测试失败：${res.status ?? "网络"} · ${res.error || "未知错误"}`,
+        );
+      }
+    } catch (err) {
+      toast.error("模型测试失败: " + extractErrorMessage(err));
+    } finally {
+      setTestingModel(false);
+    }
+  };
+
+  const handleOpenMoreMenu = async (open: boolean) => {
+    setMoreMenuOpen(open);
+    if (open && modelOptions.length === 0 && !loadingModels && !credential.disabled) {
+      setLoadingModels(true);
+      try {
+        const res = await getCredentialModels(credential.id);
+        setModelOptions(res.models.map((m) => m.modelId).filter(Boolean));
+      } catch (err) {
+        toast.error("获取可用模型失败: " + extractErrorMessage(err));
+      } finally {
+        setLoadingModels(false);
+      }
+    }
+  };
 
   const handleResetSuccess = () =>
     resetSuccess.mutate(credential.id, {
@@ -444,7 +486,7 @@ export function CredentialCard({
     // modal={false}：菜单非模态，避免 Radix 在 <html> 上施加 overflow:hidden 滚动锁。
     // 该锁在移动端（尤其 iOS Safari）会与背景层 backdrop-blur / 固定定位叠加，
     // 导致整页渲染错乱或横向位移——这正是移动端点击"更多操作"后页面异常的根因。
-    <DropdownMenu modal={false}>
+    <DropdownMenu modal={false} open={moreMenuOpen} onOpenChange={handleOpenMoreMenu}>
       <DropdownMenuTrigger asChild>
         <Button size="icon" variant="ghost" title="更多操作">
           <MoreHorizontal className="h-4 w-4" />
@@ -465,6 +507,42 @@ export function CredentialCard({
           <RotateCcw />
           重置失败计数
         </DropdownMenuItem>
+        <DropdownMenuLabel>模型测试</DropdownMenuLabel>
+        <DropdownMenuItem
+          onSelect={(e) => {
+            e.preventDefault();
+            setMoreMenuOpen(false);
+            handleTestModel();
+          }}
+          disabled={credential.disabled || testingModel}
+          title={credential.disabled ? "已禁用凭据无法测试" : "用默认 claude-opus-4.8 真实调用一次"}
+        >
+          {testingModel ? <Loader2 className="animate-spin" /> : <FlaskConical />}
+          默认（claude-opus-4.8）
+        </DropdownMenuItem>
+        {loadingModels ? (
+          <DropdownMenuItem disabled>
+            <Loader2 className="animate-spin" />
+            正在拉取可用模型…
+          </DropdownMenuItem>
+        ) : modelOptions.length === 0 ? (
+          <DropdownMenuItem disabled>无可用模型（或拉取失败）</DropdownMenuItem>
+        ) : (
+          modelOptions.map((model) => (
+            <DropdownMenuItem
+              key={model}
+              onSelect={(e) => {
+                e.preventDefault();
+                setMoreMenuOpen(false);
+                handleTestModel(model);
+              }}
+              disabled={testingModel}
+            >
+              {model}
+            </DropdownMenuItem>
+          ))
+        )}
+        <DropdownMenuSeparator />
         <DropdownMenuItem
           onSelect={() => setShowModelsDialog(true)}
           disabled={credential.disabled}
@@ -700,6 +778,31 @@ export function CredentialCard({
             {credential.successCount}
             <RotateCcw className="h-3 w-3 opacity-70" />
           </button>
+        </div>
+      </div>
+
+      {/* 并发 / RPM（中大屏） */}
+      <div className="hidden w-28 shrink-0 text-center lg:block">
+        <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+          并发 / RPM
+        </div>
+        <div
+          className="mt-0.5 text-sm font-medium tabular-nums"
+          title="实时并发(峰值/上限) · 最近 60s 请求数(RPM 上限)"
+        >
+          <span className={credential.inFlight > 0 ? "text-emerald-600 dark:text-emerald-400" : ""}>
+            {credential.inFlight}
+          </span>
+          <span className="text-muted-foreground/60">/{credential.effectiveMaxInFlight ?? "-"}</span>
+          <span className="mx-1 text-muted-foreground/40">·</span>
+          <span className={(credential.recentRpm ?? 0) > 0 ? "text-blue-600 dark:text-blue-400" : ""}>
+            {credential.recentRpm ?? 0}
+          </span>
+          <span className="text-muted-foreground/60">
+            /{credential.effectiveMinIntervalMs && credential.effectiveMinIntervalMs > 0
+              ? Math.floor(60000 / credential.effectiveMinIntervalMs)
+              : "∞"}
+          </span>
         </div>
       </div>
 
@@ -954,6 +1057,39 @@ export function CredentialCard({
                   {credential.successCount}
                   <RotateCcw className="h-3 w-3 opacity-70" />
                 </button>
+              </dd>
+            </div>
+            {/* 并发 / RPM 实时指标 */}
+            <div className="flex min-w-0 flex-wrap items-center justify-between gap-2 border-t border-border/50 pt-2 min-[420px]:col-span-2">
+              <dt className="flex shrink-0 items-center gap-1 text-muted-foreground">
+                <Boxes className="h-3.5 w-3.5" />
+                并发
+              </dt>
+              <dd className="min-w-0 tabular-nums font-medium" title="实时并发 / 峰值并发 / 生效上限">
+                <span className={credential.inFlight > 0 ? "text-emerald-600 dark:text-emerald-400" : ""}>
+                  {credential.inFlight}
+                </span>
+                <span className="text-muted-foreground/50"> / </span>
+                <span className="text-muted-foreground">{credential.peakInFlight}峰</span>
+                <span className="text-muted-foreground/50"> / </span>
+                <span className="text-muted-foreground">{credential.effectiveMaxInFlight ?? "-"}上限</span>
+              </dd>
+            </div>
+            <div className="flex min-w-0 flex-wrap items-center justify-between gap-2 min-[420px]:col-span-2">
+              <dt className="flex shrink-0 items-center gap-1 text-muted-foreground">
+                <Gauge className="h-3.5 w-3.5" />
+                RPM
+              </dt>
+              <dd className="min-w-0 tabular-nums font-medium" title="最近 60 秒实测请求数 / 最小间隔推导的 RPM 上限">
+                <span className={(credential.recentRpm ?? 0) > 0 ? "text-blue-600 dark:text-blue-400" : ""}>
+                  {credential.recentRpm ?? 0}
+                </span>
+                <span className="text-muted-foreground/50"> / </span>
+                <span className="text-muted-foreground">
+                  {credential.effectiveMinIntervalMs && credential.effectiveMinIntervalMs > 0
+                    ? `${Math.floor(60000 / credential.effectiveMinIntervalMs)}上限`
+                    : "不限"}
+                </span>
               </dd>
             </div>
             <div className="flex min-w-0 items-center justify-between gap-2 border-t border-border/50 pt-2 min-[420px]:col-span-2">

@@ -204,6 +204,14 @@ pub struct Config {
     #[serde(default = "default_adaptive_concurrency_enabled")]
     pub adaptive_concurrency_enabled: bool,
 
+    /// RPM 限速模式是否使用「突发滑动窗口」而非「固定最小间隔」。
+    ///
+    /// - `false`（默认）：固定最小间隔，两次请求至少隔 `min_interval_ms`，严格匀速、天然削峰。
+    /// - `true`（Kiro-Go 风格）：60 秒滑动窗口令牌桶，窗口内未满 `60000/min_interval_ms` 个即放行，
+    ///   允许瞬时突发。更灵活但可能打出速率尖峰，更易触发上游 429。
+    #[serde(default = "default_rpm_burst_enabled")]
+    pub rpm_burst_enabled: bool,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -339,6 +347,10 @@ fn default_adaptive_concurrency_enabled() -> bool {
     true
 }
 
+fn default_rpm_burst_enabled() -> bool {
+    false
+}
+
 fn default_update_auto_apply_time() -> String {
     "03:00".to_string()
 }
@@ -402,6 +414,7 @@ impl Default for Config {
             tier_min_interval_ms_pro: default_tier_min_interval_pro(),
             tier_min_interval_ms_basic: default_tier_min_interval_basic(),
             adaptive_concurrency_enabled: default_adaptive_concurrency_enabled(),
+            rpm_burst_enabled: default_rpm_burst_enabled(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             trace_enabled: default_trace_enabled(),

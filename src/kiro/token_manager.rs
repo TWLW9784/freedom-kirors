@@ -814,6 +814,8 @@ struct CredentialEntry {
     peak_in_flight: u64,
     /// 最近一次 429 / 账号风控发生时观测到的并发（不持久化）
     last_throttle_in_flight: Option<u64>,
+    /// 最近发起请求的时间戳滑动窗口（仅保留最近 60 秒，用于计算实时 RPM，不持久化）
+    recent_request_ticks: std::collections::VecDeque<Instant>,
 }
 
 /// 禁用原因
@@ -891,6 +893,8 @@ pub struct CredentialEntrySnapshot {
     pub peak_in_flight: u64,
     /// 最近一次 429 / 账号风控发生时观测到的并发
     pub last_throttle_in_flight: Option<u64>,
+    /// 最近 60 秒内该凭据发起的请求数（实时 RPM，滑动窗口）
+    pub recent_rpm: u64,
     /// 是否配置了凭据级代理
     pub has_proxy: bool,
     /// 代理 URL（用于前端展示）
@@ -950,6 +954,7 @@ pub struct ConcurrencyConfigSnapshot {
     pub tier_min_interval_ms_pro: u64,
     pub tier_min_interval_ms_basic: u64,
     pub adaptive_concurrency_enabled: bool,
+    pub rpm_burst_enabled: bool,
 }
 
 /// 多凭据 Token 管理器
@@ -992,6 +997,8 @@ pub struct MultiTokenManager {
     tier_min_interval_ms_basic: AtomicU64,
     /// 自适应降并发开关（运行时可改）
     adaptive_concurrency_enabled: AtomicBool,
+    /// RPM 突发滑动窗口模式开关（运行时可改）
+    rpm_burst_enabled: AtomicBool,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -1120,6 +1127,7 @@ impl MultiTokenManager {
                     in_flight: 0,
                     peak_in_flight: 0,
                     last_throttle_in_flight: None,
+                    recent_request_ticks: std::collections::VecDeque::new(),
                 }
             })
             .collect();
@@ -1174,6 +1182,7 @@ impl MultiTokenManager {
         let tier_int_pro = config.tier_min_interval_ms_pro;
         let tier_int_basic = config.tier_min_interval_ms_basic;
         let adaptive_enabled = config.adaptive_concurrency_enabled;
+        let rpm_burst = config.rpm_burst_enabled;
         let manager = Self {
             config,
             proxy: Mutex::new(proxy),
@@ -1194,6 +1203,7 @@ impl MultiTokenManager {
             tier_min_interval_ms_pro: AtomicU64::new(tier_int_pro),
             tier_min_interval_ms_basic: AtomicU64::new(tier_int_basic),
             adaptive_concurrency_enabled: AtomicBool::new(adaptive_enabled),
+            rpm_burst_enabled: AtomicBool::new(rpm_burst),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
         };
@@ -1867,6 +1877,17 @@ impl MultiTokenManager {
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                 entry.in_flight = entry.in_flight.saturating_add(1);
                 entry.peak_in_flight = entry.peak_in_flight.max(entry.in_flight);
+                // 记录本次发起时间并修剪 60 秒以前的旧点，用于实时 RPM 计算
+                let now = Instant::now();
+                entry.recent_request_ticks.push_back(now);
+                let cutoff = now - StdDuration::from_secs(60);
+                while entry
+                    .recent_request_ticks
+                    .front()
+                    .is_some_and(|t| *t < cutoff)
+                {
+                    entry.recent_request_ticks.pop_front();
+                }
             }
         }
         InFlightGuard {
@@ -2257,6 +2278,13 @@ impl MultiTokenManager {
                     in_flight: e.in_flight,
                     peak_in_flight: e.peak_in_flight,
                     last_throttle_in_flight: e.last_throttle_in_flight,
+                    recent_rpm: {
+                        let cutoff = now - StdDuration::from_secs(60);
+                        e.recent_request_ticks
+                            .iter()
+                            .filter(|t| **t >= cutoff)
+                            .count() as u64
+                    },
                     has_proxy: e.credentials.proxy_url.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
                     refresh_failure_count: e.refresh_failure_count,
@@ -2281,32 +2309,13 @@ impl MultiTokenManager {
                     source_channel: e.credentials.source_channel.clone(),
                     max_in_flight: e.credentials.max_in_flight,
                     min_interval_ms: e.credentials.min_interval_ms,
-                    effective_max_in_flight: {
-                        use crate::kiro::model::credentials::AccountTier;
-                        if let Some(v) = e.credentials.max_in_flight {
-                            v.max(1)
-                        } else {
-                            let cfg = self.config();
-                            match e.credentials.account_tier() {
-                                AccountTier::Enterprise => cfg.tier_max_in_flight_enterprise.max(1),
-                                AccountTier::Pro => cfg.tier_max_in_flight_pro.max(1),
-                                AccountTier::Basic => cfg.tier_max_in_flight_basic.max(1),
-                            }
-                        }
-                    },
-                    effective_min_interval_ms: {
-                        use crate::kiro::model::credentials::AccountTier;
-                        if let Some(v) = e.credentials.min_interval_ms {
-                            v
-                        } else {
-                            let cfg = self.config();
-                            match e.credentials.account_tier() {
-                                AccountTier::Enterprise => cfg.tier_min_interval_ms_enterprise,
-                                AccountTier::Pro => cfg.tier_min_interval_ms_pro,
-                                AccountTier::Basic => cfg.tier_min_interval_ms_basic,
-                            }
-                        }
-                    },
+                    effective_max_in_flight: self
+                        .effective_max_in_flight(&e.credentials)
+                        .max(1),
+                    effective_min_interval_ms: e
+                        .credentials
+                        .min_interval_ms
+                        .unwrap_or_else(|| self.effective_min_interval_ms(&e.credentials)),
                 })
                 .collect(),
             current_id,
@@ -2636,6 +2645,7 @@ impl MultiTokenManager {
                     in_flight: 0,
                     peak_in_flight: 0,
                     last_throttle_in_flight: None,
+                    recent_request_ticks: std::collections::VecDeque::new(),
                 });
             }
             existing_arns.insert(arn.to_string());
@@ -2670,10 +2680,7 @@ impl MultiTokenManager {
     ///
     /// 用于 IdC / Social 登录成功后立即回填真实 profileArn，消除
     /// 「刚添加凭据、profileArn 尚未回填」窗口期内模型测试撞 403 的问题。
-    pub async fn resolve_profile_arn_after_login(
-        &self,
-        id: u64,
-    ) -> anyhow::Result<Option<String>> {
+    pub async fn resolve_profile_arn_after_login(&self, id: u64) -> anyhow::Result<Option<String>> {
         let (token, _credentials) = self.prepare_request_token(id).await?;
         self.resolve_profile_arn_for(id, &token).await
     }
@@ -3246,6 +3253,7 @@ impl MultiTokenManager {
                 in_flight: 0,
                 peak_in_flight: 0,
                 last_throttle_in_flight: None,
+                recent_request_ticks: std::collections::VecDeque::new(),
             });
         }
 
@@ -3297,6 +3305,8 @@ impl MultiTokenManager {
         proxy_username: Option<Option<String>>,
         proxy_password: Option<Option<String>>,
         profile_arn: Option<Option<String>>,
+        groups: Option<Vec<String>>,
+        source_channel: Option<Option<String>>,
         max_in_flight: Option<Option<usize>>,
         min_interval_ms: Option<Option<u64>>,
     ) -> anyhow::Result<()> {
@@ -3321,6 +3331,12 @@ impl MultiTokenManager {
             }
             if let Some(v) = profile_arn {
                 entry.credentials.profile_arn = v.filter(|s| !s.is_empty());
+            }
+            if let Some(v) = groups {
+                entry.credentials.groups = v;
+            }
+            if let Some(v) = source_channel {
+                entry.credentials.source_channel = v.filter(|s| !s.is_empty());
             }
             if let Some(v) = max_in_flight {
                 // Some(None) = 清除（回退到档位默认）；Some(Some(0)) 视为清除
@@ -3751,6 +3767,7 @@ impl MultiTokenManager {
             tier_min_interval_ms_pro: self.tier_min_interval_ms_pro.load(Ordering::Relaxed),
             tier_min_interval_ms_basic: self.tier_min_interval_ms_basic.load(Ordering::Relaxed),
             adaptive_concurrency_enabled: self.adaptive_concurrency_enabled.load(Ordering::Relaxed),
+            rpm_burst_enabled: self.rpm_burst_enabled.load(Ordering::Relaxed),
         }
     }
 
@@ -3778,6 +3795,11 @@ impl MultiTokenManager {
     /// 自适应降并发是否启用（运行时值）。
     pub fn adaptive_concurrency_enabled(&self) -> bool {
         self.adaptive_concurrency_enabled.load(Ordering::Relaxed)
+    }
+
+    /// RPM 突发滑动窗口模式是否启用（运行时值）。
+    pub fn rpm_burst_enabled(&self) -> bool {
+        self.rpm_burst_enabled.load(Ordering::Relaxed)
     }
 
     /// 凭据的有效并发：显式 maxInFlight 优先，否则按档位默认（运行时值）。
@@ -3810,6 +3832,7 @@ impl MultiTokenManager {
         pro_int: Option<u64>,
         basic_int: Option<u64>,
         adaptive: Option<bool>,
+        rpm_burst: Option<bool>,
     ) -> anyhow::Result<ConcurrencyConfigSnapshot> {
         for v in [ent_mif, pro_mif, basic_mif].into_iter().flatten() {
             if !(1..=256).contains(&v) {
@@ -3832,6 +3855,7 @@ impl MultiTokenManager {
             tier_min_interval_ms_pro: pro_int.unwrap_or(prev.tier_min_interval_ms_pro),
             tier_min_interval_ms_basic: basic_int.unwrap_or(prev.tier_min_interval_ms_basic),
             adaptive_concurrency_enabled: adaptive.unwrap_or(prev.adaptive_concurrency_enabled),
+            rpm_burst_enabled: rpm_burst.unwrap_or(prev.rpm_burst_enabled),
         };
 
         self.store_concurrency_config(&next);
@@ -3851,6 +3875,7 @@ impl MultiTokenManager {
             next.tier_min_interval_ms_basic,
             next.adaptive_concurrency_enabled,
         );
+        tracing::info!("  rpm_burst_enabled={}", next.rpm_burst_enabled);
         Ok(next)
     }
 
@@ -3869,6 +3894,8 @@ impl MultiTokenManager {
             .store(c.tier_min_interval_ms_basic, Ordering::Relaxed);
         self.adaptive_concurrency_enabled
             .store(c.adaptive_concurrency_enabled, Ordering::Relaxed);
+        self.rpm_burst_enabled
+            .store(c.rpm_burst_enabled, Ordering::Relaxed);
     }
 
     fn persist_concurrency_config(&self, c: &ConcurrencyConfigSnapshot) -> anyhow::Result<()> {
@@ -3891,6 +3918,7 @@ impl MultiTokenManager {
         config.tier_min_interval_ms_pro = c.tier_min_interval_ms_pro;
         config.tier_min_interval_ms_basic = c.tier_min_interval_ms_basic;
         config.adaptive_concurrency_enabled = c.adaptive_concurrency_enabled;
+        config.rpm_burst_enabled = c.rpm_burst_enabled;
         config
             .save()
             .with_context(|| format!("持久化档位并发配置失败: {}", config_path.display()))?;
@@ -4783,7 +4811,8 @@ mod tests {
     async fn test_concurrent_add_same_api_key_inserts_once() {
         let path = tmp_creds_path("concurrent_dedup");
         let manager = Arc::new(
-            MultiTokenManager::new(Config::default(), vec![], None, Some(path.clone()), true).unwrap(),
+            MultiTokenManager::new(Config::default(), vec![], None, Some(path.clone()), true)
+                .unwrap(),
         );
 
         const N: usize = 8;
@@ -4804,7 +4833,10 @@ mod tests {
                 ok_count += 1;
             }
         }
-        assert_eq!(ok_count, 1, "并发添加同一凭据应只成功一次，实际成功 {ok_count} 次");
+        assert_eq!(
+            ok_count, 1,
+            "并发添加同一凭据应只成功一次，实际成功 {ok_count} 次"
+        );
 
         let snapshot = manager.snapshot();
         assert_eq!(
@@ -5001,9 +5033,14 @@ mod tests {
         pro_cred.subscription_title = Some("KIRO PRO".to_string());
         pro_cred.priority = 10;
 
-        let manager =
-            MultiTokenManager::new(Config::default(), vec![free_cred, pro_cred], None, None, false)
-                .unwrap();
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![free_cred, pro_cred],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
 
         // Warm current_id with the highest-priority Free account.
         let current = manager.acquire_context(None, None).await.unwrap();

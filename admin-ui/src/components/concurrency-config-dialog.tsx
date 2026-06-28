@@ -74,12 +74,14 @@ export function ConcurrencyConfigDialog({
 
   const [draft, setDraft] = useState<DraftMap>({})
   const [adaptive, setAdaptive] = useState(true)
+  const [rpmBurst, setRpmBurst] = useState(false)
 
   // 打开对话框 / 数据到达时，用服务端值初始化草稿
   useEffect(() => {
     if (open && config) {
       setDraft(configToDraft(config))
       setAdaptive(config.adaptiveConcurrencyEnabled)
+      setRpmBurst(config.rpmBurstEnabled)
     }
   }, [open, config])
 
@@ -88,7 +90,10 @@ export function ConcurrencyConfigDialog({
 
   const handleSave = () => {
     // 校验：并发 1..=256，间隔 0..=60000
-    const patch: Partial<ConcurrencyConfig> = { adaptiveConcurrencyEnabled: adaptive }
+    const patch: Partial<ConcurrencyConfig> = {
+      adaptiveConcurrencyEnabled: adaptive,
+      rpmBurstEnabled: rpmBurst,
+    }
     for (const row of TIER_ROWS) {
       const mif = parseInt(draft[row.mifField] ?? '', 10)
       const int = parseInt(draft[row.intField] ?? '', 10)
@@ -174,6 +179,17 @@ export function ConcurrencyConfigDialog({
                 </div>
               </div>
               <Switch checked={adaptive} disabled={saving} onCheckedChange={setAdaptive} />
+            </div>
+
+            <div className="flex items-center justify-between gap-2 rounded-md bg-secondary/40 px-3 py-2">
+              <div className="text-xs">
+                <div className="font-medium text-foreground">RPM 突发模式</div>
+                <div className="leading-snug text-muted-foreground">
+                  关：固定最小间隔，严格匀速、天然削峰（推荐，对上游更友好）。
+                  开：60s 滑动窗口令牌桶，同 RPM 上限下允许瞬时突发，更易踩上游 429。
+                </div>
+              </div>
+              <Switch checked={rpmBurst} disabled={saving} onCheckedChange={setRpmBurst} />
             </div>
           </div>
         )}
