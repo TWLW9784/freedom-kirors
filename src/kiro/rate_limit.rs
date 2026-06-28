@@ -256,17 +256,24 @@ impl AdaptiveLimiter {
         }
 
         // 最小间隔限速：同一 key 两次发起至少间隔 min_interval。
+        // 关键：在锁内「预占」下一个发车点（把 last_start 推进到投影时刻），
+        // 让并发到达的后续请求读到已推进的值，从而真正错峰排成 T、T+interval、
+        // T+2*interval…… 若不预占（旧逻辑 sleep 后才更新 last_start），并发请求会
+        // 读到同一个旧 last_start、算出相同 wait、sleep 完一起发车，打出尖峰脉冲。
         let wait = {
             let mut g = self.inner.lock();
             let now = Instant::now();
             match g.last_start {
                 Some(prev) => {
-                    let elapsed = now.saturating_duration_since(prev);
-                    if elapsed < min_interval {
-                        min_interval - elapsed
-                    } else {
+                    let next = prev + min_interval;
+                    if now >= next {
+                        // 距上次发车已超过间隔：立即发车，发车点取 now。
                         g.last_start = Some(now);
                         Duration::ZERO
+                    } else {
+                        // 间隔未到：预占下一个发车点，本请求等到 next。
+                        g.last_start = Some(next);
+                        next - now
                     }
                 }
                 None => {
@@ -277,7 +284,6 @@ impl AdaptiveLimiter {
         };
         if !wait.is_zero() {
             tokio::time::sleep(wait).await;
-            self.inner.lock().last_start = Some(Instant::now());
         }
 
         permit
@@ -560,5 +566,37 @@ mod tests {
         drop(p1);
         let _p2 = handle.await.unwrap();
         assert_eq!(l.inner.lock().in_flight, 1);
+    }
+
+    #[tokio::test]
+    async fn fixed_interval_reserves_slot_no_burst() {
+        // 验证预占：并发请求被错峰成 T、T+interval、T+2*interval，
+        // 而不是同时醒来一起发车（尖峰脉冲）。
+        let interval = Duration::from_millis(120);
+        let l = Arc::new(AdaptiveLimiter::new(8));
+        // 首个请求：立即放行，预占 T0。
+        let _p0 = l.acquire(interval, false).await;
+        let t_start = std::time::Instant::now();
+
+        // 同时发起 3 个并发请求，应分别等到 ~+120ms、~+240ms、~+360ms。
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let l2 = Arc::clone(&l);
+            handles.push(tokio::spawn(async move {
+                let _p = l2.acquire(interval, false).await;
+                std::time::Instant::now()
+            }));
+        }
+
+        let mut times: Vec<Duration> = Vec::new();
+        for h in handles {
+            times.push(h.await.unwrap().duration_since(t_start));
+        }
+        times.sort();
+        let slack = Duration::from_millis(40);
+        // 错峰间隔至少一个 interval；若退化为尖峰，三者会几乎同时（都趋近 0）。
+        assert!(times[0] >= interval - slack, "first={:?}", times[0]);
+        assert!(times[1] >= interval * 2 - slack, "second={:?}", times[1]);
+        assert!(times[2] >= interval * 3 - slack, "third={:?}", times[2]);
     }
 }

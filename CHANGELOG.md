@@ -5,6 +5,16 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
 
+## [0.6.13] - 2026-06-28
+
+主题：**修复固定间隔限速器并发下的尖峰脉冲 + config.json 原子写**。
+
+### 修复
+
+- **固定间隔限速器并发下不匀速（高危）**：`AdaptiveLimiter::acquire` 的固定间隔分支原先「读 last_start → 算 wait → sleep → sleep 后才更新 last_start」，算 wait 时不预占。多个并发请求会读到同一个旧 last_start、算出相同 wait、同时醒来一起发车——在并发上限 32 时会在每个间隔刻度同时打出最多 32 个请求的尖峰脉冲，恰是上游速率惩罚敏感的模式。现改为在锁内**预占**下一个发车点（把 last_start 推进到 `prev + min_interval`），后续并发请求读到已推进值，真正错峰排成 T、T+interval、T+2*interval……。新增回归测试 `fixed_interval_reserves_slot_no_burst`。
+- **config.json 非原子写（中危）**：`Config::save` 原先用 `fs::write` 直接覆写线上文件，写到一半遇崩溃/磁盘满会把 config.json 截断损坏（credentials 路径、githubToken、callbackBaseUrl 等全丢）。现改为写同目录临时文件再 `rename` 原子替换。
+
+
 ## [0.6.12] - 2026-06-28
 
 主题：**修复在线更新检查仓库指向错误**。

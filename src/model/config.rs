@@ -485,8 +485,16 @@ impl Config {
             .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存配置"))?;
 
         let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
-        fs::write(path, content)
-            .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
+        // 原子写：先写同目录临时文件再 rename 覆盖，避免写到一半遇崩溃/磁盘满
+        // 导致 config.json 被截断损坏（credentials 路径、githubToken、callbackBaseUrl 等全丢）。
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, content)
+            .with_context(|| format!("写入临时配置文件失败: {}", tmp.display()))?;
+        fs::rename(&tmp, path).with_context(|| {
+            // rename 失败时尽量清理临时文件，不报错。
+            let _ = fs::remove_file(&tmp);
+            format!("原子替换配置文件失败: {}", path.display())
+        })?;
         Ok(())
     }
 }
