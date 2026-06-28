@@ -3248,14 +3248,42 @@ impl MultiTokenManager {
                     anyhow::bail!(msg);
                 }
             }
-            // balanced 软启动：新号 success_count 不从 0 起，而是取现有号的均值。
+            // balanced 软启动：新号 success_count 不从 0 起，而是落到同组现有号的加权水位。
             // 否则加权 least-used 会把几乎全部流量砸到新号直到追平历史累计，
-            // 与限速并发叠加形成对上游不友好的脉冲。无现有号时为 0。
-            let seed_success_count = if entries.is_empty() {
-                0
-            } else {
-                let sum: u128 = entries.iter().map(|e| e.success_count as u128).sum();
-                (sum / entries.len() as u128) as u64
+            // 与限速并发叠加形成对上游不友好的脉冲。
+            //
+            // 口径必须与 select_next_credential 的选号逻辑对齐：
+            //   1) 选号比的是 success_count / weight，故播种要乘新号自己的 weight；
+            //   2) 选号在 group 过滤后比较，故只统计与新号同组的活跃号（新号无组时取全部活跃号）；
+            //   3) 禁用号不参与选号，故不计入水位。
+            // 用整体加权水位 r = Σsuccess / Σweight，seed = r * new_weight，
+            // 使新号入场时 success/weight == r，正好等于同组现有号的加权水位。
+            let new_weight = validated_cred.weight.max(1) as u128;
+            let seed_success_count = {
+                let new_groups = &validated_cred.groups;
+                let peers: Vec<&CredentialEntry> = entries
+                    .iter()
+                    .filter(|e| {
+                        if e.disabled {
+                            return false;
+                        }
+                        if new_groups.is_empty() {
+                            return true;
+                        }
+                        e.credentials.groups.iter().any(|g| new_groups.contains(g))
+                    })
+                    .collect();
+                if peers.is_empty() {
+                    0u64
+                } else {
+                    let sum_success: u128 = peers.iter().map(|e| e.success_count as u128).sum();
+                    let sum_weight: u128 = peers
+                        .iter()
+                        .map(|e| e.credentials.weight.max(1) as u128)
+                        .sum();
+                    // sum_weight >= peers.len() >= 1，不会除零
+                    ((sum_success * new_weight) / sum_weight) as u64
+                }
             };
             entries.push(CredentialEntry {
                 id: new_id,
@@ -4109,8 +4137,84 @@ mod tests {
             .find(|a| a.id == id3)
             .map(|a| a.success_count)
             .expect("新号应在快照中");
-        // 均值 = (10 + 20) / 2 = 15
-        assert_eq!(seeded, 15, "新号 success_count 应播种为现有号均值");
+        // 等权(都 weight=1)、无分组：加权水位 = (10+20)/(1+1) = 15，新号 weight=1 → 15
+        assert_eq!(seeded, 15, "新号 success_count 应播种为同组加权水位");
+    }
+
+    #[tokio::test]
+    async fn test_soft_start_seed_respects_weight() {
+        // 选号比的是 success_count / weight，故播种必须乘新号自己的 weight。
+        // 现有两号 success=10/20、weight 均 1 → 加权水位 r=(10+20)/(1+1)=15。
+        // 新号 weight=2 → seed = r*2 = 30，使其 success/weight = 30/2 = 15 == r。
+        let config = Config::default();
+        let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+
+        for (k, _w) in [("ksk_a", 1u32), ("ksk_b", 1u32)] {
+            let mut c = KiroCredentials::default();
+            c.kiro_api_key = Some(k.to_string());
+            c.auth_method = Some("api_key".to_string());
+            manager.add_credential(c).await.unwrap();
+        }
+        // id1=10 次、id2=20 次
+        for _ in 0..10 {
+            manager.report_success(1);
+        }
+        for _ in 0..20 {
+            manager.report_success(2);
+        }
+
+        let mut k3 = KiroCredentials::default();
+        k3.kiro_api_key = Some("ksk_c".to_string());
+        k3.auth_method = Some("api_key".to_string());
+        k3.weight = 2;
+        let id3 = manager.add_credential(k3).await.unwrap();
+
+        let seeded = manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|a| a.id == id3)
+            .map(|a| a.success_count)
+            .expect("新号应在快照中");
+        assert_eq!(seeded, 30, "weight=2 的新号播种应为加权水位×weight");
+    }
+
+    #[tokio::test]
+    async fn test_soft_start_seed_scoped_to_group() {
+        // 选号在 group 过滤后比较，故播种只看同组活跃号，不被别的组拉偏。
+        // g1: A(success=100) ; g2: B(success=10) ; 新号 C 属 g2 → seed 应只参照 B=10，而非含 A 的全局均值。
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![grouped_cred("a", &["g1"]), grouped_cred("b", &["g2"])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        for _ in 0..100 {
+            manager.report_success(1);
+        }
+        for _ in 0..10 {
+            manager.report_success(2);
+        }
+
+        let mut c = grouped_cred("c", &["g2"]);
+        c.kiro_api_key = Some("ksk_c".to_string());
+        c.auth_method = Some("api_key".to_string());
+        c.refresh_token = None;
+        let id3 = manager.add_credential(c).await.unwrap();
+
+        let seeded = manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|a| a.id == id3)
+            .map(|a| a.success_count)
+            .expect("新号应在快照中");
+        // 只参照 g2 的 B=10（weight=1），不含 g1 的 A=100
+        assert_eq!(seeded, 10, "新号播种应只统计同组活跃号");
     }
 
     #[tokio::test]

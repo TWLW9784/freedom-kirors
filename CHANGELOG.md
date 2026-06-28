@@ -5,6 +5,15 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
 
+## [0.6.16] - 2026-06-29
+
+主题：**修正 balanced 软启动播种口径（与选号逻辑对齐）**。
+
+### 修复
+
+- **balanced 软启动播种口径与选号逻辑对齐**：0.6.15 的软启动用了裸 `success_count` 全局均值播种新号，与 `select_next_credential` 的选号口径不一致，存两个问题：(1) 选号比的是 `success_count / weight`，播种未乘新号 weight，weight>1 的新号仍会被砸流量；(2) 选号在 group 过滤后比较，而播种用了含禁用号、含其他组的全局均值，跨组污染会让新号在本组被过度冷落。现改为：只统计与新号同组的活跃号（新号无组取全部活跃号），按整体加权水位 `Σsuccess / Σweight` × 新号 weight 播种，使新号入场时 `success/weight` 恰好落在同组现有号的加权水位上。新增 weight / group 两个回归测试。
+
+
 ## [0.6.15] - 2026-06-28
 
 主题：**balanced 软启动 + 识别 ProMax 新订阅**。
