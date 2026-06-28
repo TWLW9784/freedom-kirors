@@ -5,6 +5,15 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
 
+## [0.6.17] - 2026-06-29
+
+主题：**数据文件全面原子写，根治半截损坏丢数据风险**。
+
+### 修复
+
+- **所有数据文件改为原子写（temp + rename）**：之前除 `config.json` 外，其余数据文件都是 `std::fs::write` 直接覆写，写到一半遇进程崩溃 / 断电 / 磁盘满会把文件截断成半截 JSON，下次启动反序列化失败 → 数据全丢。影响面包括：**凭据文件**（所有账号）、**客户端 Key**（含配额用量）、**分组**、**代理池**、**余额缓存**、**统计缓存**、**CacheMeter 落盘**。新增 `common::fs::write_atomic` / `write_atomic_blocking` 共享 helper（同目录临时文件 + rename，失败清理残留），7 处落盘点统一走它。配 3 个单测。
+
+
 ## [0.6.16] - 2026-06-29
 
 主题：**修正 balanced 软启动播种口径（与选号逻辑对齐）**。

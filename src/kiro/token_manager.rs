@@ -1645,13 +1645,10 @@ impl MultiTokenManager {
 
         // 写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
         // 持 persist_lock 串行化整文件覆写，避免批量导入等并发场景下写盘互相踩踏。
+        // 原子写（temp + rename）避免写到一半遇崩溃/磁盘满截断损坏 → 所有账号丢失。
         let _write_guard = self.persist_lock.lock();
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| std::fs::write(path, &json))
-                .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
-        } else {
-            std::fs::write(path, &json).with_context(|| format!("回写凭据文件失败: {:?}", path))?;
-        }
+        crate::common::fs::write_atomic_blocking(path, &json)
+            .with_context(|| format!("原子回写凭据文件失败: {:?}", path))?;
 
         tracing::debug!("已回写凭据到文件: {:?}", path);
         Ok(true)
@@ -1842,7 +1839,7 @@ impl MultiTokenManager {
 
         match serde_json::to_string_pretty(&stats) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
+                if let Err(e) = crate::common::fs::write_atomic(&path, json) {
                     tracing::warn!("保存统计缓存失败: {}", e);
                 } else {
                     *self.last_stats_save_at.lock() = Some(Instant::now());
