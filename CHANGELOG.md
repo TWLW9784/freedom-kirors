@@ -5,6 +5,20 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
 
+## [0.6.14] - 2026-06-28
+
+主题：**修复凭据去重漏判 + 配置持久化竞态 + 清理哑配置**。
+
+### 修复
+
+- **凭据去重漏判（中危）**：`add_credential` 的预去重比较 profileArn 时口径与入库不一致。entries 在 `MultiTokenManager::new` 构造时会被 `fill_default_profile_arn()` 填默认 ARN，而重新添加的新凭据可能 `profileArn=None`；直接拿原始 None 比较时 `Some(默认) ≠ None`，导致同 refreshToken 的重复凭据被放行、多走一次上游刷新甚至重复入库。现在去重前对新凭据克隆填默认 ARN 取有效值再比较，与入库口径一致。（修复了一直失败的回归测试 `test_add_credential_reject_duplicate_refresh_token`）
+- **配置持久化 load-modify-save 竞态（中危）**：5 个配置持久化点（负载均衡模式 / 账号级风控 / 档位并发 / 日志治理 / update_config_file）原先各自「load 全量 → 改各自切片 → save」，并发时后写覆盖先写丢更新。新增全局持久化锁 + `Config::persist_update` 辅助函数，把「锁→load 最新→改→原子 save」整段串行化，5 处统一走此函数。
+
+### 清理
+
+- 移除哑配置字段 `allow_same_account`/`allowSameAccount`：前后端都声明但加凭据流程从不读、无 UI 真发它的残留半成品。
+
+
 ## [0.6.13] - 2026-06-28
 
 主题：**修复固定间隔限速器并发下的尖峰脉冲 + config.json 原子写**。

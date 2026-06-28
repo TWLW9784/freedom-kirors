@@ -3,6 +3,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+/// 全局配置持久化锁：串行化所有「load 最新 → 改字段 → 原子 save」序列。
+/// 多个 admin 操作并发持久化时（如同时改并发配置与节流配置），若各自
+/// load 全量、改各自切片、save，会后写覆盖先写丢更新。此锁覆盖整段 load+save，
+/// 保证持久化排队执行、每次都在最新文件基础上改。
+static CONFIG_PERSIST_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -495,6 +502,25 @@ impl Config {
             let _ = fs::remove_file(&tmp);
             format!("原子替换配置文件失败: {}", path.display())
         })?;
+        Ok(())
+    }
+
+    /// 在全局持久化锁下原子地「load 最新 → updater 改字段 → save」。
+    /// 5 个配置持久化点统一走此函数，消除 load-modify-save 竞态（后写覆盖先写丢更新）。
+    /// 锁在重新 load 之前获取，保证每个 updater 都看到前一个写入的结果。
+    pub fn persist_update(
+        config_path: &Path,
+        updater: impl FnOnce(&mut Config),
+    ) -> anyhow::Result<()> {
+        let _guard = CONFIG_PERSIST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut config = Config::load(config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        updater(&mut config);
+        config
+            .save()
+            .with_context(|| format!("持久化配置失败: {}", config_path.display()))?;
         Ok(())
     }
 }

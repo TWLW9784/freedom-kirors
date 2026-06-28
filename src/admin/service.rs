@@ -1499,14 +1499,8 @@ impl AdminService {
         let Some(path) = base.config_path() else {
             return;
         };
-        match Config::load(path) {
-            Ok(mut fresh) => {
-                updater(&mut fresh);
-                if let Err(e) = fresh.save() {
-                    tracing::warn!("保存配置文件失败: {}", e);
-                }
-            }
-            Err(e) => tracing::warn!("读取配置文件失败（跳过持久化）: {}", e),
+        if let Err(e) = Config::persist_update(path, updater) {
+            tracing::warn!("保存配置文件失败: {}", e);
         }
     }
 
@@ -2268,20 +2262,18 @@ impl AdminService {
                 return Ok(());
             }
         };
-        let mut config = crate::model::config::Config::load(&config_path)
-            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
-        if let Some(v) = req.trace_enabled {
-            config.trace_enabled = v;
-        }
-        if let Some(v) = req.trace_retention_days {
-            config.trace_retention_days = v;
-        }
-        if let Some(v) = req.usage_log_retention_days {
-            config.usage_log_retention_days = v;
-        }
-        config
-            .save()
-            .with_context(|| format!("持久化日志治理配置失败: {}", config_path.display()))?;
+        Config::persist_update(&config_path, |config| {
+            if let Some(v) = req.trace_enabled {
+                config.trace_enabled = v;
+            }
+            if let Some(v) = req.trace_retention_days {
+                config.trace_retention_days = v;
+            }
+            if let Some(v) = req.usage_log_retention_days {
+                config.usage_log_retention_days = v;
+            }
+        })
+        .with_context(|| format!("持久化日志治理配置失败: {}", config_path.display()))?;
         Ok(())
     }
 

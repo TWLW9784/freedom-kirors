@@ -163,8 +163,6 @@ export interface AddCredentialRequest {
   email?: string
   groups?: string[]
   sourceChannel?: string
-  /** 允许同一上游 Kiro 账户的多把 key（默认 false，同账户会被账号级去重拒绝） */
-  allowSameAccount?: boolean
 }
 
 // 添加凭据响应

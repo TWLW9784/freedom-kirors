@@ -3127,11 +3127,20 @@ impl MultiTokenManager {
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("缺少 refreshToken"))?;
             let new_refresh_token_hash = sha256_hex(new_refresh_token);
-            let new_profile_arn = new_cred
-                .profile_arn
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
+            // 去重比较 profileArn 时必须与入库口径一致：entries 在 MultiTokenManager::new
+            // 构造时会被 fill_default_profile_arn() 填默认 ARN，而重新添加的新凭据
+            // 可能 profileArn=None。若直接拿原始 None 比较，Some(默认) ≠ None 会去重漏判，
+            // 导致同 refreshToken 的重复凭据被放行、多走一次上游刷新甚至重复入库。
+            // 故先对新凭据克隆填默认 ARN，取有效值后再比较。
+            let new_profile_arn = {
+                let mut probe = new_cred.clone();
+                probe.fill_default_profile_arn();
+                probe
+                    .profile_arn
+                    .as_deref()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            };
             let duplicate_exists = {
                 let entries = self.entries.lock();
                 entries.iter().any(|entry| {
@@ -3149,7 +3158,7 @@ impl MultiTokenManager {
                         .credentials
                         .profile_arn
                         .as_deref()
-                        .map(str::trim)
+                        .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty());
                     existing_profile_arn == new_profile_arn
                 })
@@ -3636,12 +3645,10 @@ impl MultiTokenManager {
             }
         };
 
-        let mut config = Config::load(&config_path)
-            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
-        config.load_balancing_mode = mode.to_string();
-        config
-            .save()
-            .with_context(|| format!("持久化负载均衡模式失败: {}", config_path.display()))?;
+        Config::persist_update(&config_path, |config| {
+            config.load_balancing_mode = mode.to_string();
+        })
+        .with_context(|| format!("持久化负载均衡模式失败: {}", config_path.display()))?;
 
         Ok(())
     }
@@ -3740,13 +3747,11 @@ impl MultiTokenManager {
             }
         };
 
-        let mut config = Config::load(&config_path)
-            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
-        config.account_throttle_failover = failover;
-        config.account_throttle_cooldown_secs = cooldown_secs;
-        config
-            .save()
-            .with_context(|| format!("持久化账号级风控配置失败: {}", config_path.display()))?;
+        Config::persist_update(&config_path, |config| {
+            config.account_throttle_failover = failover;
+            config.account_throttle_cooldown_secs = cooldown_secs;
+        })
+        .with_context(|| format!("持久化账号级风控配置失败: {}", config_path.display()))?;
 
         Ok(())
     }
@@ -3909,19 +3914,17 @@ impl MultiTokenManager {
             }
         };
 
-        let mut config = Config::load(&config_path)
-            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
-        config.tier_max_in_flight_enterprise = c.tier_max_in_flight_enterprise;
-        config.tier_max_in_flight_pro = c.tier_max_in_flight_pro;
-        config.tier_max_in_flight_basic = c.tier_max_in_flight_basic;
-        config.tier_min_interval_ms_enterprise = c.tier_min_interval_ms_enterprise;
-        config.tier_min_interval_ms_pro = c.tier_min_interval_ms_pro;
-        config.tier_min_interval_ms_basic = c.tier_min_interval_ms_basic;
-        config.adaptive_concurrency_enabled = c.adaptive_concurrency_enabled;
-        config.rpm_burst_enabled = c.rpm_burst_enabled;
-        config
-            .save()
-            .with_context(|| format!("持久化档位并发配置失败: {}", config_path.display()))?;
+        Config::persist_update(&config_path, |config| {
+            config.tier_max_in_flight_enterprise = c.tier_max_in_flight_enterprise;
+            config.tier_max_in_flight_pro = c.tier_max_in_flight_pro;
+            config.tier_max_in_flight_basic = c.tier_max_in_flight_basic;
+            config.tier_min_interval_ms_enterprise = c.tier_min_interval_ms_enterprise;
+            config.tier_min_interval_ms_pro = c.tier_min_interval_ms_pro;
+            config.tier_min_interval_ms_basic = c.tier_min_interval_ms_basic;
+            config.adaptive_concurrency_enabled = c.adaptive_concurrency_enabled;
+            config.rpm_burst_enabled = c.rpm_burst_enabled;
+        })
+        .with_context(|| format!("持久化档位并发配置失败: {}", config_path.display()))?;
 
         Ok(())
     }

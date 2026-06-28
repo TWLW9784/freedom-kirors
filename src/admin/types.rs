@@ -294,9 +294,6 @@ pub struct AddCredentialRequest {
     /// 账号来源渠道（纯备注，可选）
     #[serde(default)]
     pub source_channel: Option<String>,
-    /// 允许同一上游 Kiro 账户的多把 key（默认 false：同账户会被账号级去重拒绝）
-    #[serde(default, alias = "allow_same_account")]
-    pub allow_same_account: bool,
 }
 
 fn default_auth_method() -> String {
