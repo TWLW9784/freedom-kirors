@@ -5,6 +5,15 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
 
+## [0.6.12] - 2026-06-28
+
+主题：**修复在线更新检查仓库指向错误**。
+
+### 修复
+
+- **在线更新检查指向上游仓库的 bug**：`service.rs` 的 `GITHUB_RELEASES_REPO`（查版本号/changelog 用）仍硬编码为上游 `ZyphrZero/kiro.rs`，而 `binary_update.rs` 的 `GITHUB_REPO`（下载二进制用）是部署仓 `TWLW9784/freedom-kirors`——一个查上游、一个下部署库，两边版本对不上，导致面板显示上游版本号与 changelog。已统一为部署仓 `freedom-kirors`。
+
+
 ## [0.6.11] - 2026-06-28
 
 主题：**档位 RPM/并发限速可观测性修复 + RPM 突发模式可选开关**。
