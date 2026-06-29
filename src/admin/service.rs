@@ -1314,6 +1314,8 @@ impl AdminService {
             provider: req.provider,
             client_id: req.client_id,
             client_secret: req.client_secret,
+            token_endpoint: req.token_endpoint,
+            scopes: req.scopes,
             start_url: req.start_url,
             priority: req.priority,
             weight: 1,

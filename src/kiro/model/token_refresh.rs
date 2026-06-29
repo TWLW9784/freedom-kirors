@@ -43,6 +43,19 @@ pub struct IdcRefreshResponse {
     pub profile_arn: Option<String>,
 }
 
+/// 外部 IdP (external_idp / M365 / Entra ID) Token 刷新响应体。
+///
+/// Microsoft 身份平台返回标准 OAuth2 snake_case 字段（access_token / refresh_token /
+/// expires_in），与 camelCase 的 [`IdcRefreshResponse`] 不同，故单独定义。
+#[derive(Debug, Deserialize)]
+pub struct ExternalIdpRefreshResponse {
+    pub access_token: String,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    #[serde(default)]
+    pub expires_in: Option<i64>,
+}
+
 // ============ AWS SSO OIDC 设备授权流程 ============
 
 /// 注册 OIDC 客户端请求体

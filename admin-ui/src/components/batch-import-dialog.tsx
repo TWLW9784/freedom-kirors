@@ -29,6 +29,8 @@ interface CredentialInput {
   refreshToken?: string
   clientId?: string
   clientSecret?: string
+  tokenEndpoint?: string
+  scopes?: string
   region?: string
   authRegion?: string
   apiRegion?: string
@@ -202,13 +204,35 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
           const clientId = cred.clientId?.trim() || undefined
           const clientSecret = cred.clientSecret?.trim() || undefined
-          const authMethod = clientId && clientSecret ? 'idc' : 'social'
-          if (authMethod === 'social' && (clientId || clientSecret)) {
-            updateResult(i, {
-              status: 'failed',
-              error: 'idc 模式需要同时提供 clientId 和 clientSecret',
-            })
-            continue
+          const tokenEndpoint = cred.tokenEndpoint?.trim() || undefined
+          const scopes = cred.scopes?.trim() || undefined
+          const declaredMethod = cred.authMethod?.trim().toLowerCase()
+          const isExternalIdp =
+            declaredMethod === 'external_idp' ||
+            declaredMethod === 'external-idp' ||
+            declaredMethod === 'externalidp' ||
+            (!!tokenEndpoint && !clientSecret)
+
+          let authMethod: 'social' | 'idc' | 'external_idp'
+          if (isExternalIdp) {
+            // 外部 IdP / M365：public client + PKCE，只需 clientId + tokenEndpoint，无 clientSecret
+            if (!clientId || !tokenEndpoint) {
+              updateResult(i, {
+                status: 'failed',
+                error: 'external_idp 模式需要同时提供 clientId 和 tokenEndpoint',
+              })
+              continue
+            }
+            authMethod = 'external_idp'
+          } else {
+            authMethod = clientId && clientSecret ? 'idc' : 'social'
+            if (authMethod === 'social' && (clientId || clientSecret)) {
+              updateResult(i, {
+                status: 'failed',
+                error: 'idc 模式需要同时提供 clientId 和 clientSecret',
+              })
+              continue
+            }
           }
 
           toImport.push({
@@ -220,6 +244,8 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               apiRegion: cred.apiRegion?.trim() || undefined,
               clientId,
               clientSecret,
+              tokenEndpoint,
+              scopes,
               priority: cred.priority || 0,
               machineId: cred.machineId?.trim() || undefined,
               endpoint: cred.endpoint?.trim() || undefined,

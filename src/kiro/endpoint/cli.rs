@@ -85,8 +85,8 @@ impl KiroEndpoint for CliEndpoint {
         if let Some(arn) = ctx.credentials.effective_profile_arn() {
             req = req.header("x-amzn-kiro-profile-arn", arn);
         }
-        if ctx.credentials.is_api_key_credential() {
-            req = req.header("tokentype", "API_KEY");
+        if let Some(token_type) = ctx.credentials.token_type_header() {
+            req = req.header("tokentype", token_type);
         }
         req
     }
@@ -103,8 +103,8 @@ impl KiroEndpoint for CliEndpoint {
         if let Some(arn) = ctx.credentials.effective_profile_arn() {
             req = req.header("x-amzn-kiro-profile-arn", arn);
         }
-        if ctx.credentials.is_api_key_credential() {
-            req = req.header("tokentype", "API_KEY");
+        if let Some(token_type) = ctx.credentials.token_type_header() {
+            req = req.header("tokentype", token_type);
         }
         req
     }

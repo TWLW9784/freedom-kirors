@@ -239,6 +239,14 @@ pub struct AddCredentialRequest {
     #[serde(default, alias = "client_secret")]
     pub client_secret: Option<String>,
 
+    /// 外部 IdP Token 端点（external_idp / M365 刷新需要）
+    #[serde(default, alias = "token_endpoint")]
+    pub token_endpoint: Option<String>,
+
+    /// 外部 IdP 刷新 scope（external_idp 需要）
+    #[serde(default)]
+    pub scopes: Option<String>,
+
     /// 优先级（可选，默认 0）
     #[serde(default)]
     pub priority: u32,

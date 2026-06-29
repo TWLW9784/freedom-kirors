@@ -146,11 +146,13 @@ export interface AddCredentialRequest {
   accessToken?: string
   profileArn?: string
   expiresAt?: string
-  authMethod?: 'social' | 'idc' | 'api_key'
+  authMethod?: 'social' | 'idc' | 'api_key' | 'external_idp'
   provider?: string
   startUrl?: string
   clientId?: string
   clientSecret?: string
+  tokenEndpoint?: string
+  scopes?: string
   priority?: number
   authRegion?: string
   apiRegion?: string

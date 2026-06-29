@@ -76,6 +76,18 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_secret: Option<String>,
 
+    /// 外部 IdP (external_idp / M365 / Entra ID) Token 端点。
+    ///
+    /// external_idp 是 public client + PKCE 登录：刷新时直接打这个 token_endpoint
+    /// （如 `https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token`），
+    /// 用 client_id + refresh_token，**无 client_secret**。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_endpoint: Option<String>,
+
+    /// 外部 IdP 刷新 scope（external_idp 需要，刷新时原样回传）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<String>,
+
     /// 凭据优先级（数字越小优先级越高，默认为 0）
     #[serde(default)]
     #[serde(skip_serializing_if = "is_zero")]
@@ -216,6 +228,8 @@ impl std::fmt::Debug for KiroCredentials {
             .field("start_url", &self.start_url)
             .field("client_id", &fmt_redacted(&self.client_id))
             .field("client_secret", &fmt_redacted(&self.client_secret))
+            .field("token_endpoint", &self.token_endpoint)
+            .field("scopes", &self.scopes)
             .field("start_url", &self.start_url)
             .field("priority", &self.priority)
             .field("region", &self.region)
@@ -508,6 +522,34 @@ impl KiroCredentials {
                 .unwrap_or(false)
     }
 
+    /// 是否为外部 IdP（external_idp / M365 / Entra ID）登录。
+    pub fn is_external_idp(&self) -> bool {
+        self.auth_method
+            .as_deref()
+            .map(|m| {
+                m.eq_ignore_ascii_case("external_idp")
+                    || m.eq_ignore_ascii_case("external-idp")
+                    || m.eq_ignore_ascii_case("externalidp")
+            })
+            .unwrap_or(false)
+    }
+
+    /// 该凭据在 CodeWhisperer API 调用时应发送的 `tokentype` header 值（如有）。
+    ///
+    /// - API Key 凭据 → `API_KEY`
+    /// - 外部 IdP（M365/Entra）→ `EXTERNAL_IDP`（缺失会被上游以 403
+    ///   "bearer token invalid" 拒绝）
+    /// - 其余（social / idc / builder-id）→ 不发送
+    pub fn token_type_header(&self) -> Option<&'static str> {
+        if self.is_api_key_credential() {
+            Some("API_KEY")
+        } else if self.is_external_idp() {
+            Some("EXTERNAL_IDP")
+        } else {
+            None
+        }
+    }
+
     /// 返回「可发送给上游」的真实 profileArn（跳过 BuilderID 占位符）。
     ///
     /// - 真实 ARN（含 Social 共享 ARN）→ 原样返回；
@@ -607,6 +649,8 @@ mod tests {
             start_url: None,
             client_id: None,
             client_secret: None,
+            token_endpoint: None,
+            scopes: None,
             priority: 0,
             region: None,
             auth_region: None,
@@ -801,6 +845,8 @@ groups: vec![],
             start_url: None,
             client_id: None,
             client_secret: None,
+            token_endpoint: None,
+            scopes: None,
             priority: 0,
             region: Some("eu-west-1".to_string()),
             auth_region: None,
@@ -839,6 +885,8 @@ groups: vec![],
             start_url: None,
             client_id: None,
             client_secret: None,
+            token_endpoint: None,
+            scopes: None,
             priority: 0,
             region: None,
             auth_region: None,
@@ -960,6 +1008,8 @@ groups: vec![],
             start_url: None,
             client_id: None,
             client_secret: None,
+            token_endpoint: None,
+            scopes: None,
             priority: 3,
             region: Some("us-west-2".to_string()),
             auth_region: None,

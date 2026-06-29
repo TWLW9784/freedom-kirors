@@ -23,7 +23,8 @@ use crate::kiro::model::available_models::ListAvailableModelsResponse;
 use crate::kiro::model::available_profiles::{AvailableProfile, ListAvailableProfilesResponse};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
-    IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
+    ExternalIdpRefreshResponse, IdcRefreshRequest, IdcRefreshResponse, RefreshRequest,
+    RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
@@ -124,14 +125,21 @@ pub(crate) async fn refresh_token(
     // 根据 auth_method 选择刷新方式
     // 如果未指定 auth_method，根据是否有 clientId/clientSecret 自动判断
     let auth_method = credentials.auth_method.as_deref().unwrap_or_else(|| {
-        if credentials.client_id.is_some() && credentials.client_secret.is_some() {
+        if credentials.token_endpoint.is_some() && credentials.client_id.is_some() {
+            "external_idp"
+        } else if credentials.client_id.is_some() && credentials.client_secret.is_some() {
             "idc"
         } else {
             "social"
         }
     });
 
-    if auth_method.eq_ignore_ascii_case("idc")
+    if auth_method.eq_ignore_ascii_case("external_idp")
+        || auth_method.eq_ignore_ascii_case("external-idp")
+        || auth_method.eq_ignore_ascii_case("externalidp")
+    {
+        refresh_external_idp_token(credentials, config, proxy).await
+    } else if auth_method.eq_ignore_ascii_case("idc")
         || auth_method.eq_ignore_ascii_case("builder-id")
         || auth_method.eq_ignore_ascii_case("iam")
     {
@@ -324,6 +332,139 @@ async fn refresh_idc_token(
     Ok(new_credentials)
 }
 
+/// 外部 IdP 可信 Token 端点主机后缀白名单（防 SSRF / 开放重定向）。
+const EXTERNAL_IDP_ALLOWED_HOST_SUFFIXES: &[&str] = &[
+    ".microsoftonline.com",
+    ".microsoftonline.us",
+    ".microsoftonline.cn",
+];
+
+/// 校验外部 IdP token_endpoint：必须 https + 主机在白名单后缀内。
+///
+/// 不依赖额外 url crate，手动解析 scheme/host。
+fn validate_external_idp_endpoint(raw_url: &str) -> anyhow::Result<()> {
+    let trimmed = raw_url.trim();
+    let rest = trimmed
+        .strip_prefix("https://")
+        .ok_or_else(|| anyhow::anyhow!("external IdP token_endpoint 必须是 https: {}", raw_url))?;
+    // authority = scheme 后到第一个 '/'、'?'、'#' 之前的部分
+    let authority_end = rest
+        .find(|c| c == '/' || c == '?' || c == '#')
+        .unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    // 拒绝 userinfo（防止 https://evil.com@microsoftonline.com 这类绕过）
+    if authority.contains('@') {
+        bail!("external IdP token_endpoint 不允许包含 userinfo: {}", raw_url);
+    }
+    // 去掉端口
+    let host = authority
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(authority)
+        .to_ascii_lowercase();
+    if host.is_empty() {
+        bail!("external IdP token_endpoint 缺少主机: {}", raw_url);
+    }
+    // 不允许 IP 字面量
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        bail!("external IdP token_endpoint 不允许使用 IP: {}", host);
+    }
+    if EXTERNAL_IDP_ALLOWED_HOST_SUFFIXES
+        .iter()
+        .any(|suffix| host.ends_with(suffix))
+    {
+        return Ok(());
+    }
+    bail!("external IdP token_endpoint 主机不在白名单: {}", host)
+}
+
+/// 刷新外部 IdP Token（external_idp / M365 / Entra ID）
+///
+/// external_idp 是 public client + PKCE 登录：刷新直接打凭据自带的
+/// `token_endpoint`（如 `login.microsoftonline.com/{tenant}/oauth2/v2.0/token`），
+/// 用 `client_id + refresh_token`，**无 client_secret**。profile_arn 不变。
+async fn refresh_external_idp_token(
+    credentials: &KiroCredentials,
+    config: &Config,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<KiroCredentials> {
+    tracing::info!("正在刷新 external IdP (M365) Token...");
+
+    let refresh_token = credentials.refresh_token.as_ref().unwrap();
+    let client_id = credentials
+        .client_id
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("external IdP 刷新需要 clientId"))?;
+    let token_endpoint = credentials
+        .token_endpoint
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("external IdP 刷新需要 tokenEndpoint"))?;
+
+    validate_external_idp_endpoint(token_endpoint)?;
+
+    let client = build_client(proxy, 60, config.tls_backend)?;
+    let mut form: Vec<(&str, &str)> = vec![
+        ("client_id", client_id.as_str()),
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token.as_str()),
+    ];
+    if let Some(scopes) = credentials.scopes.as_deref() {
+        if !scopes.trim().is_empty() {
+            form.push(("scope", scopes));
+        }
+    }
+
+    let response = client
+        .post(token_endpoint)
+        .header("Accept", "application/json")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Connection", "close")
+        .form(&form)
+        .send()
+        .await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+
+        // invalid_grant → refreshToken 永久失效（被撤销/过期）
+        if (status.as_u16() == 400 || status.as_u16() == 401)
+            && body_text.contains("invalid_grant")
+        {
+            return Err(RefreshTokenInvalidError {
+                message: format!("external IdP refreshToken 已失效 (invalid_grant): {}", body_text),
+            }
+            .into());
+        }
+
+        let error_msg = match status.as_u16() {
+            400 => "external IdP 请求参数错误或 refreshToken 无效",
+            401 => "external IdP 凭证已过期或无效，需要重新认证",
+            403 => "权限不足，无法刷新 Token",
+            429 => "请求过于频繁，已被限流",
+            500..=599 => "服务器错误，Microsoft 身份服务暂时不可用",
+            _ => "external IdP Token 刷新失败",
+        };
+        bail!("{}: {} {}", error_msg, status, body_text);
+    }
+
+    // 复用 IdcRefreshResponse 的字段集（access_token/refresh_token/expires_in/profile_arn），
+    // M365 响应为 snake_case，但 IdcRefreshResponse 是 camelCase——不匹配，用专用结构。
+    let data: ExternalIdpRefreshResponse = response.json().await?;
+
+    let mut new_credentials = credentials.clone();
+    new_credentials.access_token = Some(data.access_token);
+    if let Some(new_refresh_token) = data.refresh_token {
+        new_credentials.refresh_token = Some(new_refresh_token);
+    }
+    if let Some(expires_in) = data.expires_in {
+        let expires_at = Utc::now() + Duration::seconds(expires_in);
+        new_credentials.expires_at = Some(expires_at.to_rfc3339());
+    }
+    // external_idp 刷新不返回 profile_arn，保持原值不变。
+    Ok(new_credentials)
+}
+
 /// 官方 Kiro 用量 / 模型 REST 接口（getUsageLimits / ListAvailableModels /
 /// setUserPreference）仅在 `us-east-1` 与 `eu-central-1` 两个端点提供服务。
 ///
@@ -420,8 +561,8 @@ pub(crate) async fn get_usage_limits(
         if let Some(arn) = profile_arn_header.as_deref() {
             request = request.header("x-amzn-kiro-profile-arn", arn);
         }
-        if credentials.is_api_key_credential() {
-            request = request.header("tokentype", "API_KEY");
+        if let Some(token_type) = credentials.token_type_header() {
+            request = request.header("tokentype", token_type);
         }
 
         let response = request.send().await?;
@@ -504,8 +645,8 @@ pub(crate) async fn get_available_models(
         if let Some(arn) = profile_arn_header.as_deref() {
             request = request.header("x-amzn-kiro-profile-arn", arn);
         }
-        if credentials.is_api_key_credential() {
-            request = request.header("tokentype", "API_KEY");
+        if let Some(token_type) = credentials.token_type_header() {
+            request = request.header("tokentype", token_type);
         }
 
         let response = request.send().await?;
@@ -615,8 +756,8 @@ pub(crate) async fn list_available_profiles(
                 .header("Connection", "close")
                 .body(body);
 
-            if credentials.is_api_key_credential() {
-                request = request.header("tokentype", "API_KEY");
+            if let Some(token_type) = credentials.token_type_header() {
+                request = request.header("tokentype", token_type);
             }
 
             let response = request.send().await?;
@@ -737,8 +878,8 @@ pub(crate) async fn set_user_preference(
             .header("Connection", "close")
             .json(&body);
 
-        if credentials.is_api_key_credential() {
-            request = request.header("tokentype", "API_KEY");
+        if let Some(token_type) = credentials.token_type_header() {
+            request = request.header("tokentype", token_type);
         }
 
         let response = request.send().await?;
@@ -3976,6 +4117,86 @@ impl Drop for MultiTokenManager {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn test_validate_external_idp_endpoint_accepts_microsoft() {
+        assert!(validate_external_idp_endpoint(
+            "https://login.microsoftonline.com/tenant-id/oauth2/v2.0/token"
+        )
+        .is_ok());
+        assert!(validate_external_idp_endpoint(
+            "https://login.microsoftonline.us/t/oauth2/v2.0/token"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_validate_external_idp_endpoint_rejects_bad_hosts() {
+        // 非 https
+        assert!(validate_external_idp_endpoint(
+            "http://login.microsoftonline.com/t/oauth2/v2.0/token"
+        )
+        .is_err());
+        // 非白名单主机
+        assert!(validate_external_idp_endpoint("https://evil.example.com/token").is_err());
+        // userinfo 绕过
+        assert!(validate_external_idp_endpoint(
+            "https://evil.com@login.microsoftonline.com/token"
+        )
+        .is_err());
+        // 后缀拼接绕过（不是真正的 microsoftonline.com）
+        assert!(validate_external_idp_endpoint(
+            "https://login.microsoftonline.com.evil.com/token"
+        )
+        .is_err());
+        // IP 字面量
+        assert!(validate_external_idp_endpoint("https://10.0.0.1/token").is_err());
+    }
+
+    #[test]
+    fn test_refresh_routing_external_idp_by_token_endpoint() {
+        // 有 token_endpoint + client_id、无 auth_method → 应走 external_idp
+        let mut cred = KiroCredentials::default();
+        cred.refresh_token = Some("r".repeat(120));
+        cred.client_id = Some("cid".to_string());
+        cred.token_endpoint =
+            Some("https://login.microsoftonline.com/t/oauth2/v2.0/token".to_string());
+        let auth_method = cred.auth_method.as_deref().unwrap_or_else(|| {
+            if cred.token_endpoint.is_some() && cred.client_id.is_some() {
+                "external_idp"
+            } else if cred.client_id.is_some() && cred.client_secret.is_some() {
+                "idc"
+            } else {
+                "social"
+            }
+        });
+        assert_eq!(auth_method, "external_idp");
+    }
+
+    #[test]
+    fn test_external_idp_credential_roundtrip() {
+        // 导出 JSON 能被 kiro-rs 正确反序列化（含 token_endpoint/scopes，无 clientSecret）
+        let json = r#"{
+            "accessToken": "a",
+            "refreshToken": "r",
+            "authMethod": "external_idp",
+            "clientId": "cid",
+            "tokenEndpoint": "https://login.microsoftonline.com/t/oauth2/v2.0/token",
+            "issuerUrl": "https://login.microsoftonline.com/t/v2.0",
+            "scopes": "api://x/codewhisperer:completions offline_access",
+            "profileArn": "arn:aws:codewhisperer:us-east-1:1:profile/X"
+        }"#;
+        let cred: KiroCredentials = serde_json::from_str(json).unwrap();
+        assert_eq!(cred.auth_method.as_deref(), Some("external_idp"));
+        assert_eq!(cred.client_id.as_deref(), Some("cid"));
+        assert!(cred.client_secret.is_none());
+        assert_eq!(
+            cred.token_endpoint.as_deref(),
+            Some("https://login.microsoftonline.com/t/oauth2/v2.0/token")
+        );
+        assert!(cred.scopes.is_some());
+        // 未知字段 issuerUrl 被忽略、不报错
+    }
 
     #[test]
     fn test_is_token_expired_with_expired_token() {
