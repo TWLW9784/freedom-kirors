@@ -627,6 +627,11 @@ impl KiroProvider {
                 .await?;
             let account_key = self.account_rate_key_for(&ctx.credentials, ctx.id);
             let in_flight_guard = self.token_manager.begin_in_flight(ctx.id);
+            // 自适应并发控制器需要观测「上游响应头延迟」（TTFB），而不是本地排队时间。
+            // attempt_start 覆盖了 acquire_account_rate_guard() 等待并发名额的时间；当 limit
+            // 已收敛到很低时，把这段本地等待计入 RTT 会形成自我污染：越限流越排队、越排队
+            // 越显得上游慢，恢复变慢。因此这里在真正发起上游请求前重新打点。
+            let upstream_start = Instant::now();
             let response = match self.client_for(&ctx.credentials)?.execute(request).await {
                 Ok(resp) => resp,
                 Err(e) => {
@@ -676,7 +681,7 @@ impl KiroProvider {
                     attempt_start,
                 );
                 self.token_manager.report_success(ctx.id);
-                self.report_account_success_to_limiter(&account_key, attempt_start.elapsed());
+                self.report_account_success_to_limiter(&account_key, upstream_start.elapsed());
                 return Ok(KiroCallResult {
                     response,
                     credential_id: ctx.id,
