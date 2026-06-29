@@ -5,6 +5,20 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
 
+## [0.6.18] - 2026-06-29
+
+主题：**支持 M365 / Entra ID（external_idp）凭据，并修复其去重**。
+
+### 新增
+
+- **支持 M365 / Entra ID 组织 SSO（external_idp）凭据**：kiro-login-web 导出的 M365 凭据 JSON 现可被 admin-ui 批量导入、刷新、并实际调用 CodeWhisperer API。`KiroCredentials` 新增 `tokenEndpoint` / `scopes` 字段；新增 external_idp 刷新分支 `refresh_external_idp_token`（public client + PKCE，`clientId` + `refreshToken`，无 `clientSecret`，POST `tokenEndpoint`）与 `validate_external_idp_endpoint`（仅允许 `https` + 主机在 `.microsoftonline.com` / `.us` / `.cn` 白名单后缀，拒绝 IP / userinfo，无新增 crate 依赖）。前端 `batch-import-dialog` 识别 external_idp（`authMethod` 或「有 tokenEndpoint 无 clientSecret」），不再误判为 idc 而报「需要 clientId 和 clientSecret」。
+- **external_idp token 统一携带 `tokentype: EXTERNAL_IDP` 头**：M365 token 调任何 CodeWhisperer / Kiro 管理面接口都必须带该头，否则上游返回 403「bearer token invalid」/ 400「Invalid token」。新增 `KiroCredentials::token_type_header()`（api_key→`API_KEY`，external_idp→`EXTERNAL_IDP`），8 处 API 调用站点统一改用，替换原先写死的 `tokentype: API_KEY`。
+
+### 修复
+
+- **修复 external_idp 凭据去重漏判导致重复入库**：M365/Entra 的 `refreshToken` 每次登录与刷新都会轮换，而 `add_credential` 原去重逻辑按 `refreshToken` 哈希比较，导致同一 M365 账号重复导入时 `refreshToken` 必然不同、去重永远命不中而重复入库。现 external_idp 改用稳定的 `profileArn` 去重（跨登录 / 刷新不变），非 external_idp 维持原 `refreshToken` + `profileArn` 口径；预去重与持锁重检两处均已修正。`should_skip_default_profile_arn_fill` 让 external_idp 也跳过 BuilderID 占位 ARN 回填，避免污染去重 / 把可用账号变成 403。新增 4 个单测（端点白名单、刷新路由、反序列化往返、profileArn 去重正反例）。
+
+
 ## [0.6.17] - 2026-06-29
 
 主题：**数据文件全面原子写，根治半截损坏丢数据风险**。
