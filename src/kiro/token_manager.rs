@@ -3279,9 +3279,24 @@ impl MultiTokenManager {
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
             };
+            // external_idp（M365/Entra）的 refreshToken 每次登录与刷新都会轮换，
+            // 故同一账号重复导入时 refreshToken 必然不同，无法用其去重。
+            // 改用稳定的 profileArn（每用户 Kiro profile，跨登录/刷新不变）去重。
+            let is_external_idp_cred = new_cred.is_external_idp();
             let duplicate_exists = {
                 let entries = self.entries.lock();
                 entries.iter().any(|entry| {
+                    let existing_profile_arn = entry
+                        .credentials
+                        .profile_arn
+                        .as_deref()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    if is_external_idp_cred && entry.credentials.is_external_idp() {
+                        // 两者都是 external_idp：profileArn 相同即视为同一账号。
+                        return new_profile_arn.is_some()
+                            && existing_profile_arn == new_profile_arn;
+                    }
                     let same_refresh = entry
                         .credentials
                         .refresh_token
@@ -3292,16 +3307,13 @@ impl MultiTokenManager {
                     if !same_refresh {
                         return false;
                     }
-                    let existing_profile_arn = entry
-                        .credentials
-                        .profile_arn
-                        .as_deref()
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty());
                     existing_profile_arn == new_profile_arn
                 })
             };
             if duplicate_exists {
+                if is_external_idp_cred {
+                    anyhow::bail!("凭据已存在（external_idp profileArn 重复）");
+                }
                 anyhow::bail!("凭据已存在（refreshToken + profileArn 重复）");
             }
         }
@@ -3319,6 +3331,7 @@ impl MultiTokenManager {
         // new_cred 的字段 move 走，故必须在此处（字段尚完整时）取指纹，
         // 供插入临界区的权威去重重检使用。
         let dedup_is_api_key = new_cred.is_api_key_credential();
+        let dedup_is_external_idp = new_cred.is_external_idp();
         let dedup_hash: Option<String> = if dedup_is_api_key {
             new_cred
                 .kiro_api_key
@@ -3327,6 +3340,19 @@ impl MultiTokenManager {
                 .map(sha256_hex)
         } else {
             new_cred.refresh_token.as_deref().map(sha256_hex)
+        };
+        // external_idp 的 refreshToken 会被刷新轮换（入库存的是轮换后的值），
+        // 故 step 5 插入点的权威去重不能比 refreshToken，须用稳定的 profileArn。
+        let dedup_profile_arn: Option<String> = if dedup_is_external_idp {
+            let mut probe = new_cred.clone();
+            probe.fill_default_profile_arn();
+            probe
+                .profile_arn
+                .as_deref()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        } else {
+            None
         };
 
         // 4. 分配新 ID。必须使用单调计数器，不能按当前 entries 最大值重算；
@@ -3368,7 +3394,23 @@ impl MultiTokenManager {
             // add_credential 通过了步骤 2 的预去重并已插入同一凭据。故在持锁的
             // 插入点用原始输入指纹再做一次权威去重，关闭 TOCTOU（如命中则 bail，
             // next_id 即便已自增也只是跳号，无副作用）。
-            if let Some(hash) = &dedup_hash {
+            if dedup_is_external_idp {
+                // external_idp：refreshToken 已轮换，用稳定 profileArn 重检。
+                if let Some(arn) = &dedup_profile_arn {
+                    let dup = entries.iter().any(|e| {
+                        e.credentials.is_external_idp()
+                            && e.credentials
+                                .profile_arn
+                                .as_deref()
+                                .map(|s| s.trim())
+                                .filter(|s| !s.is_empty())
+                                == Some(arn.as_str())
+                    });
+                    if dup {
+                        anyhow::bail!("凭据已存在（external_idp profileArn 重复）");
+                    }
+                }
+            } else if let Some(hash) = &dedup_hash {
                 let dup = entries.iter().any(|e| {
                     let entry_hash = if dedup_is_api_key {
                         e.credentials.kiro_api_key.as_deref().map(sha256_hex)
@@ -4300,6 +4342,79 @@ mod tests {
         let result = manager.add_credential(duplicate).await;
         assert!(result.is_err());
         assert!(result.err().unwrap().to_string().contains("凭据已存在"));
+    }
+
+    #[tokio::test]
+    async fn test_add_credential_external_idp_dedup_by_profile_arn() {
+        // external_idp（M365）的 refreshToken 每次登录/刷新都轮换，
+        // 同一账号重复导入时 refreshToken 不同，必须按稳定的
+        // profileArn 去重。预去重（step 2）在网络刷新前，故可离线验证。
+        let config = Config::default();
+        let arn = "arn:aws:codewhisperer:us-east-1:427606711601:profile/HWYEM9UMADKX";
+
+        let mut existing = KiroCredentials::default();
+        existing.auth_method = Some("external_idp".to_string());
+        existing.refresh_token = Some("old-rotated-token-".to_string() + &"x".repeat(120));
+        existing.client_id = Some("cid".to_string());
+        existing.token_endpoint =
+            Some("https://login.microsoftonline.com/t/oauth2/v2.0/token".to_string());
+        existing.profile_arn = Some(arn.to_string());
+
+        let manager = MultiTokenManager::new(config, vec![existing], None, None, false).unwrap();
+
+        // 同账号重新登录：profileArn 一致但 refreshToken 全新。
+        let mut dup = KiroCredentials::default();
+        dup.auth_method = Some("external_idp".to_string());
+        dup.refresh_token = Some("fresh-login-token-".to_string() + &"y".repeat(120));
+        dup.client_id = Some("cid".to_string());
+        dup.token_endpoint =
+            Some("https://login.microsoftonline.com/t/oauth2/v2.0/token".to_string());
+        dup.profile_arn = Some(arn.to_string());
+
+        let result = manager.add_credential(dup).await;
+        assert!(result.is_err());
+        let msg = result.err().unwrap().to_string();
+        assert!(
+            msg.contains("external_idp profileArn 重复"),
+            "期望 external_idp profileArn 去重报错，实际：{}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_external_idp_different_profile_arn_not_duplicate() {
+        // 不同 profileArn 的两个 external_idp 账号不应被当重复。
+        // （预去重放行后会走到网络刷新，测试环境无网 → 报刷新错而非去重错，
+            // 故只断言“不是去重错”即可证明预去重未误判。）
+        let config = Config::default();
+        let mut existing = KiroCredentials::default();
+        existing.auth_method = Some("external_idp".to_string());
+        existing.refresh_token = Some("tok-".to_string() + &"x".repeat(120));
+        existing.client_id = Some("cid".to_string());
+        existing.token_endpoint =
+            Some("https://login.microsoftonline.com/t/oauth2/v2.0/token".to_string());
+        existing.profile_arn =
+            Some("arn:aws:codewhisperer:us-east-1:1:profile/AAAA".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![existing], None, None, false).unwrap();
+
+        let mut other = KiroCredentials::default();
+        other.auth_method = Some("external_idp".to_string());
+        other.refresh_token = Some("tok2-".to_string() + &"y".repeat(120));
+        other.client_id = Some("cid".to_string());
+        other.token_endpoint =
+            Some("https://login.microsoftonline.com/t/oauth2/v2.0/token".to_string());
+        other.profile_arn =
+            Some("arn:aws:codewhisperer:us-east-1:1:profile/BBBB".to_string());
+
+        let result = manager.add_credential(other).await;
+        assert!(result.is_err(), "无网环境下刷新会失败");
+        let msg = result.err().unwrap().to_string();
+        assert!(
+            !msg.contains("凭据已存在"),
+            "不同 profileArn 不应被误判为重复，实际：{}",
+            msg
+        );
     }
 
     #[tokio::test]

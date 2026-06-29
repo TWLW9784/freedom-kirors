@@ -449,7 +449,9 @@ impl KiroCredentials {
                 .as_deref()
                 .map(|m| m.eq_ignore_ascii_case("idc"))
                 .unwrap_or(false);
-        is_enterprise_or_idc && !self.is_social_login()
+        // external_idp（M365/Entra）的 profileArn 也是账号特异的，不能补 BuilderID
+        // 占位 ARN，否则会把可用账号变成 403 并污染去重。
+        (is_enterprise_or_idc && !self.is_social_login()) || self.is_external_idp()
     }
 
     /// 检查凭据是否支持 Opus 模型
