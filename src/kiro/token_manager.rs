@@ -957,6 +957,10 @@ struct CredentialEntry {
     last_throttle_in_flight: Option<u64>,
     /// 最近发起请求的时间戳滑动窗口（仅保留最近 60 秒，用于计算实时 RPM，不持久化）
     recent_request_ticks: std::collections::VecDeque<Instant>,
+    /// 上游响应延迟的指数滑动平均（毫秒，不持久化）。
+    /// 取自每次成功请求的 `upstream_start.elapsed()`（上游首字节前耗时，剔除生成时间的干扰）。
+    /// `None` 表示尚无样本，balanced 模式选择时视为无惩罚（给新账号公平起跑机会）。
+    latency_ewma_ms: Option<f64>,
 }
 
 /// 禁用原因
@@ -1049,6 +1053,9 @@ pub struct CredentialEntrySnapshot {
     /// 临时冷却剩余秒数（账号级 429 风控）；冷却中且 `> 0` 才返回
     #[serde(skip_serializing_if = "Option::is_none")]
     pub throttled_remaining_secs: Option<u64>,
+    /// 上游响应延迟 EWMA（毫秒，延迟感知路由的权重依据）；尚无样本时为 None
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ewma_ms: Option<f64>,
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
@@ -1148,6 +1155,32 @@ pub struct MultiTokenManager {
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
+
+// ── 延迟感知路由（balanced 模式）────────────────────────────────────────────
+/// 每账号上游响应延迟的指数滑动平均权重（越大越重视新样本）。
+const LATENCY_EWMA_ALPHA: f64 = 0.25;
+/// 延迟惩罚参考基准（毫秒）：延迟 <= 该值几乎不惩罚，超过后开始倾斜流量。
+/// Kiro 健康首字节约 1-3s，取 4s 作为「开始惩罚」的软门槛。
+const LATENCY_PENALTY_REF_MS: f64 = 4000.0;
+/// 延迟惩罚上限：极慢账号有效权重最多缩小到 1/该值。
+/// 取 8 表示极慢账号最少仍能拿到约 1/8 的正常流量（仍持续被少量采样、可自愈）。
+const LATENCY_PENALTY_MAX: f64 = 8.0;
+
+/// 根据账号延迟 EWMA 计算 balanced 模式的有效权重。
+/// 返回值越大 = 越快/越健康 = 应承担越多流量。
+/// 无延迟样本时不惩罚（直接用配置权重）；延迟 <= 参考基准时几乎不惩罚；
+/// 超过后按 ref/latency 线性降权，惩罚系数下限 1/LATENCY_PENALTY_MAX。
+fn latency_effective_weight(weight: u32, latency_ewma_ms: Option<f64>) -> f64 {
+    let w = weight.max(1) as f64;
+    match latency_ewma_ms {
+        Some(lat) if lat > LATENCY_PENALTY_REF_MS => {
+            let factor = (LATENCY_PENALTY_REF_MS / lat).clamp(1.0 / LATENCY_PENALTY_MAX, 1.0);
+            w * factor
+        }
+        _ => w,
+    }
+}
+
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 
@@ -1269,6 +1302,7 @@ impl MultiTokenManager {
                     peak_in_flight: 0,
                     last_throttle_in_flight: None,
                     recent_request_ticks: std::collections::VecDeque::new(),
+                    latency_ewma_ms: None,
                 }
             })
             .collect();
@@ -1464,15 +1498,18 @@ impl MultiTokenManager {
 
         match mode {
             "balanced" => {
-                // 加权 Least-Used：按 success_count / weight 升序选择（权重越大承担越多流量）。
-                // 用交叉相乘避免浮点/除零：a/wa < b/wb  ⇔  a*wb < b*wa（u128 防溢出）。
-                // 平局时按优先级（数字越小越高）。
+                // 加权 Least-Used + 延迟感知：按 success_count / effective_weight 升序选择。
+                // effective_weight = weight / latency_penalty：慢账号惩罚系数越大、有效权重越小、
+                // 分到的流量越少；无延迟样本（新账号）惩罚=1（不惩罚，公平起跑）。
+                // 惩罚上限 LATENCY_PENALTY_MAX，极慢账号也保留最低流量以持续重新探测、自愈。
+                // 用交叉相乘比较：a/ea < b/eb  ⇔  a*eb < b*ea。
                 let entry = available.iter().min_by(|a, b| {
-                    let wa = a.credentials.weight.max(1) as u128;
-                    let wb = b.credentials.weight.max(1) as u128;
-                    let lhs = (a.success_count as u128) * wb;
-                    let rhs = (b.success_count as u128) * wa;
-                    lhs.cmp(&rhs)
+                    let ea = latency_effective_weight(a.credentials.weight, a.latency_ewma_ms);
+                    let eb = latency_effective_weight(b.credentials.weight, b.latency_ewma_ms);
+                    let lhs = (a.success_count as f64) * eb;
+                    let rhs = (b.success_count as f64) * ea;
+                    lhs.partial_cmp(&rhs)
+                        .unwrap_or(std::cmp::Ordering::Equal)
                         .then(a.credentials.priority.cmp(&b.credentials.priority))
                 })?;
 
@@ -2057,6 +2094,22 @@ impl MultiTokenManager {
     ///
     /// # Arguments
     /// * `id` - 凭据 ID（来自 CallContext）
+    /// 记录一次上游成功请求的响应延迟样本（毫秒），更新该账号的延迟 EWMA。
+    /// 供 balanced 模式选择时对慢账号做流量惩罚（快账号拿更多流量）。
+    /// 不持久化、不影响失败计数，只影响路由权重。
+    pub fn record_latency(&self, id: u64, latency_ms: f64) {
+        if !(latency_ms.is_finite() && latency_ms > 0.0) {
+            return;
+        }
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            entry.latency_ewma_ms = Some(match entry.latency_ewma_ms {
+                Some(cur) => cur * (1.0 - LATENCY_EWMA_ALPHA) + latency_ms * LATENCY_EWMA_ALPHA,
+                None => latency_ms,
+            });
+        }
+    }
+
     pub fn report_success(&self, id: u64) {
         {
             let mut entries = self.entries.lock();
@@ -2423,6 +2476,7 @@ impl MultiTokenManager {
                             .filter(|t| **t >= cutoff)
                             .count() as u64
                     },
+                    latency_ewma_ms: e.latency_ewma_ms.map(|v| (v * 10.0).round() / 10.0),
                     has_proxy: e.credentials.proxy_url.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
                     refresh_failure_count: e.refresh_failure_count,
@@ -2784,6 +2838,7 @@ impl MultiTokenManager {
                     peak_in_flight: 0,
                     last_throttle_in_flight: None,
                     recent_request_ticks: std::collections::VecDeque::new(),
+                    latency_ewma_ms: None,
                 });
             }
             existing_arns.insert(arn.to_string());
@@ -3480,6 +3535,7 @@ impl MultiTokenManager {
                 peak_in_flight: 0,
                 last_throttle_in_flight: None,
                 recent_request_ticks: std::collections::VecDeque::new(),
+                latency_ewma_ms: None,
             });
         }
 
@@ -4159,6 +4215,44 @@ impl Drop for MultiTokenManager {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn test_latency_effective_weight_no_sample_no_penalty() {
+        // 无延迟样本（新账号）：直接用配置权重，不惩罚
+        assert_eq!(latency_effective_weight(1, None), 1.0);
+        assert_eq!(latency_effective_weight(5, None), 5.0);
+    }
+
+    #[test]
+    fn test_latency_effective_weight_fast_no_penalty() {
+        // 延迟低于参考基准（健康账号）：不惩罚
+        assert_eq!(latency_effective_weight(1, Some(1000.0)), 1.0);
+        assert_eq!(latency_effective_weight(1, Some(LATENCY_PENALTY_REF_MS)), 1.0);
+    }
+
+    #[test]
+    fn test_latency_effective_weight_slow_penalized() {
+        // 延迟 8s（参考基准 4s 的 2 倍）：有效权重减半
+        let w = latency_effective_weight(1, Some(8000.0));
+        assert!((w - 0.5).abs() < 1e-6, "expected 0.5, got {w}");
+        // 极慢（远超上限）：有效权重不低于 1/LATENCY_PENALTY_MAX
+        let w_extreme = latency_effective_weight(1, Some(1_000_000.0));
+        assert!((w_extreme - 1.0 / LATENCY_PENALTY_MAX).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_latency_effective_weight_faster_gets_more() {
+        // 快账号有效权重必须 >= 慢账号（同配置权重下）
+        let fast = latency_effective_weight(1, Some(2000.0));
+        let slow = latency_effective_weight(1, Some(20000.0));
+        assert!(fast > slow, "fast {fast} should exceed slow {slow}");
+    }
+
+    #[test]
+    fn test_latency_effective_weight_invalid_ignored() {
+        // 非法延迟值不应影响权重（防御性）
+        assert_eq!(latency_effective_weight(3, Some(0.0)), 3.0);
+    }
 
     #[test]
     fn test_validate_external_idp_endpoint_accepts_microsoft() {

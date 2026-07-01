@@ -681,7 +681,10 @@ impl KiroProvider {
                     attempt_start,
                 );
                 self.token_manager.report_success(ctx.id);
-                self.report_account_success_to_limiter(&account_key, upstream_start.elapsed());
+                let upstream_rtt = upstream_start.elapsed();
+                self.token_manager
+                    .record_latency(ctx.id, upstream_rtt.as_secs_f64() * 1000.0);
+                self.report_account_success_to_limiter(&account_key, upstream_rtt);
                 return Ok(KiroCallResult {
                     response,
                     credential_id: ctx.id,

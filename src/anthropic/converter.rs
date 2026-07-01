@@ -173,7 +173,9 @@ pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
 
     if model_lower.contains("sonnet") {
-        if model_lower.contains("4-8") || model_lower.contains("4.8") {
+        if model_lower.contains("sonnet-5") || model_lower.contains("sonnet5") {
+            Some("claude-sonnet-5".to_string())
+        } else if model_lower.contains("4-8") || model_lower.contains("4.8") {
             Some("claude-sonnet-4.8".to_string())
         } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
             Some("claude-sonnet-4.6".to_string())
@@ -209,7 +211,8 @@ pub fn map_model(model: &str) -> Option<String> {
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
         Some(mapped)
-            if mapped == "claude-sonnet-4.6"
+            if mapped == "claude-sonnet-5"
+                || mapped == "claude-sonnet-4.6"
                 || mapped == "claude-sonnet-4.8"
                 || mapped == "claude-opus-4.6"
                 || mapped == "claude-opus-4.7"
@@ -1260,6 +1263,15 @@ mod tests {
                 .contains("sonnet")
         );
         assert!(map_model("claude-sonnet-4-6").unwrap().contains("sonnet"));
+        assert_eq!(
+            map_model("claude-sonnet-5"),
+            Some("claude-sonnet-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-sonnet-5-thinking"),
+            Some("claude-sonnet-5".to_string())
+        );
+        assert_eq!(get_context_window_size("claude-sonnet-5"), 1_000_000);
     }
 
     #[test]
