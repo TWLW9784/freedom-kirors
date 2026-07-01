@@ -610,6 +610,7 @@ impl AdminService {
                     peak_in_flight: entry.peak_in_flight,
                     last_throttle_in_flight: entry.last_throttle_in_flight,
                     recent_rpm: entry.recent_rpm,
+                    latency_ewma_ms: entry.latency_ewma_ms,
                     has_proxy: entry.has_proxy,
                     proxy_url: entry.proxy_url,
                     refresh_failure_count: entry.refresh_failure_count,

@@ -128,6 +128,9 @@ pub struct CredentialStatusItem {
     pub last_throttle_in_flight: Option<u64>,
     /// 最近 60 秒内该凭据发起的请求数（实时 RPM，滑动窗口）
     pub recent_rpm: u64,
+    /// 上游响应延迟 EWMA（毫秒，延迟感知路由的权重依据）；尚无样本时为 None
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ewma_ms: Option<f64>,
     /// 是否配置了凭据级代理
     pub has_proxy: bool,
     /// 代理 URL（用于前端展示）
