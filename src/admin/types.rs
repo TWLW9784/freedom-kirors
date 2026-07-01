@@ -115,8 +115,11 @@ pub struct CredentialStatusItem {
     pub masked_api_key: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
-    /// API 调用成功次数
+    /// API 调用成功次数（真实计数）
     pub success_count: u64,
+    /// balanced 软启动路由基线（新号入场基线，仅影响选号，不计入成功次数显示）
+    #[serde(default)]
+    pub routing_seed_base: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
     /// 当前正在使用该凭据的上游请求数（实时并发）

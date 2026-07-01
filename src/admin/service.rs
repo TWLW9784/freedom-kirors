@@ -605,6 +605,7 @@ impl AdminService {
                     masked_api_key: entry.masked_api_key,
                     email: entry.email,
                     success_count: entry.success_count,
+                    routing_seed_base: entry.routing_seed_base,
                     last_used_at: entry.last_used_at.clone(),
                     in_flight: entry.in_flight,
                     peak_in_flight: entry.peak_in_flight,

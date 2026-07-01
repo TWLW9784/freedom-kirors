@@ -941,8 +941,13 @@ struct CredentialEntry {
     disabled: bool,
     /// 禁用原因（用于区分手动禁用 vs 自动禁用，便于自愈）
     disabled_reason: Option<DisabledReason>,
-    /// API 调用成功次数
+    /// API 调用成功次数（真实计数，从 0 起，面板显示此值）
     success_count: u64,
+    /// balanced 软启动路由基线（仅参与选号比较，不计入 success_count 显示）。
+    /// 新号入场时播种为同组现有号的加权水位，避免加权 least-used 把流量砸满新号。
+    /// 选号时用 `success_count + routing_seed_base` 比较，但面板只显示真实 success_count。
+    /// 需持久化，否则重启后基线丢失、新号会重新被灌爆。
+    routing_seed_base: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
     /// 临时冷却到期时间（账号级 429 风控触发后短期跳过该凭据）
@@ -986,6 +991,8 @@ struct StatsEntry {
     success_count: u64,
     #[serde(default)]
     total_failure_count: u64,
+    #[serde(default)]
+    routing_seed_base: u64,
     last_used_at: Option<String>,
 }
 
@@ -1028,8 +1035,11 @@ pub struct CredentialEntrySnapshot {
     pub masked_api_key: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
-    /// API 调用成功次数
+    /// API 调用成功次数（真实计数）
     pub success_count: u64,
+    /// balanced 软启动路由基线（新号入场基线，仅影响选号，不计入 success_count 显示）
+    #[serde(default)]
+    pub routing_seed_base: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
     /// 当前正在使用该凭据的上游请求数（实时并发）
@@ -1296,6 +1306,7 @@ impl MultiTokenManager {
                         None
                     },
                     success_count: 0,
+                    routing_seed_base: 0,
                     last_used_at: None,
                     throttled_until: None,
                     in_flight: 0,
@@ -1506,8 +1517,11 @@ impl MultiTokenManager {
                 let entry = available.iter().min_by(|a, b| {
                     let ea = latency_effective_weight(a.credentials.weight, a.latency_ewma_ms);
                     let eb = latency_effective_weight(b.credentials.weight, b.latency_ewma_ms);
-                    let lhs = (a.success_count as f64) * eb;
-                    let rhs = (b.success_count as f64) * ea;
+                    // 软启动：选号水位 = 真实 success_count + 路由基线（新号入场基线）。
+                    let la = (a.success_count + a.routing_seed_base) as f64;
+                    let lb = (b.success_count + b.routing_seed_base) as f64;
+                    let lhs = la * eb;
+                    let rhs = lb * ea;
                     lhs.partial_cmp(&rhs)
                         .unwrap_or(std::cmp::Ordering::Equal)
                         .then(a.credentials.priority.cmp(&b.credentials.priority))
@@ -1983,6 +1997,7 @@ impl MultiTokenManager {
             if let Some(s) = stats.get(&entry.id.to_string()) {
                 entry.success_count = s.success_count;
                 entry.total_failure_count = s.total_failure_count;
+                entry.routing_seed_base = s.routing_seed_base;
                 entry.last_used_at = s.last_used_at.clone();
             }
         }
@@ -2008,6 +2023,7 @@ impl MultiTokenManager {
                         StatsEntry {
                             success_count: e.success_count,
                             total_failure_count: e.total_failure_count,
+                            routing_seed_base: e.routing_seed_base,
                             last_used_at: e.last_used_at.clone(),
                         },
                     )
@@ -2465,6 +2481,7 @@ impl MultiTokenManager {
                     },
                     email: e.credentials.email.clone(),
                     success_count: e.success_count,
+                    routing_seed_base: e.routing_seed_base,
                     last_used_at: e.last_used_at.clone(),
                     in_flight: e.in_flight,
                     peak_in_flight: e.peak_in_flight,
@@ -2832,6 +2849,7 @@ impl MultiTokenManager {
                     disabled: false,
                     disabled_reason: None,
                     success_count: 0,
+                    routing_seed_base: 0,
                     last_used_at: None,
                     throttled_until: None,
                     in_flight: 0,
@@ -3511,7 +3529,11 @@ impl MultiTokenManager {
                 if peers.is_empty() {
                     0u64
                 } else {
-                    let sum_success: u128 = peers.iter().map(|e| e.success_count as u128).sum();
+                    // 同组现有号的加权水位也要算上各自的路由基线，否则新号会参照偏低。
+                    let sum_success: u128 = peers
+                        .iter()
+                        .map(|e| (e.success_count + e.routing_seed_base) as u128)
+                        .sum();
                     let sum_weight: u128 = peers
                         .iter()
                         .map(|e| e.credentials.weight.max(1) as u128)
@@ -3528,7 +3550,8 @@ impl MultiTokenManager {
                 refresh_failure_count: 0,
                 disabled: false,
                 disabled_reason: None,
-                success_count: seed_success_count,
+                success_count: 0,
+                routing_seed_base: seed_success_count,
                 last_used_at: None,
                 throttled_until: None,
                 in_flight: 0,
@@ -4562,10 +4585,12 @@ mod tests {
             .entries
             .into_iter()
             .find(|a| a.id == id3)
-            .map(|a| a.success_count)
+            .map(|a| (a.success_count, a.routing_seed_base))
             .expect("新号应在快照中");
         // 等权(都 weight=1)、无分组：加权水位 = (10+20)/(1+1) = 15，新号 weight=1 → 15
-        assert_eq!(seeded, 15, "新号 success_count 应播种为同组加权水位");
+        // 真实 success_count 从 0 起（面板显示真实值），路由基线播种为 15。
+        assert_eq!(seeded.0, 0, "新号真实 success_count 应从 0 起");
+        assert_eq!(seeded.1, 15, "新号路由基线应播种为同组加权水位");
     }
 
     #[tokio::test]
@@ -4601,9 +4626,10 @@ mod tests {
             .entries
             .into_iter()
             .find(|a| a.id == id3)
-            .map(|a| a.success_count)
+            .map(|a| (a.success_count, a.routing_seed_base))
             .expect("新号应在快照中");
-        assert_eq!(seeded, 30, "weight=2 的新号播种应为加权水位×weight");
+        assert_eq!(seeded.0, 0, "新号真实 success_count 应从 0 起");
+        assert_eq!(seeded.1, 30, "weight=2 的新号路由基线应为加权水位×weight");
     }
 
     #[tokio::test]
@@ -4638,10 +4664,11 @@ mod tests {
             .entries
             .into_iter()
             .find(|a| a.id == id3)
-            .map(|a| a.success_count)
+            .map(|a| (a.success_count, a.routing_seed_base))
             .expect("新号应在快照中");
         // 只参照 g2 的 B=10（weight=1），不含 g1 的 A=100
-        assert_eq!(seeded, 10, "新号播种应只统计同组活跃号");
+        assert_eq!(seeded.0, 0, "新号真实 success_count 应从 0 起");
+        assert_eq!(seeded.1, 10, "新号路由基线应只统计同组活跃号");
     }
 
     #[tokio::test]
