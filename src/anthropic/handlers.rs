@@ -242,6 +242,7 @@ fn last_attempt_outcome(tracer: &RequestTracer) -> Option<&'static str> {
         outcome::TRANSIENT => outcome::TRANSIENT,
         outcome::NETWORK_ERROR => outcome::NETWORK_ERROR,
         outcome::BAD_REQUEST => outcome::BAD_REQUEST,
+        outcome::NO_CREDENTIAL => outcome::NO_CREDENTIAL,
         _ => outcome::UNKNOWN,
     })
 }

@@ -107,6 +107,22 @@ impl fmt::Display for RefreshTokenInvalidError {
 
 impl std::error::Error for RefreshTokenInvalidError {}
 
+/// 请求指定的分组/模型无任何匹配凭据（确定性配置/路由错误，非“账号被禁用”）。
+/// 专门类型化：供上层区分分类为 NO_CREDENTIAL 并 fail-fast
+/// （重试无意义——分组内凭据数在单次请求内不会变多）。
+#[derive(Debug)]
+pub(crate) struct NoCredentialError {
+    pub message: String,
+}
+
+impl fmt::Display for NoCredentialError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for NoCredentialError {}
+
 /// 刷新 Token
 pub(crate) async fn refresh_token(
     credentials: &KiroCredentials,
@@ -1621,11 +1637,33 @@ impl MultiTokenManager {
                         (new_id, new_creds)
                     } else {
                         let entries = self.entries.lock();
-                        // 注意：必须在 bail! 之前计算 available_count，
-                        // 因为 available_count() 会尝试获取 entries 锁，
-                        // 而此时我们已经持有该锁，会导致死锁
-                        let available = entries.iter().filter(|e| !e.disabled).count();
-                        anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
+                        // 注意：必须在返回之前计算计数，因为相关方法会尝试获取 entries 锁，
+                        // 而此时我们已经持有该锁，会导致死锁。
+                        // available 也按请求分组口径统计（与 total 同 scope），避免全局数、分组数拼在一起出现“可用>总数”的矛盾。
+                        let available_in_group = entries
+                            .iter()
+                            .filter(|e| !e.disabled && group_matches(&e.credentials.groups, group))
+                            .count();
+                        drop(entries);
+                        // total==0：该分组/模型压根没有任何匹配凭据（确定性配置/路由错误），
+                        // 不是“都被禁用”；用专用错误类型供上层 fail-fast + 分类为 NO_CREDENTIAL。
+                        if total == 0 {
+                            return Err(NoCredentialError {
+                                message: match group {
+                                    Some(g) => format!(
+                                        "请求分组「{}」没有任何匹配凭据（分组内 0 个账号；全局启用 {}）",
+                                        g,
+                                        self.available_count()
+                                    ),
+                                    None => format!(
+                                        "无任何可用凭据（全局启用 {}）",
+                                        self.available_count()
+                                    ),
+                                },
+                            }
+                            .into());
+                        }
+                        anyhow::bail!("所有凭据均已禁用（{}/{}）", available_in_group, total);
                     }
                 }
             };
@@ -5590,6 +5628,38 @@ mod tests {
         c.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
         c.groups = groups.iter().map(|s| s.to_string()).collect();
         c
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_empty_group_returns_no_credential_error() {
+        // 请求一个没有任何账号的分组时，应返回专用 NoCredentialError（而非“所有凭据均已禁用”），
+        // 且消息不再出现“可用>总数”的矛盾。现有账号均无分组，请求分组 g_absent 匹配 0 个。
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![grouped_cred("a", &[]), grouped_cred("b", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let err = match manager.acquire_context(None, Some("g_absent")).await {
+            Ok(_) => panic!("空分组应失败"),
+            Err(e) => e,
+        };
+        assert!(
+            err.downcast_ref::<NoCredentialError>().is_some(),
+            "应为 NoCredentialError，实际: {}",
+            err
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("g_absent"), "消息应含分组名: {}", msg);
+        assert!(
+            !msg.contains("所有凭据均已禁用"),
+            "空分组不应报“所有凭据均已禁用”: {}",
+            msg
+        );
     }
 
     #[test]

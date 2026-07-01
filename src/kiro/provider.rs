@@ -551,17 +551,29 @@ impl KiroProvider {
             let mut ctx = match self.token_manager.acquire_context(model.as_deref(), group).await {
                 Ok(c) => c,
                 Err(e) => {
+                    // 分组/模型无任何匹配凭据：确定性错误，重试无意义。
+                    // 分类为 NO_CREDENTIAL 并 fail-fast（避免 3 次空转重试污染 trace）。
+                    let is_no_cred = e
+                        .downcast_ref::<crate::kiro::token_manager::NoCredentialError>()
+                        .is_some();
                     Self::emit_attempt(
                         sink,
                         attempt,
                         0,
                         "",
                         None,
-                        outcome::UNKNOWN,
+                        if is_no_cred {
+                            outcome::NO_CREDENTIAL
+                        } else {
+                            outcome::UNKNOWN
+                        },
                         Some(&e.to_string()),
                         attempt_start,
                     );
                     last_error = Some(e);
+                    if is_no_cred {
+                        break;
+                    }
                     continue;
                 }
             };

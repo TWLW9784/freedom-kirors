@@ -139,6 +139,8 @@ pub mod outcome {
     pub const NETWORK_ERROR: &str = "network_error";
     pub const BAD_REQUEST: &str = "bad_request";
     pub const UNKNOWN: &str = "unknown";
+    /// 请求指定的分组/模型无任何匹配凭据（确定性配置/路由错误，不重试）
+    pub const NO_CREDENTIAL: &str = "no_credential";
     /// 仅用作 record.error_type：流式响应已开始但上游中途断开
     pub const STREAM_INTERRUPTED: &str = "stream_interrupted";
 }
