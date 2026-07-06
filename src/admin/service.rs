@@ -25,6 +25,7 @@ use crate::model::config::Config;
 
 use super::error::AdminServiceError;
 use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
+use super::stress::{StressOutcome, StressProbeResult};
 use super::types::{
     AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse, AssignProxyRequest,
     AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse, AvailableProfileItem,
@@ -956,6 +957,150 @@ impl AdminService {
                 response_preview: None,
                 error: Some(e.to_string()),
             }),
+        }
+    }
+
+    /// 构建压测专用 HTTP client（调用方按 effective proxy 缓存复用，避免每请求重建 rustls）。
+    ///
+    /// 与 `test_credential_model` 的 client 一致（rustls + 120s 超时 + Connection: close），
+    /// 但由 stress_test 模块持有并复用，消除 TLS 握手 CPU 抖动进入延迟测量。
+    pub fn stress_build_client_for(&self, id: u64) -> Result<reqwest::Client, AdminServiceError> {
+        let credentials = self
+            .token_manager
+            .clone_all_credentials()
+            .into_iter()
+            .find(|c| c.id == Some(id))
+            .ok_or_else(|| AdminServiceError::InternalError(format!("凭据不存在: {}", id)))?;
+        let config = self.token_manager.config();
+        let global_proxy = self.token_manager.proxy();
+        let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
+        build_client(effective_proxy.as_ref(), 120, config.tls_backend)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))
+    }
+
+    /// 压测专用探针：测 TTFB（time-to-first-byte）并立即丢弃响应流。
+    ///
+    /// 与 `test_credential_model` 的差异（专业性修复）：
+    /// 1. **精确 TTFB**：`elapsed_ms` 只覆盖 `send().await`，不含 token 准备/profile 解析/序列化；
+    /// 2. **早断连**：拿到响应头后立即 `drop(resp)`，上游生成流被中止，
+    ///    不再消耗输出 quota，也不让 `inflight` 时长被输出长度污染；
+    /// 3. **client 复用**：由调用方传入已复用的 `reqwest::Client`；
+    /// 4. **失败细分**：`Setup` = 前置准备失败（未打上游），`Network` = 网络错误（send 失败），
+    ///    `Http` = 有响应头（无论 2xx/4xx/5xx）。
+    pub async fn stress_probe(
+        &self,
+        id: u64,
+        model: &str,
+        client: &reqwest::Client,
+    ) -> StressProbeResult {
+        // ==== 前置准备（不计入 TTFB）====
+        let (token, credentials) = match self.token_manager.prepare_admin_request_token(id).await {
+            Ok(v) => v,
+            Err(e) => {
+                return StressProbeResult {
+                    status: None,
+                    elapsed_ms: 0.0,
+                    outcome: StressOutcome::Setup(e.to_string()),
+                };
+            }
+        };
+
+        let credentials = if credentials.is_api_key_credential() {
+            credentials
+        } else {
+            // profileArn 已解析时短路（不产生额外上游调用）
+            let _ = self.token_manager.resolve_profile_arn_for(id, &token).await;
+            self.token_manager
+                .prepare_admin_request_token(id)
+                .await
+                .map(|(_, c)| c)
+                .unwrap_or(credentials)
+        };
+
+        let endpoint_name = credentials
+            .endpoint
+            .as_deref()
+            .unwrap_or(&self.token_manager.config().default_endpoint)
+            .to_string();
+        let endpoint: Box<dyn KiroEndpoint> = match endpoint_name.as_str() {
+            "cli" => Box::new(CliEndpoint::new()),
+            "ide" => Box::new(IdeEndpoint::new()),
+            other => {
+                return StressProbeResult {
+                    status: None,
+                    elapsed_ms: 0.0,
+                    outcome: StressOutcome::Setup(format!("未知端点: {}", other)),
+                };
+            }
+        };
+
+        let config = self.token_manager.config();
+        let machine_id = machine_id::generate_from_credentials(&credentials, config);
+        let request = KiroRequest {
+            conversation_state: ConversationState::new(Uuid::new_v4().to_string())
+                .with_agent_task_type("vibe")
+                .with_chat_trigger_type("MANUAL")
+                .with_current_message(CurrentMessage::new(UserInputMessage::new(
+                    "ping".to_string(),
+                    model.to_string(),
+                ))),
+            profile_arn: credentials.streaming_profile_arn(),
+            additional_model_request_fields: None,
+        };
+        let request_body = match serde_json::to_string(&request) {
+            Ok(s) => s,
+            Err(e) => {
+                return StressProbeResult {
+                    status: None,
+                    elapsed_ms: 0.0,
+                    outcome: StressOutcome::Setup(format!("序列化失败: {}", e)),
+                };
+            }
+        };
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: &token,
+            machine_id: &machine_id,
+            config,
+        };
+        let body = endpoint.transform_api_body(&request_body, &ctx);
+        let url = endpoint.api_url(&ctx);
+        let req_builder = client
+            .post(&url)
+            .body(body)
+            .header("content-type", endpoint.content_type())
+            .header("Connection", "close");
+        let req = endpoint.decorate_api(req_builder, &ctx);
+
+        // ==== 计时窗口：只覆盖网络往返 ====
+        let start = Instant::now();
+        let response = req.send().await;
+        let elapsed = start.elapsed();
+        let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
+
+        match response {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let retry_after = resp
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.trim().parse::<f64>().ok());
+                // 立即 drop：不读 body → 上游停止生成 → 不消耗输出 quota + inflight 时长纯 TTFB
+                drop(resp);
+                StressProbeResult {
+                    status: Some(status),
+                    elapsed_ms,
+                    outcome: StressOutcome::Http {
+                        retry_after_secs: retry_after,
+                    },
+                }
+            }
+            Err(e) => StressProbeResult {
+                status: None,
+                elapsed_ms,
+                outcome: StressOutcome::Network(e.to_string()),
+            },
         }
     }
 
@@ -3570,10 +3715,7 @@ mod tests {
             subscription_type_from_title(Some("KIRO PRO MAX")),
             "Pro_Max"
         );
-        assert_eq!(
-            subscription_type_from_title(Some("KIRO PROMAX")),
-            "Pro_Max"
-        );
+        assert_eq!(subscription_type_from_title(Some("KIRO PROMAX")), "Pro_Max");
         assert_eq!(
             subscription_type_from_title(Some("KIRO POWER")),
             "Enterprise"

@@ -7,7 +7,7 @@
 //! - **RPM 速率测试（Rpm）**：按固定的「每分钟请求数」节奏匀速发出请求，持续指定时长，
 //!   衡量在稳定速率下的成功率/延迟/限流情况（贴近真实业务 QPS 而非峰值打爆）。
 //!
-//! 两种模式都复用 `AdminService::test_credential_model` 做真实上游调用，统计 P50/P95/P99/Max，
+//! 两种模式都复用 `AdminService::stress_probe` 做真实上游 TTFB 探针，统计 P50/P95/P99/Max，
 //! 运行中可停止；进度通过全局会话注册表暴露，由 `/stress-test/{id}/status` 轮询读取。
 
 use std::collections::HashMap;
@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::admin::service::AdminService;
-use crate::admin::types::TestCredentialModelRequest;
+use crate::admin::stress::{StressOutcome, StressProbeResult};
 
 /// 全局会话注册表：session_id -> 会话状态
 static SESSIONS: LazyLock<RwLock<HashMap<String, Arc<SessionState>>>> =
@@ -123,6 +123,12 @@ struct CredAccum {
     failed: AtomicUsize,
     status_429: AtomicUsize,
     status_500: AtomicUsize,
+    status_4xx_other: AtomicUsize,
+    network_errors: AtomicUsize,
+    setup_errors: AtomicUsize,
+    retry_after_count: AtomicUsize,
+    status_counts: Mutex<HashMap<u16, usize>>,
+    retry_after_secs: Mutex<Vec<f64>>,
     latencies_ms: Mutex<Vec<f64>>,
 }
 
@@ -134,28 +140,60 @@ impl CredAccum {
             failed: AtomicUsize::new(0),
             status_429: AtomicUsize::new(0),
             status_500: AtomicUsize::new(0),
+            status_4xx_other: AtomicUsize::new(0),
+            network_errors: AtomicUsize::new(0),
+            setup_errors: AtomicUsize::new(0),
+            retry_after_count: AtomicUsize::new(0),
+            status_counts: Mutex::new(HashMap::new()),
+            retry_after_secs: Mutex::new(Vec::new()),
             latencies_ms: Mutex::new(Vec::new()),
         }
     }
 
-    fn record(&self, ok: bool, status: Option<u16>, elapsed_ms: f64) {
+    fn record(&self, probe: &StressProbeResult) {
         self.total.fetch_add(1, Ordering::Relaxed);
-        if ok {
+        if probe.is_success() {
             self.success.fetch_add(1, Ordering::Relaxed);
         } else {
             self.failed.fetch_add(1, Ordering::Relaxed);
         }
-        match status {
+        match probe.status {
             Some(429) => {
                 self.status_429.fetch_add(1, Ordering::Relaxed);
+            }
+            Some(s) if (400..500).contains(&s) => {
+                self.status_4xx_other.fetch_add(1, Ordering::Relaxed);
             }
             Some(s) if (500..600).contains(&s) => {
                 self.status_500.fetch_add(1, Ordering::Relaxed);
             }
             _ => {}
         }
-        if let Ok(mut v) = self.latencies_ms.lock() {
-            v.push(elapsed_ms);
+        match &probe.outcome {
+            StressOutcome::Http { retry_after_secs } => {
+                if let Some(status) = probe.status {
+                    if let Ok(mut m) = self.status_counts.lock() {
+                        *m.entry(status).or_insert(0) += 1;
+                    }
+                }
+                if let Some(v) = retry_after_secs {
+                    self.retry_after_count.fetch_add(1, Ordering::Relaxed);
+                    if let Ok(mut xs) = self.retry_after_secs.lock() {
+                        xs.push(*v);
+                    }
+                }
+                if let Ok(mut v) = self.latencies_ms.lock() {
+                    v.push(probe.elapsed_ms);
+                }
+            }
+            StressOutcome::Network(err) => {
+                let _ = err.len();
+                self.network_errors.fetch_add(1, Ordering::Relaxed);
+            }
+            StressOutcome::Setup(err) => {
+                let _ = err.len();
+                self.setup_errors.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -183,6 +221,8 @@ struct SessionState {
     accums: HashMap<i64, CredAccum>,
     /// 排序后的凭证顺序（用于稳定输出）
     cred_order: Vec<i64>,
+    /// 压测专用 HTTP client 缓存（按凭据缓存，避免每请求重建 rustls/client）。
+    clients: Mutex<HashMap<i64, reqwest::Client>>,
 }
 
 /// 单凭证测试结果（对外 JSON）
@@ -195,6 +235,13 @@ pub struct CredentialTestResult {
     pub failed: usize,
     pub status_429: usize,
     pub status_500: usize,
+    pub status_4xx_other: usize,
+    pub network_errors: usize,
+    pub setup_errors: usize,
+    pub retry_after_count: usize,
+    pub retry_after_max: Option<f64>,
+    pub latency_samples: usize,
+    pub status_counts: HashMap<u16, usize>,
     pub latency_p50: f64,
     pub latency_p95: f64,
     pub latency_p99: f64,
@@ -270,6 +317,21 @@ impl SessionState {
                     .map(|v| v.clone())
                     .unwrap_or_default();
                 lat.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let retry_after_max = acc
+                    .retry_after_secs
+                    .lock()
+                    .map(|v| {
+                        v.iter().copied().fold(None, |max, x| match max {
+                            Some(m) if m >= x => Some(m),
+                            _ => Some(x),
+                        })
+                    })
+                    .unwrap_or(None);
+                let status_counts = acc
+                    .status_counts
+                    .lock()
+                    .map(|m| m.clone())
+                    .unwrap_or_default();
                 results.push(CredentialTestResult {
                     credential_id: cred_id,
                     total: acc.total.load(Ordering::Relaxed),
@@ -277,6 +339,13 @@ impl SessionState {
                     failed: acc.failed.load(Ordering::Relaxed),
                     status_429: acc.status_429.load(Ordering::Relaxed),
                     status_500: acc.status_500.load(Ordering::Relaxed),
+                    status_4xx_other: acc.status_4xx_other.load(Ordering::Relaxed),
+                    network_errors: acc.network_errors.load(Ordering::Relaxed),
+                    setup_errors: acc.setup_errors.load(Ordering::Relaxed),
+                    retry_after_count: acc.retry_after_count.load(Ordering::Relaxed),
+                    retry_after_max,
+                    latency_samples: lat.len(),
+                    status_counts,
                     latency_p50: percentile(&lat, 50.0),
                     latency_p95: percentile(&lat, 95.0),
                     latency_p99: percentile(&lat, 99.0),
@@ -337,9 +406,7 @@ pub fn start_session(config: StressTestConfig, service: Arc<AdminService>) -> (S
     // 总请求量：并发模式 = 凭证数 * 每凭证请求数；RPM 模式 = 目标速率按时长换算
     let total_requests = match mode {
         TestMode::Concurrency => cred_order.len() * rpc,
-        TestMode::Rpm => {
-            ((target_rpm as f64) * (duration_secs as f64) / 60.0).round() as usize
-        }
+        TestMode::Rpm => ((target_rpm as f64) * (duration_secs as f64) / 60.0).round() as usize,
     }
     .max(1);
 
@@ -366,6 +433,7 @@ pub fn start_session(config: StressTestConfig, service: Arc<AdminService>) -> (S
         finished: AtomicBool::new(false),
         accums,
         cred_order: cred_order.clone(),
+        clients: Mutex::new(HashMap::new()),
     });
 
     {
@@ -377,7 +445,10 @@ pub fn start_session(config: StressTestConfig, service: Arc<AdminService>) -> (S
                 .filter(|(_, s)| s.finished.load(Ordering::Relaxed))
                 .map(|(k, _)| k.clone())
                 .collect();
-            for k in stale.into_iter().take(reg.len().saturating_sub(MAX_SESSIONS) + 1) {
+            for k in stale
+                .into_iter()
+                .take(reg.len().saturating_sub(MAX_SESSIONS) + 1)
+            {
                 reg.remove(&k);
             }
         }
@@ -402,19 +473,51 @@ async fn run_one_request(
     if !state.running.load(Ordering::Relaxed) {
         return;
     }
+    // `max_tokens` 在 Kiro 原生流式协议中无等价字段；保留入参仅为 API 向后兼容。
+    // 压测器现在测的是 HTTP TTFB 并立即断流，不读取生成 body，因此不会让输出长度污染并发/RPM 统计。
+    let _ = max_tokens;
+
+    let client = match state.clients.lock() {
+        Ok(mut clients) => {
+            if let Some(client) = clients.get(&cred_id) {
+                client.clone()
+            } else {
+                match service.stress_build_client_for(cred_id as u64) {
+                    Ok(client) => {
+                        clients.insert(cred_id, client.clone());
+                        client
+                    }
+                    Err(e) => {
+                        if let Some(acc) = state.accums.get(&cred_id) {
+                            acc.record(&StressProbeResult {
+                                status: None,
+                                elapsed_ms: 0.0,
+                                outcome: StressOutcome::Setup(e.to_string()),
+                            });
+                        }
+                        state.completed.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                }
+            }
+        }
+        Err(_) => {
+            if let Some(acc) = state.accums.get(&cred_id) {
+                acc.record(&StressProbeResult {
+                    status: None,
+                    elapsed_ms: 0.0,
+                    outcome: StressOutcome::Setup("client cache poisoned".to_string()),
+                });
+            }
+            state.completed.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    };
+
     state.inflight.fetch_add(1, Ordering::Relaxed);
-    let req = TestCredentialModelRequest {
-        model: model.to_string(),
-        prompt: "ping".to_string(),
-        max_tokens,
-    };
-    let resp = service.test_credential_model(cred_id as u64, req).await;
-    let (ok, status, elapsed_ms) = match resp {
-        Ok(r) => (r.ok, r.status, r.elapsed_ms as f64),
-        Err(_) => (false, None, 0.0),
-    };
+    let probe = service.stress_probe(cred_id as u64, model, &client).await;
     if let Some(acc) = state.accums.get(&cred_id) {
-        acc.record(ok, status, elapsed_ms);
+        acc.record(&probe);
     }
     state.completed.fetch_add(1, Ordering::Relaxed);
     state.inflight.fetch_sub(1, Ordering::Relaxed);

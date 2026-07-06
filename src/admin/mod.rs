@@ -18,13 +18,14 @@
 
 mod binary_update;
 pub mod client_keys;
-pub mod groups;
 mod error;
+pub mod groups;
 mod handlers;
 mod middleware;
 pub mod proxy_pool;
 mod router;
 mod service;
+pub mod stress;
 pub mod stress_test;
 pub mod trace_db;
 pub mod types;

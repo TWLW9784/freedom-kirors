@@ -31,6 +31,13 @@ interface CredentialResult {
   failed: number
   status429: number
   status500: number
+  status4xxOther?: number
+  networkErrors?: number
+  setupErrors?: number
+  retryAfterCount?: number
+  retryAfterMax?: number | null
+  latencySamples?: number
+  statusCounts?: Record<string, number>
   latencyP50: number
   latencyP95: number
   latencyP99: number
@@ -573,7 +580,7 @@ export function StressTestPage() {
 
                     <div className="grid grid-cols-2 md:grid-cols-6 gap-4 text-sm">
                       <div>
-                        <span className="text-muted-foreground">P50:</span>
+                        <span className="text-muted-foreground">TTFB P50:</span>
                         <span className="ml-2 font-medium">{result.latencyP50.toFixed(0)}ms</span>
                       </div>
                       <div>
@@ -596,7 +603,36 @@ export function StressTestPage() {
                         <span className="text-muted-foreground">5xx:</span>
                         <span className="ml-2 font-medium text-red-500">{result.status500}</span>
                       </div>
+                      <div>
+                        <span className="text-muted-foreground">其他4xx:</span>
+                        <span className="ml-2 font-medium text-yellow-500">{result.status4xxOther || 0}</span>
+                      </div>
+                      <div>
+                        <span className="text-muted-foreground">网络错误:</span>
+                        <span className="ml-2 font-medium text-red-500">{result.networkErrors || 0}</span>
+                      </div>
+                      <div>
+                        <span className="text-muted-foreground">准备错误:</span>
+                        <span className="ml-2 font-medium text-red-500">{result.setupErrors || 0}</span>
+                      </div>
+                      <div>
+                        <span className="text-muted-foreground">延迟样本:</span>
+                        <span className="ml-2 font-medium">{result.latencySamples ?? result.total}</span>
+                      </div>
+                      <div>
+                        <span className="text-muted-foreground">Retry-After:</span>
+                        <span className="ml-2 font-medium">{result.retryAfterMax ? `${result.retryAfterMax}s` : '-'}</span>
+                      </div>
                     </div>
+
+                    {result.statusCounts && Object.keys(result.statusCounts).length > 0 && (
+                      <p className="text-xs text-muted-foreground mt-3">
+                        状态码分布: {Object.entries(result.statusCounts)
+                          .sort(([a], [b]) => Number(a) - Number(b))
+                          .map(([code, count]) => `${code}=${count}`)
+                          .join(' · ')}
+                      </p>
+                    )}
                   </Card>
                 )
               })}
