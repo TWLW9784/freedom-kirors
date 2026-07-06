@@ -23,7 +23,7 @@ use crate::kiro::model::available_models::ListAvailableModelsResponse;
 use crate::kiro::model::available_profiles::{AvailableProfile, ListAvailableProfilesResponse};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
-    ExternalIdpRefreshResponse, IdcRefreshRequest, IdcRefreshResponse, RefreshRequest,
+    ExternalIdpTokenResponse, IdcRefreshRequest, IdcRefreshResponse, RefreshRequest,
     RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
@@ -137,6 +137,13 @@ pub(crate) async fn refresh_token(
     }
 
     validate_refresh_token(credentials)?;
+
+    // 企业 SSO (external_idp) 走 IdP token 端点刷新（refresh_token grant，public client），
+    // 而非 AWS SSO OIDC / Social 端点。必须在下面的 idc/social 自动判断之前分流：
+    // external_idp 有 clientId 但无 clientSecret，落到自动判断会被误判为 social。
+    if credentials.is_external_idp_credential() {
+        return refresh_external_idp_token(credentials, config, proxy).await;
+    }
 
     // 根据 auth_method 选择刷新方式
     // 如果未指定 auth_method，根据是否有 clientId/clientSecret 自动判断
@@ -348,93 +355,51 @@ async fn refresh_idc_token(
     Ok(new_credentials)
 }
 
-/// 外部 IdP 可信 Token 端点主机后缀白名单（防 SSRF / 开放重定向）。
-const EXTERNAL_IDP_ALLOWED_HOST_SUFFIXES: &[&str] = &[
-    ".microsoftonline.com",
-    ".microsoftonline.us",
-    ".microsoftonline.cn",
-];
-
-/// 校验外部 IdP token_endpoint：必须 https + 主机在白名单后缀内。
+/// 刷新企业 SSO (external_idp, 如 Azure AD / M365 / Entra ID) Token
 ///
-/// 不依赖额外 url crate，手动解析 scheme/host。
-fn validate_external_idp_endpoint(raw_url: &str) -> anyhow::Result<()> {
-    let trimmed = raw_url.trim();
-    let rest = trimmed
-        .strip_prefix("https://")
-        .ok_or_else(|| anyhow::anyhow!("external IdP token_endpoint 必须是 https: {}", raw_url))?;
-    // authority = scheme 后到第一个 '/'、'?'、'#' 之前的部分
-    let authority_end = rest
-        .find(|c| c == '/' || c == '?' || c == '#')
-        .unwrap_or(rest.len());
-    let authority = &rest[..authority_end];
-    // 拒绝 userinfo（防止 https://evil.com@microsoftonline.com 这类绕过）
-    if authority.contains('@') {
-        bail!("external IdP token_endpoint 不允许包含 userinfo: {}", raw_url);
-    }
-    // 去掉端口
-    let host = authority
-        .rsplit_once(':')
-        .map(|(h, _)| h)
-        .unwrap_or(authority)
-        .to_ascii_lowercase();
-    if host.is_empty() {
-        bail!("external IdP token_endpoint 缺少主机: {}", raw_url);
-    }
-    // 不允许 IP 字面量
-    if host.parse::<std::net::IpAddr>().is_ok() {
-        bail!("external IdP token_endpoint 不允许使用 IP: {}", host);
-    }
-    if EXTERNAL_IDP_ALLOWED_HOST_SUFFIXES
-        .iter()
-        .any(|suffix| host.ends_with(suffix))
-    {
-        return Ok(());
-    }
-    bail!("external IdP token_endpoint 主机不在白名单: {}", host)
-}
-
-/// 刷新外部 IdP Token（external_idp / M365 / Entra ID）
-///
-/// external_idp 是 public client + PKCE 登录：刷新直接打凭据自带的
-/// `token_endpoint`（如 `login.microsoftonline.com/{tenant}/oauth2/v2.0/token`），
-/// 用 `client_id + refresh_token`，**无 client_secret**。profile_arn 不变。
+/// 通过 IdP 的 OAuth2 token 端点以 refresh_token grant 刷新（public client，无
+/// client_secret）。IdP 不返回 profileArn（由 `list_available_profiles` 用
+/// EXTERNAL_IDP token type 另行解析并回填）。
 async fn refresh_external_idp_token(
     credentials: &KiroCredentials,
     config: &Config,
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<KiroCredentials> {
-    tracing::info!("正在刷新 external IdP (M365) Token...");
+    tracing::info!("正在刷新 External IdP (企业 SSO) Token...");
 
     let refresh_token = credentials.refresh_token.as_ref().unwrap();
     let client_id = credentials
         .client_id
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("external IdP 刷新需要 clientId"))?;
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("External IdP 刷新需要 clientId"))?;
     let token_endpoint = credentials
         .token_endpoint
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("external IdP 刷新需要 tokenEndpoint"))?;
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("External IdP 刷新需要 tokenEndpoint"))?;
 
-    validate_external_idp_endpoint(token_endpoint)?;
+    // 纵深防御：外发 refreshToken 前再次校验端点在允许列表内，避免持久化的
+    // tokenEndpoint 被带外写入（备份还原 / 外部改文件）后把 refreshToken 送到非法主机。
+    crate::kiro::model::credentials::validate_external_idp_endpoint(token_endpoint)
+        .map_err(|e| anyhow::anyhow!("External IdP tokenEndpoint 被拒绝: {}", e))?;
 
     let client = build_client(proxy, 60, config.tls_backend)?;
+
+    // 表单编码 refresh_token grant；scope 中的 offline_access 是拿到（轮换后）
+    // refresh_token 的前提。reqwest 的 .form() 会自动设 Content-Type。
     let mut form: Vec<(&str, &str)> = vec![
-        ("client_id", client_id.as_str()),
+        ("client_id", client_id),
         ("grant_type", "refresh_token"),
-        ("refresh_token", refresh_token.as_str()),
+        ("refresh_token", refresh_token),
     ];
-    if let Some(scopes) = credentials.scopes.as_deref() {
-        if !scopes.trim().is_empty() {
-            form.push(("scope", scopes));
-        }
+    if let Some(scopes) = credentials.scopes.as_deref().filter(|s| !s.is_empty()) {
+        form.push(("scope", scopes));
     }
 
     let response = client
         .post(token_endpoint)
         .header("Accept", "application/json")
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("Connection", "close")
         .form(&form)
         .send()
         .await?;
@@ -443,41 +408,47 @@ async fn refresh_external_idp_token(
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
 
-        // invalid_grant → refreshToken 永久失效（被撤销/过期）
-        if (status.as_u16() == 400 || status.as_u16() == 401)
-            && body_text.contains("invalid_grant")
-        {
+        // invalid_grant → refreshToken 永久失效（Azure 返回
+        // {"error":"invalid_grant","error_description":"..."}）
+        if status.as_u16() == 400 && body_text.contains("invalid_grant") {
             return Err(RefreshTokenInvalidError {
-                message: format!("external IdP refreshToken 已失效 (invalid_grant): {}", body_text),
+                message: format!(
+                    "External IdP refreshToken 已失效 (invalid_grant): {}",
+                    body_text
+                ),
             }
             .into());
         }
 
         let error_msg = match status.as_u16() {
-            400 => "external IdP 请求参数错误或 refreshToken 无效",
-            401 => "external IdP 凭证已过期或无效，需要重新认证",
+            401 => "企业 SSO 凭证已过期或无效，需要重新认证",
             403 => "权限不足，无法刷新 Token",
             429 => "请求过于频繁，已被限流",
-            500..=599 => "服务器错误，Microsoft 身份服务暂时不可用",
-            _ => "external IdP Token 刷新失败",
+            500..=599 => "服务器错误，IdP token 端点暂时不可用",
+            _ => "External IdP Token 刷新失败",
         };
         bail!("{}: {} {}", error_msg, status, body_text);
     }
 
-    // 复用 IdcRefreshResponse 的字段集（access_token/refresh_token/expires_in/profile_arn），
-    // M365 响应为 snake_case，但 IdcRefreshResponse 是 camelCase——不匹配，用专用结构。
-    let data: ExternalIdpRefreshResponse = response.json().await?;
+    let data: ExternalIdpTokenResponse = response.json().await?;
+    if data.access_token.is_empty() {
+        bail!("External IdP Token 刷新失败: 响应缺少 access_token");
+    }
 
     let mut new_credentials = credentials.clone();
     new_credentials.access_token = Some(data.access_token);
-    if let Some(new_refresh_token) = data.refresh_token {
+
+    // 部分 IdP（Azure AD）轮换 refresh_token，部分刷新时不下发；未下发时保留旧的。
+    if let Some(new_refresh_token) = data.refresh_token.filter(|t| !t.is_empty()) {
         new_credentials.refresh_token = Some(new_refresh_token);
     }
+
     if let Some(expires_in) = data.expires_in {
         let expires_at = Utc::now() + Duration::seconds(expires_in);
         new_credentials.expires_at = Some(expires_at.to_rfc3339());
     }
-    // external_idp 刷新不返回 profile_arn，保持原值不变。
+
+    // 不改动 profile_arn：external_idp 不返回，由 resolve_profile_arn_for 解析回填。
     Ok(new_credentials)
 }
 
@@ -1855,7 +1826,13 @@ impl MultiTokenManager {
             None => return Ok(false),
         };
 
-        // 收集所有凭据
+        // 持 persist_lock 覆盖「快照 + 序列化 + 写盘」整个临界区：并发 persist 严格串行，
+        // 最后写盘者必在其临界区内重新快照到最新内存，杜绝陈旧快照覆盖已轮换的 token
+        // （issue #23 根因）。entries.lock 仅在快照期短暂持有、不跨磁盘 I/O，故不阻塞请求路由。
+        // 注：persist_lock 全仓仅此一处获取，且顺序恒为 persist_lock → entries.lock，无死锁。
+        let _write_guard = self.persist_lock.lock();
+
+        // 收集所有凭据（在 persist_lock 保护下拍快照，保证与随后的写盘原子）
         let credentials: Vec<KiroCredentials> = {
             let entries = self.entries.lock();
             entries
@@ -1873,10 +1850,10 @@ impl MultiTokenManager {
         // 序列化为 pretty JSON
         let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
 
-        // 写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
-        // 持 persist_lock 串行化整文件覆写，避免批量导入等并发场景下写盘互相踩踏。
+        // 写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）。
+        // persist_lock 已在本函数顶部持有（覆盖快照+序列化+写盘整个临界区，issue #23），
+        // 此处不再重复加锁（std Mutex 重入会死锁）。
         // 原子写（temp + rename）避免写到一半遇崩溃/磁盘满截断损坏 → 所有账号丢失。
-        let _write_guard = self.persist_lock.lock();
         crate::common::fs::write_atomic_blocking(path, &json)
             .with_context(|| format!("原子回写凭据文件失败: {:?}", path))?;
 
@@ -3474,12 +3451,8 @@ impl MultiTokenManager {
         // 5. 设置 ID 并保留用户输入的元数据
         validated_cred.id = Some(new_id);
         validated_cred.priority = new_cred.priority;
-        validated_cred.auth_method = new_cred.auth_method.map(|m| {
-            if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam") {
-                "idc".to_string()
-            } else {
-                m
-            }
+        validated_cred.auth_method = new_cred.auth_method.as_deref().map(|m| {
+            crate::kiro::model::credentials::canonicalize_auth_method_value(m).to_string()
         });
         if new_cred.profile_arn.is_some() {
             validated_cred.profile_arn = new_cred.profile_arn;
@@ -3489,6 +3462,9 @@ impl MultiTokenManager {
         validated_cred.fill_default_profile_arn();
         validated_cred.client_id = new_cred.client_id;
         validated_cred.client_secret = new_cred.client_secret;
+        validated_cred.token_endpoint = new_cred.token_endpoint;
+        validated_cred.issuer_url = new_cred.issuer_url;
+        validated_cred.scopes = new_cred.scopes;
         validated_cred.region = new_cred.region;
         validated_cred.auth_region = new_cred.auth_region;
         validated_cred.api_region = new_cred.api_region;
@@ -5615,6 +5591,37 @@ mod tests {
         let actual_id = manager.snapshot().entries[0].id;
         let reloaded = manager.try_reload_credential_from_file(actual_id);
         assert!(reloaded, "单凭据无 ID 时仍应能匹配并 reload");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// issue #23 修复：persist_credentials 原子落盘——写盘成功、内容为合法 JSON、
+    /// 且不残留临时文件（tmp+rename）。
+    #[test]
+    fn persist_credentials_writes_atomically_no_tmp_residue() {
+        let path = tmp_creds_path("persist_atomic");
+        let mut cred = KiroCredentials::default();
+        cred.id = Some(1);
+        cred.refresh_token = Some("tok_aaaa".repeat(5));
+        std::fs::write(&path, serde_json::to_vec_pretty(&[&cred]).unwrap()).unwrap();
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+
+        assert!(manager.persist_credentials().unwrap(), "persist 应写盘成功");
+
+        // 文件为合法 JSON 数组
+        let content = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(parsed.is_array(), "凭据文件应为 JSON 数组");
+        // 原子落盘后不应残留临时文件
+        let tmp = path.with_extension("json.tmp");
+        assert!(!tmp.exists(), "原子落盘后不应残留临时文件");
 
         let _ = std::fs::remove_file(&path);
     }

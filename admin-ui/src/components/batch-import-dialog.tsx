@@ -18,7 +18,7 @@ import {
   type BatchImportSummary,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
-import { extractErrorMessage, sha256Hex } from '@/lib/utils'
+import { extractErrorMessage, sha256Hex, normalizeImportAuthMethod } from '@/lib/utils'
 
 interface BatchImportDialogProps {
   open: boolean
@@ -43,6 +43,8 @@ interface CredentialInput {
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string
+  // 企业 SSO (external_idp)
+  issuerUrl?: string
 }
 
 interface VerificationResult {
@@ -205,47 +207,31 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           const clientId = cred.clientId?.trim() || undefined
           const clientSecret = cred.clientSecret?.trim() || undefined
           const tokenEndpoint = cred.tokenEndpoint?.trim() || undefined
-          const scopes = cred.scopes?.trim() || undefined
-          const declaredMethod = cred.authMethod?.trim().toLowerCase()
-          const isExternalIdp =
-            declaredMethod === 'external_idp' ||
-            declaredMethod === 'external-idp' ||
-            declaredMethod === 'externalidp' ||
-            (!!tokenEndpoint && !clientSecret)
-
-          let authMethod: 'social' | 'idc' | 'external_idp'
-          if (isExternalIdp) {
-            // 外部 IdP / M365：public client + PKCE，只需 clientId + tokenEndpoint，无 clientSecret
-            if (!clientId || !tokenEndpoint) {
-              updateResult(i, {
-                status: 'failed',
-                error: 'external_idp 模式需要同时提供 clientId 和 tokenEndpoint',
-              })
-              continue
-            }
-            authMethod = 'external_idp'
-          } else {
-            authMethod = clientId && clientSecret ? 'idc' : 'social'
-            if (authMethod === 'social' && (clientId || clientSecret)) {
-              updateResult(i, {
-                status: 'failed',
-                error: 'idc 模式需要同时提供 clientId 和 clientSecret',
-              })
-              continue
-            }
+          const { authMethod, error: authError } = normalizeImportAuthMethod(cred.authMethod, {
+            tokenEndpoint,
+            clientId,
+            clientSecret,
+          })
+          if (authError) {
+            updateResult(i, { status: 'failed', error: authError })
+            continue
           }
+          const isExternalIdp = authMethod === 'external_idp'
 
           toImport.push({
             index: i,
             req: {
               refreshToken: token,
               authMethod,
+              provider: isExternalIdp ? 'AzureAD' : undefined,
               authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
               apiRegion: cred.apiRegion?.trim() || undefined,
               clientId,
-              clientSecret,
+              // external_idp 为公共客户端，不携带 clientSecret
+              clientSecret: isExternalIdp ? undefined : clientSecret,
               tokenEndpoint,
-              scopes,
+              issuerUrl: cred.issuerUrl?.trim() || undefined,
+              scopes: cred.scopes?.trim() || undefined,
               priority: cred.priority || 0,
               machineId: cred.machineId?.trim() || undefined,
               endpoint: cred.endpoint?.trim() || undefined,
@@ -421,7 +407,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               JSON 格式凭据
             </label>
             <textarea
-              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\n支持 region 字段自动映射为 authRegion'}
+              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n企业 SSO: [{"authMethod":"external_idp","refreshToken":"...","clientId":"...","tokenEndpoint":"https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token","scopes":"...","region":"eu-central-1"}]\n\n支持 region 字段自动映射为 authRegion'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}
