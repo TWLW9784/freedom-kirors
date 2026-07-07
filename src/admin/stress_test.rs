@@ -76,6 +76,24 @@ pub struct StressTestConfig {
     #[serde(default = "default_max_tokens")]
     pub max_tokens: i32,
 
+    /// 自定义提示词（为空则回落到轻量 `ping`，保持零成本探针语义）。
+    #[serde(default)]
+    pub prompt: String,
+
+    /// 目标上下文规模（近似 token 数）。>0 时自动生成对应规模的填充上下文，
+    /// 叠加在 `prompt` 之前，用于大上下文压测。默认 0 = 不填充（沿用轻量 ping）。
+    ///
+    /// ⚠️ 计费：>0 时上游会真实消耗 input quota（每请求 ≈ ctx_tokens）。
+    #[serde(default)]
+    pub ctx_tokens: usize,
+
+    /// 是否测量完整响应时间（读完整个上游流）。
+    /// - false（默认）：只测 TTFB（拿到响应头即断连），不消耗输出 quota；
+    /// - true：读完整个响应体，测端到端时长（大上下文延迟坍缩的真实口径），
+    ///   会消耗输出 quota（受 max_tokens 约束）。
+    #[serde(default)]
+    pub measure_full_response: bool,
+
     /// 测试模式（默认并发测试，向后兼容旧前端）
     #[serde(default)]
     pub mode: TestMode,
@@ -114,6 +132,37 @@ fn default_target_rpm() -> usize {
 }
 fn default_duration_secs() -> usize {
     60
+}
+
+/// 根据目标 token 数构造填充上下文（英文约 4 char/token）。
+///
+/// 用可复现的重复段落拼接，带递增序号避免上游去重/缓存干扰。返回最终 prompt：
+/// - `ctx_tokens == 0`：直接用 `base`（为空则 `ping`）；
+/// - `ctx_tokens > 0`：生成 ≈ `ctx_tokens` 规模填充，末尾拼接 `base`。
+fn build_stress_prompt(base: &str, ctx_tokens: usize) -> String {
+    let base = base.trim();
+    if ctx_tokens == 0 {
+        return if base.is_empty() {
+            "ping".to_string()
+        } else {
+            base.to_string()
+        };
+    }
+    let target_chars = ctx_tokens.saturating_mul(4);
+    let para = "The quick brown fox jumps over the lazy dog near the riverbank while the sun \
+sets slowly over distant hills. Data point %N records temperature, humidity, and \
+barometric pressure for downstream statistical analysis and reporting. ";
+    let mut buf = String::with_capacity(target_chars + base.len() + 16);
+    let mut i: usize = 0;
+    while buf.len() < target_chars {
+        buf.push_str(&para.replace("%N", &i.to_string()));
+        i += 1;
+    }
+    if !base.is_empty() {
+        buf.push('\n');
+        buf.push_str(base);
+    }
+    buf
 }
 
 /// 单凭证累加器（运行期使用原子量 + 延迟列表）
@@ -208,6 +257,12 @@ struct SessionState {
     requests_per_credential: usize,
     target_rpm: usize,
     duration_secs: usize,
+    /// 构造好的 prompt（含大上下文填充），创建时一次性生成并共享
+    prompt: Arc<String>,
+    /// 上下文规模（近似 token），仅用于展示
+    ctx_tokens: usize,
+    /// 是否测完整响应
+    measure_full_response: bool,
     started_at: Instant,
     total_requests: usize,
     completed: AtomicUsize,
@@ -242,9 +297,36 @@ pub struct CredentialTestResult {
     pub retry_after_max: Option<f64>,
     pub latency_samples: usize,
     pub status_counts: HashMap<u16, usize>,
+    pub latency_min: f64,
+    pub latency_mean: f64,
     pub latency_p50: f64,
     pub latency_p95: f64,
     pub latency_p99: f64,
+    pub latency_p999: f64,
+    pub latency_max: f64,
+}
+
+/// 全局聚合统计（跨所有凭证，专业压测总览）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverallStats {
+    pub total: usize,
+    pub success: usize,
+    pub failed: usize,
+    pub status_429: usize,
+    pub status_500: usize,
+    pub status_4xx_other: usize,
+    pub network_errors: usize,
+    pub setup_errors: usize,
+    pub success_rate: f64,
+    pub throttle_rate: f64,
+    pub latency_samples: usize,
+    pub latency_min: f64,
+    pub latency_mean: f64,
+    pub latency_p50: f64,
+    pub latency_p95: f64,
+    pub latency_p99: f64,
+    pub latency_p999: f64,
     pub latency_max: f64,
 }
 
@@ -261,6 +343,12 @@ pub struct StressTestStatus {
     pub target_rpm: usize,
     /// RPM 模式：持续时长（秒）
     pub duration_secs: usize,
+    /// 本次测试的上下文规模（近似 token），0 = ping 级
+    pub ctx_tokens: usize,
+    /// 延迟语义：true = 完整响应时长，false = 纯 TTFB
+    pub measure_full_response: bool,
+    /// 是否计费（ctx_tokens>0 或 measure_full_response 时为 true，前端据此告警）
+    pub billable: bool,
     pub running: bool,
     pub finished: bool,
     pub total_requests: usize,
@@ -275,6 +363,8 @@ pub struct StressTestStatus {
     pub rps: f64,
     /// 实时每分钟完成数（= rps * 60），RPM 模式用于对照目标
     pub actual_rpm: f64,
+    /// 全局聚合统计（跨所有凭证）
+    pub overall: OverallStats,
     pub results: Vec<CredentialTestResult>,
 }
 
@@ -309,6 +399,11 @@ impl SessionState {
         };
 
         let mut results = Vec::with_capacity(self.cred_order.len());
+        // 全局聚合累加器
+        let mut all_lat: Vec<f64> = Vec::new();
+        let (mut ov_total, mut ov_success, mut ov_failed) = (0usize, 0usize, 0usize);
+        let (mut ov_429, mut ov_500, mut ov_4xx) = (0usize, 0usize, 0usize);
+        let (mut ov_net, mut ov_setup) = (0usize, 0usize);
         for &cred_id in &self.cred_order {
             if let Some(acc) = self.accums.get(&cred_id) {
                 let mut lat = acc
@@ -332,27 +427,87 @@ impl SessionState {
                     .lock()
                     .map(|m| m.clone())
                     .unwrap_or_default();
+                let mean = if lat.is_empty() {
+                    0.0
+                } else {
+                    lat.iter().sum::<f64>() / lat.len() as f64
+                };
+                let t = acc.total.load(Ordering::Relaxed);
+                let s = acc.success.load(Ordering::Relaxed);
+                let f = acc.failed.load(Ordering::Relaxed);
+                let c429 = acc.status_429.load(Ordering::Relaxed);
+                let c500 = acc.status_500.load(Ordering::Relaxed);
+                let c4xx = acc.status_4xx_other.load(Ordering::Relaxed);
+                let cnet = acc.network_errors.load(Ordering::Relaxed);
+                let csetup = acc.setup_errors.load(Ordering::Relaxed);
+                ov_total += t;
+                ov_success += s;
+                ov_failed += f;
+                ov_429 += c429;
+                ov_500 += c500;
+                ov_4xx += c4xx;
+                ov_net += cnet;
+                ov_setup += csetup;
+                all_lat.extend_from_slice(&lat);
                 results.push(CredentialTestResult {
                     credential_id: cred_id,
-                    total: acc.total.load(Ordering::Relaxed),
-                    success: acc.success.load(Ordering::Relaxed),
-                    failed: acc.failed.load(Ordering::Relaxed),
-                    status_429: acc.status_429.load(Ordering::Relaxed),
-                    status_500: acc.status_500.load(Ordering::Relaxed),
-                    status_4xx_other: acc.status_4xx_other.load(Ordering::Relaxed),
-                    network_errors: acc.network_errors.load(Ordering::Relaxed),
-                    setup_errors: acc.setup_errors.load(Ordering::Relaxed),
+                    total: t,
+                    success: s,
+                    failed: f,
+                    status_429: c429,
+                    status_500: c500,
+                    status_4xx_other: c4xx,
+                    network_errors: cnet,
+                    setup_errors: csetup,
                     retry_after_count: acc.retry_after_count.load(Ordering::Relaxed),
                     retry_after_max,
                     latency_samples: lat.len(),
                     status_counts,
+                    latency_min: lat.first().copied().unwrap_or(0.0),
+                    latency_mean: mean,
                     latency_p50: percentile(&lat, 50.0),
                     latency_p95: percentile(&lat, 95.0),
                     latency_p99: percentile(&lat, 99.0),
+                    latency_p999: percentile(&lat, 99.9),
                     latency_max: lat.last().copied().unwrap_or(0.0),
                 });
             }
         }
+
+        all_lat.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let ov_mean = if all_lat.is_empty() {
+            0.0
+        } else {
+            all_lat.iter().sum::<f64>() / all_lat.len() as f64
+        };
+        let overall = OverallStats {
+            total: ov_total,
+            success: ov_success,
+            failed: ov_failed,
+            status_429: ov_429,
+            status_500: ov_500,
+            status_4xx_other: ov_4xx,
+            network_errors: ov_net,
+            setup_errors: ov_setup,
+            success_rate: if ov_total > 0 {
+                ov_success as f64 / ov_total as f64 * 100.0
+            } else {
+                0.0
+            },
+            throttle_rate: if ov_total > 0 {
+                ov_429 as f64 / ov_total as f64 * 100.0
+            } else {
+                0.0
+            },
+            latency_samples: all_lat.len(),
+            latency_min: all_lat.first().copied().unwrap_or(0.0),
+            latency_mean: ov_mean,
+            latency_p50: percentile(&all_lat, 50.0),
+            latency_p95: percentile(&all_lat, 95.0),
+            latency_p99: percentile(&all_lat, 99.0),
+            latency_p999: percentile(&all_lat, 99.9),
+            latency_max: all_lat.last().copied().unwrap_or(0.0),
+        };
 
         let progress = if self.total_requests > 0 {
             (completed as f64 / self.total_requests as f64) * 100.0
@@ -368,6 +523,9 @@ impl SessionState {
             concurrency: self.concurrency,
             target_rpm: self.target_rpm,
             duration_secs: self.duration_secs,
+            ctx_tokens: self.ctx_tokens,
+            measure_full_response: self.measure_full_response,
+            billable: self.ctx_tokens > 0 || self.measure_full_response,
             running: self.running.load(Ordering::Relaxed),
             finished: self.finished.load(Ordering::Relaxed),
             total_requests: self.total_requests,
@@ -378,6 +536,7 @@ impl SessionState {
             elapsed_ms,
             rps,
             actual_rpm: rps * 60.0,
+            overall,
             results,
         }
     }
@@ -403,6 +562,11 @@ pub fn start_session(config: StressTestConfig, service: Arc<AdminService>) -> (S
     let target_rpm = config.target_rpm.clamp(1, 600_000);
     let duration_secs = config.duration_secs.clamp(1, 3600);
 
+    // 上下文规模上限保护（避免误填天文数字导致内存爆炸），上限 2M tokens。
+    let ctx_tokens = config.ctx_tokens.min(2_000_000);
+    let measure_full_response = config.measure_full_response;
+    let prompt = Arc::new(build_stress_prompt(&config.prompt, ctx_tokens));
+
     // 总请求量：并发模式 = 凭证数 * 每凭证请求数；RPM 模式 = 目标速率按时长换算
     let total_requests = match mode {
         TestMode::Concurrency => cred_order.len() * rpc,
@@ -424,6 +588,9 @@ pub fn start_session(config: StressTestConfig, service: Arc<AdminService>) -> (S
         requests_per_credential: rpc,
         target_rpm,
         duration_secs,
+        prompt,
+        ctx_tokens,
+        measure_full_response,
         started_at: Instant::now(),
         total_requests,
         completed: AtomicUsize::new(0),
@@ -515,7 +682,16 @@ async fn run_one_request(
     };
 
     state.inflight.fetch_add(1, Ordering::Relaxed);
-    let probe = service.stress_probe(cred_id as u64, model, &client).await;
+    let probe = service
+        .stress_probe(
+            cred_id as u64,
+            model,
+            &client,
+            &state.prompt,
+            state.measure_full_response,
+            max_tokens,
+        )
+        .await;
     if let Some(acc) = state.accums.get(&cred_id) {
         acc.record(&probe);
     }
@@ -670,5 +846,40 @@ pub fn stop_session(session_id: &str) -> bool {
         true
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ctx0_returns_base_or_ping() {
+        assert_eq!(build_stress_prompt("", 0), "ping");
+        assert_eq!(build_stress_prompt("  ", 0), "ping");
+        assert_eq!(build_stress_prompt("hello", 0), "hello");
+    }
+
+    #[test]
+    fn ctx_tokens_generates_approx_scale() {
+        // 目标 1000 tokens ≈ 4000 chars，允许一段的溢出
+        let p = build_stress_prompt("", 1000);
+        assert!(p.len() >= 4000, "len={} 应 >= 4000", p.len());
+        assert!(p.len() < 4000 + 300, "len={} 溢出过大", p.len());
+    }
+
+    #[test]
+    fn ctx_tokens_appends_base_prompt() {
+        let p = build_stress_prompt("REPLY_OK", 500);
+        assert!(p.ends_with("REPLY_OK"), "末尾应拼接自定义 prompt");
+        assert!(p.len() > 2000, "应含填充上下文");
+    }
+
+    #[test]
+    fn percentile_p999_within_range() {
+        let mut v: Vec<f64> = (1..=1000).map(|x| x as f64).collect();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p999 = percentile(&v, 99.9);
+        assert!(p999 >= 999.0 && p999 <= 1000.0, "p999={}", p999);
     }
 }

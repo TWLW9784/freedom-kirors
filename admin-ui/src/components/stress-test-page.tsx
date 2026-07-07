@@ -14,6 +14,9 @@ interface StressTestConfig {
   credentialIds: number[]
   model: string
   maxTokens: number
+  prompt: string
+  ctxTokens: number
+  measureFullResponse: boolean
   mode: TestMode
   // 并发测试参数
   concurrency: number
@@ -38,9 +41,33 @@ interface CredentialResult {
   retryAfterMax?: number | null
   latencySamples?: number
   statusCounts?: Record<string, number>
+  latencyMin?: number
+  latencyMean?: number
   latencyP50: number
   latencyP95: number
   latencyP99: number
+  latencyP999?: number
+  latencyMax: number
+}
+
+interface OverallStats {
+  total: number
+  success: number
+  failed: number
+  status429: number
+  status500: number
+  status4xxOther: number
+  networkErrors: number
+  setupErrors: number
+  successRate: number
+  throttleRate: number
+  latencySamples: number
+  latencyMin: number
+  latencyMean: number
+  latencyP50: number
+  latencyP95: number
+  latencyP99: number
+  latencyP999: number
   latencyMax: number
 }
 
@@ -52,6 +79,9 @@ interface StressTestStatus {
   concurrency: number
   targetRpm: number
   durationSecs: number
+  ctxTokens: number
+  measureFullResponse: boolean
+  billable: boolean
   running: boolean
   finished: boolean
   totalRequests: number
@@ -62,6 +92,7 @@ interface StressTestStatus {
   elapsedMs: number
   rps: number
   actualRpm: number
+  overall?: OverallStats
   results: CredentialResult[]
 }
 
@@ -80,6 +111,9 @@ export function StressTestPage() {
     credentialIds: [],
     model: 'claude-opus-4.8',
     maxTokens: 4,
+    prompt: '',
+    ctxTokens: 0,
+    measureFullResponse: false,
     mode: 'concurrency',
     concurrency: 8,
     requestsPerCredential: 50,
@@ -94,6 +128,8 @@ export function StressTestPage() {
   const [rps, setRps] = useState(0)
   const [actualRpm, setActualRpm] = useState(0)
   const [inflight, setInflight] = useState(0)
+  const [overall, setOverall] = useState<OverallStats | null>(null)
+  const [billable, setBillable] = useState(false)
   const [results, setResults] = useState<CredentialResult[]>([])
   const sessionIdRef = useRef<string | null>(null)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -123,6 +159,8 @@ export function StressTestPage() {
     setRps(status.rps)
     setActualRpm(status.actualRpm)
     setInflight(status.inflightRequests)
+    setOverall(status.overall || null)
+    setBillable(status.billable || false)
     setResults(status.results)
   }
 
@@ -147,6 +185,8 @@ export function StressTestPage() {
   const estimatedTotal = config.mode === 'rpm'
     ? Math.max(1, Math.round((config.targetRpm * config.durationSecs) / 60))
     : selectedIds.length * config.requestsPerCredential
+  const estimatedInputTokens = estimatedTotal * Math.max(0, config.ctxTokens)
+  const latencyLabel = config.measureFullResponse ? '完整响应' : 'TTFB'
 
   const handleStart = async () => {
     if (selectedIds.length === 0) {
@@ -162,6 +202,8 @@ export function StressTestPage() {
     setRps(0)
     setActualRpm(0)
     setInflight(0)
+    setOverall(null)
+    setBillable(config.ctxTokens > 0 || config.measureFullResponse)
 
     const testConfig = { ...config, credentialIds: selectedIds }
 
@@ -212,6 +254,10 @@ export function StressTestPage() {
       model: config.model,
       mode: config.mode,
       maxTokens: config.maxTokens,
+      prompt: config.prompt,
+      ctxTokens: config.ctxTokens,
+      measureFullResponse: config.measureFullResponse,
+      billable,
       ...(config.mode === 'concurrency'
         ? {
             strategy: config.strategy,
@@ -227,6 +273,7 @@ export function StressTestPage() {
       completedRequests: completedReqs,
       rps,
       successRate,
+      overall,
       generatedAt: new Date().toISOString(),
       results,
     }
@@ -367,6 +414,68 @@ export function StressTestPage() {
             </div>
           </div>
 
+          {/* 负载模型：prompt / 上下文规模 / 延迟口径 */}
+          <div className="rounded-lg border p-4 space-y-3 bg-muted/20">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <label className="text-sm font-medium block">负载模型</label>
+                <p className="text-xs text-muted-foreground mt-1">
+                  默认 0 上下文 = 轻量 ping/纯 TTFB；填上下文后用于大上下文真实压测，会消耗 input quota。
+                </p>
+              </div>
+              {(config.ctxTokens > 0 || config.measureFullResponse) && (
+                <Badge variant="destructive" className="shrink-0">计费压测</Badge>
+              )}
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div>
+                <label className="text-sm font-medium mb-2 block">上下文规模（近似 tokens）</label>
+                <input
+                  type="number"
+                  value={config.ctxTokens}
+                  onChange={(e) => setConfig({ ...config, ctxTokens: Math.max(0, parseInt(e.target.value) || 0) })}
+                  min={0}
+                  max={2000000}
+                  className="w-full border rounded px-3 py-2 text-sm"
+                  disabled={testing}
+                />
+              </div>
+              <div>
+                <label className="text-sm font-medium mb-2 block">延迟口径</label>
+                <select
+                  value={config.measureFullResponse ? 'full' : 'ttfb'}
+                  onChange={(e) => setConfig({ ...config, measureFullResponse: e.target.value === 'full' })}
+                  className="w-full border rounded px-3 py-2 text-sm"
+                  disabled={testing}
+                >
+                  <option value="ttfb">TTFB（早断连，不读输出）</option>
+                  <option value="full">完整响应（读完整流）</option>
+                </select>
+              </div>
+              <div>
+                <label className="text-sm font-medium mb-2 block">估算 input tokens</label>
+                <div className="border rounded px-3 py-2 text-sm bg-background">
+                  {estimatedInputTokens.toLocaleString()}
+                </div>
+              </div>
+            </div>
+            <div>
+              <label className="text-sm font-medium mb-2 block">自定义 prompt（可选）</label>
+              <textarea
+                value={config.prompt}
+                onChange={(e) => setConfig({ ...config, prompt: e.target.value })}
+                placeholder="为空时使用 ping；填了上下文规模时会追加在大上下文后面，例如：Reply only OK。"
+                className="w-full border rounded px-3 py-2 text-sm min-h-20"
+                disabled={testing}
+              />
+            </div>
+            {(config.ctxTokens > 0 || config.measureFullResponse) && (
+              <p className="text-xs text-destructive">
+                ⚠️ 该配置会真实消耗上游额度。建议先用小请求数验证，再逐步提高并发/RPM。
+              </p>
+            )}
+          </div>
+
           {/* 并发测试参数 */}
           {config.mode === 'concurrency' && (
             <>
@@ -485,6 +594,8 @@ export function StressTestPage() {
           <div className="flex flex-wrap gap-x-6 gap-y-1 text-sm text-muted-foreground">
             <span>{progress.toFixed(1)}% 完成 ({completedReqs} / {totalReqs} 请求)</span>
             <span>实时 RPS: {rps.toFixed(1)}</span>
+            <span>延迟口径: {latencyLabel}</span>
+            {billable && <span className="text-destructive">计费压测</span>}
             {config.mode === 'rpm' && (
               <>
                 <span>实际 RPM: {actualRpm.toFixed(0)} / 目标 {config.targetRpm}</span>
@@ -504,7 +615,7 @@ export function StressTestPage() {
               <div className="flex items-center justify-between">
                 <div>
                   <p className="text-sm text-muted-foreground">总成功率</p>
-                  <p className="text-2xl font-bold">{successRate.toFixed(1)}%</p>
+                  <p className="text-2xl font-bold">{(overall?.successRate ?? successRate).toFixed(1)}%</p>
                 </div>
                 <TrendingUp className="w-8 h-8 text-green-500" />
               </div>
@@ -514,10 +625,10 @@ export function StressTestPage() {
               <div className="flex items-center justify-between">
                 <div>
                   <p className="text-sm text-muted-foreground">
-                    {config.mode === 'rpm' ? '实际 RPM' : '平均延迟 (P50)'}
+                    {config.mode === 'rpm' ? '实际 RPM' : `${latencyLabel} P50`}
                   </p>
                   <p className="text-2xl font-bold">
-                    {config.mode === 'rpm' ? actualRpm.toFixed(0) : `${avgLatency.toFixed(0)}ms`}
+                    {config.mode === 'rpm' ? actualRpm.toFixed(0) : `${(overall?.latencyP50 ?? avgLatency).toFixed(0)}ms`}
                   </p>
                 </div>
                 {config.mode === 'rpm'
@@ -530,7 +641,7 @@ export function StressTestPage() {
               <div>
                 <p className="text-sm text-muted-foreground">总请求数</p>
                 <p className="text-2xl font-bold">
-                  {results.reduce((sum, r) => sum + r.total, 0)}
+                  {overall?.total ?? results.reduce((sum, r) => sum + r.total, 0)}
                 </p>
               </div>
             </Card>
@@ -539,11 +650,24 @@ export function StressTestPage() {
               <div>
                 <p className="text-sm text-muted-foreground">429 限流</p>
                 <p className="text-2xl font-bold text-orange-500">
-                  {results.reduce((sum, r) => sum + r.status429, 0)}
+                  {overall?.status429 ?? results.reduce((sum, r) => sum + r.status429, 0)}
                 </p>
               </div>
             </Card>
           </div>
+
+          {overall && (
+            <Card className="p-4">
+              <div className="grid grid-cols-2 md:grid-cols-6 gap-4 text-sm">
+                <div><span className="text-muted-foreground">Mean:</span><span className="ml-2 font-medium">{overall.latencyMean.toFixed(0)}ms</span></div>
+                <div><span className="text-muted-foreground">P95:</span><span className="ml-2 font-medium">{overall.latencyP95.toFixed(0)}ms</span></div>
+                <div><span className="text-muted-foreground">P99:</span><span className="ml-2 font-medium">{overall.latencyP99.toFixed(0)}ms</span></div>
+                <div><span className="text-muted-foreground">P99.9:</span><span className="ml-2 font-medium">{overall.latencyP999.toFixed(0)}ms</span></div>
+                <div><span className="text-muted-foreground">Max:</span><span className="ml-2 font-medium">{overall.latencyMax.toFixed(0)}ms</span></div>
+                <div><span className="text-muted-foreground">429率:</span><span className="ml-2 font-medium text-orange-500">{overall.throttleRate.toFixed(1)}%</span></div>
+              </div>
+            </Card>
+          )}
 
           {/* 凭证详细结果 */}
           <Card className="p-6">
@@ -580,7 +704,7 @@ export function StressTestPage() {
 
                     <div className="grid grid-cols-2 md:grid-cols-6 gap-4 text-sm">
                       <div>
-                        <span className="text-muted-foreground">TTFB P50:</span>
+                        <span className="text-muted-foreground">{latencyLabel} P50:</span>
                         <span className="ml-2 font-medium">{result.latencyP50.toFixed(0)}ms</span>
                       </div>
                       <div>
@@ -590,6 +714,14 @@ export function StressTestPage() {
                       <div>
                         <span className="text-muted-foreground">P99:</span>
                         <span className="ml-2 font-medium">{result.latencyP99.toFixed(0)}ms</span>
+                      </div>
+                      <div>
+                        <span className="text-muted-foreground">P99.9:</span>
+                        <span className="ml-2 font-medium">{(result.latencyP999 || result.latencyP99).toFixed(0)}ms</span>
+                      </div>
+                      <div>
+                        <span className="text-muted-foreground">Mean:</span>
+                        <span className="ml-2 font-medium">{(result.latencyMean || result.latencyP50).toFixed(0)}ms</span>
                       </div>
                       <div>
                         <span className="text-muted-foreground">Max:</span>

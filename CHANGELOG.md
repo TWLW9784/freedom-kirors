@@ -5,6 +5,22 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
 
+## [0.6.20] - 2026-07-07
+
+主题：**压测模块专业化：支持大上下文、完整响应计时、全局聚合统计与计费护栏**。
+
+### 新增
+
+- **内置压测支持大上下文测试**：`StressTestConfig` 新增 `prompt`、`ctxTokens`、`measureFullResponse`。默认 `ctxTokens=0` 时保持原轻量 `ping` 探针语义；填入 `ctxTokens` 后自动生成指定规模的可复现填充上下文，并在末尾拼接自定义 prompt。
+- **双延迟口径**：默认继续测纯 TTFB（拿到响应头即早断连，不读输出）；开启 `measureFullResponse` 后读取完整上游流，测端到端时长，用于大上下文延迟坍缩/排队效应诊断。
+- **专业统计增强**：单凭证结果新增 `latencyMin`、`latencyMean`、`latencyP999`；状态响应新增 `overall` 全局聚合统计（成功率、429率、整体 P50/P95/P99/P99.9/Max 等）。
+- **前端压测页升级**：新增“负载模型”配置区，可设置上下文规模、延迟口径、自定义 prompt；显示估算 input tokens、计费压测红色警告、全局聚合统计卡片，并导出完整报告。
+
+### 修复
+
+- 修复测试构建中的既有问题：`credentials.rs` 测试 fixture 重复 `start_url` 字段、`token_manager.rs` 测试模块缺少 `validate_external_idp_endpoint` 引入，确保 `cargo test --no-run` 可通过。
+
+
 ## [0.6.19] - 2026-07-07
 
 主题：**延迟感知路由 + Tool Call 全链路加固 + Sonnet 5 / Fable 5 模型 + 压测探针精确化**。

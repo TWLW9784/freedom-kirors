@@ -4251,6 +4251,7 @@ impl Drop for MultiTokenManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kiro::model::credentials::validate_external_idp_endpoint;
     use std::sync::Arc;
 
     #[test]

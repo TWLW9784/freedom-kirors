@@ -16,7 +16,9 @@ use crate::kiro::auth::social;
 use crate::kiro::endpoint::{CliEndpoint, IdeEndpoint, KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::model::credentials::{normalize_import_auth_method, validate_external_idp_endpoint};
+use crate::kiro::model::credentials::{
+    normalize_import_auth_method, validate_external_idp_endpoint,
+};
 use crate::kiro::model::requests::conversation::{
     ConversationState, CurrentMessage, UserInputMessage,
 };
@@ -991,6 +993,9 @@ impl AdminService {
         id: u64,
         model: &str,
         client: &reqwest::Client,
+        prompt: &str,
+        measure_full_response: bool,
+        max_tokens: i32,
     ) -> StressProbeResult {
         // ==== 前置准备（不计入 TTFB）====
         let (token, credentials) = match self.token_manager.prepare_admin_request_token(id).await {
@@ -1035,12 +1040,18 @@ impl AdminService {
 
         let config = self.token_manager.config();
         let machine_id = machine_id::generate_from_credentials(&credentials, config);
+        let _ = max_tokens; // Kiro 原生流式无 max_tokens 等价字段，保留入参仅为语义完整
+        let probe_prompt = if prompt.trim().is_empty() {
+            "ping".to_string()
+        } else {
+            prompt.to_string()
+        };
         let request = KiroRequest {
             conversation_state: ConversationState::new(Uuid::new_v4().to_string())
                 .with_agent_task_type("vibe")
                 .with_chat_trigger_type("MANUAL")
                 .with_current_message(CurrentMessage::new(UserInputMessage::new(
-                    "ping".to_string(),
+                    probe_prompt,
                     model.to_string(),
                 ))),
             profile_arn: credentials.streaming_profile_arn(),
@@ -1074,8 +1085,8 @@ impl AdminService {
         // ==== 计时窗口：只覆盖网络往返 ====
         let start = Instant::now();
         let response = req.send().await;
-        let elapsed = start.elapsed();
-        let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
+        let ttfb = start.elapsed();
+        let ttfb_ms = ttfb.as_secs_f64() * 1000.0;
 
         match response {
             Ok(resp) => {
@@ -1085,8 +1096,21 @@ impl AdminService {
                     .get(reqwest::header::RETRY_AFTER)
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.trim().parse::<f64>().ok());
-                // 立即 drop：不读 body → 上游停止生成 → 不消耗输出 quota + inflight 时长纯 TTFB
-                drop(resp);
+                let elapsed_ms = if measure_full_response {
+                    // 读完整个响应体：测端到端时长（大上下文延迟坍缩的真实口径）。
+                    use futures::StreamExt as _;
+                    let mut stream = resp.bytes_stream();
+                    while let Some(chunk) = stream.next().await {
+                        if chunk.is_err() {
+                            break;
+                        }
+                    }
+                    start.elapsed().as_secs_f64() * 1000.0
+                } else {
+                    // 立即 drop：不读 body → 上游停止生成 → 不消耗输出 quota + 纯 TTFB
+                    drop(resp);
+                    ttfb_ms
+                };
                 StressProbeResult {
                     status: Some(status),
                     elapsed_ms,
@@ -1097,7 +1121,7 @@ impl AdminService {
             }
             Err(e) => StressProbeResult {
                 status: None,
-                elapsed_ms,
+                elapsed_ms: ttfb_ms,
                 outcome: StressOutcome::Network(e.to_string()),
             },
         }
