@@ -5,6 +5,27 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
 
+## [0.6.19] - 2026-07-07
+
+主题：**延迟感知路由 + Tool Call 全链路加固 + Sonnet 5 / Fable 5 模型 + 压测探针精确化**。
+
+> 说明：`v0.6.18` tag 打得偏早，以下功能在打 tag 之后陆续合入但未随 tag 发布，线上二进制早已包含。本版将其正式收敛为一个 release。
+
+### 新增
+
+- **balanced 模式延迟感知路由（EWMA）**：balanced 选号在健康度之外加入按凭据延迟的指数加权移动平均（EWMA），慢账号自动降权，避免流量持续打在响应慢的账号上。admin `/credentials` 端点透传 `latencyEwmaMs` 字段供前端观测。
+- **新增 Sonnet 5 / Fable 5 模型映射**：`converter` 模型映射表加入 `claude-sonnet-5`（及 thinking 变体）与 Fable 5 系列，放在 4-x 分支之前避免误判。
+- **企业 SSO（Entra ID / Azure AD）external_idp 认证**：与 0.6.18 的 M365 支持配套的模型侧改动随本版一并发布。
+
+### 修复 / 加固
+
+- **Tool Call 全链路加固 + CCH 缓存计量 + Thinking effort 修复**：规范化 tool `inputSchema` 顶层 `type` 与组合关键字（anyOf/oneOf/allOf），修复工具调用在流式/非流式路径的边界问题；缓存创建/读取（CCH）计量对齐；thinking effort 传递修复。
+- **凭据持久化原子落盘 + 串行化写盘临界区（#23）**：`token_manager` 写盘走原子 temp+rename 并串行化临界区，杜绝并发写盘竞态导致的凭据文件损坏。
+- **路由软启动隔离 + 分组无匹配凭据的错误分类**：新号软启动改用独立路由基线，`success_count` 不再串成别号数据；分组无匹配凭据时给出准确错误消息而非误导性提示，补空转重试。
+- **压测探针精确化（accurate TTFB + richer stats）**：admin 内置压测探针计时窗口只覆盖网络往返（精确 TTFB），拿到响应头即早断连（不消耗输出 quota、inflight 时长不被输出长度污染），client 复用消除 TLS 握手抖动；结果统计细分 Setup / Network / Http 失败并补充延迟分位。
+- 合入上游 `origin/master`（至 `2429e72`）及 README 更新。
+
+
 ## [0.6.18] - 2026-06-29
 
 主题：**支持 M365 / Entra ID（external_idp）凭据，并修复其去重**。
