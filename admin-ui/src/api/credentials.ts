@@ -518,6 +518,28 @@ export async function setConcurrencyConfig(
   return data
 }
 
+// 全局自定义缓存比例策略
+// mode: off（真实前缀命中模拟）/ override（强制按固定比例拆 total）/ scale（在真实命中上乘系数）
+export interface CacheRatioConfig {
+  mode: string
+  readRatio: number
+  creationRatio: number
+}
+
+// 获取全局缓存比例策略
+export async function getCacheRatioConfig(): Promise<CacheRatioConfig> {
+  const { data } = await api.get<CacheRatioConfig>('/config/cache-ratio')
+  return data
+}
+
+// 设置全局缓存比例策略（运行时即时生效并持久化）
+export async function setCacheRatioConfig(
+  patch: Partial<CacheRatioConfig>,
+): Promise<CacheRatioConfig> {
+  const { data } = await api.put<CacheRatioConfig>('/config/cache-ratio', patch)
+  return data
+}
+
 export interface LogGovernanceConfig {
   traceEnabled: boolean
   traceRetentionDays: number

@@ -20,6 +20,8 @@ import {
   setAccountThrottleConfig,
   getConcurrencyConfig,
   setConcurrencyConfig,
+  getCacheRatioConfig,
+  setCacheRatioConfig,
   getLogGovernanceConfig,
   setLogGovernanceConfig,
   resetSuccessCount,
@@ -263,6 +265,25 @@ export function useSetConcurrencyConfig() {
     mutationFn: setConcurrencyConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['concurrencyConfig'] })
+    },
+  })
+}
+
+// 获取全局缓存比例策略
+export function useCacheRatioConfig() {
+  return useQuery({
+    queryKey: ['cacheRatioConfig'],
+    queryFn: getCacheRatioConfig,
+  })
+}
+
+// 设置全局缓存比例策略
+export function useSetCacheRatioConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setCacheRatioConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['cacheRatioConfig'] })
     },
   })
 }

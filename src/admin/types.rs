@@ -29,6 +29,28 @@ where
     }))
 }
 
+/// 反序列化 `Option<Option<f64>>`，保留 0 / 负值（缓存比例允许 0）。
+/// `null` 视为清除覆盖（`Some(None)`）；具体数值为设置（`Some(Some(v))`）。
+pub fn de_opt_opt_f64_keep_zero<'de, D>(deserializer: D) -> Result<Option<Option<f64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v: Option<f64> = Option::deserialize(deserializer)?;
+    Ok(Some(v))
+}
+
+/// 反序列化 `Option<Option<String>>`：`null`/空串 视为清除覆盖（`Some(None)`）。
+pub fn de_opt_opt_string<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v: Option<String> = Option::deserialize(deserializer)?;
+    Ok(Some(match v {
+        Some(s) if !s.trim().is_empty() => Some(s),
+        _ => None,
+    }))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(default)]
@@ -597,6 +619,29 @@ pub struct SetAccountThrottleConfigRequest {
     pub cooldown_secs: Option<u64>,
 }
 
+/// 全局缓存比例策略响应。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheRatioConfigResponse {
+    /// off / override / scale
+    pub mode: String,
+    pub read_ratio: f64,
+    pub creation_ratio: f64,
+}
+
+/// 设置全局缓存比例策略；任一字段缺省表示不修改。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCacheRatioConfigRequest {
+    /// off / override / scale（大小写不敏感）
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub read_ratio: Option<f64>,
+    #[serde(default)]
+    pub creation_ratio: Option<f64>,
+}
+
 /// 档位并发配置响应（企业/Pro/Basic 默认并发 + 间隔 + 自适应开关）
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -951,6 +996,13 @@ pub struct ClientKeyItem {
     /// Credit 上限（未设置不返回）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credit_limit: Option<f64>,
+    /// per-key 缓存比例模式覆盖（off/override/scale，未覆盖不返回）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_ratio_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_ratio: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_ratio: Option<f64>,
     /// 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换）
     #[serde(default)]
     pub is_system: bool,
@@ -1005,6 +1057,13 @@ pub struct UpdateClientKeyRequest {
     /// Credit 上限：字段缺失=不改；null 或 0 = 清除限额；>0 = 设置。
     #[serde(default, deserialize_with = "crate::admin::types::de_opt_opt_f64")]
     pub credit_limit: Option<Option<f64>>,
+    /// per-key 缓存比例模式覆盖：字段缺失=不改；null/空串 = 清除覆盖；off/override/scale。
+    #[serde(default, deserialize_with = "crate::admin::types::de_opt_opt_string")]
+    pub cache_ratio_mode: Option<Option<String>>,
+    #[serde(default, deserialize_with = "crate::admin::types::de_opt_opt_f64_keep_zero")]
+    pub cache_read_ratio: Option<Option<f64>>,
+    #[serde(default, deserialize_with = "crate::admin::types::de_opt_opt_f64_keep_zero")]
+    pub cache_creation_ratio: Option<Option<f64>>,
 }
 
 // ============ IdC 设备授权登录 ============

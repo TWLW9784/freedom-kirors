@@ -35,6 +35,8 @@ pub struct AdminState {
     pub trace_store: SharedTraceStore,
     /// 账号分组注册表（持久化到 groups.json）
     pub groups: SharedGroupManager,
+    /// 中转层缓存计量器（与 anthropic 路由共享，用于读/写全局缓存比例策略）
+    pub cache_meter: Option<crate::anthropic::cache_metering::SharedCacheMeter>,
 }
 
 impl AdminState {
@@ -53,7 +55,17 @@ impl AdminState {
             usage_aggregator,
             trace_store,
             groups,
+            cache_meter: None,
         }
+    }
+
+    /// 注入共享的 CacheMeter（供全局缓存比例策略读写）。
+    pub fn with_cache_meter(
+        mut self,
+        cache_meter: Option<crate::anthropic::cache_metering::SharedCacheMeter>,
+    ) -> Self {
+        self.cache_meter = cache_meter;
+        self
     }
 }
 

@@ -1377,6 +1377,9 @@ pub struct StreamContext {
     /// 做互斥分摊：`input + cache_creation + cache_read == total`，避免把被缓存
     /// 覆盖的前缀重复计进 input_tokens。
     pub cache_usage: super::cache_metering::CacheUsage,
+    /// 自定义缓存比例策略（全局默认或 per-client-key 覆盖），影响 `resolved_usage`
+    /// 拆分口径。`Off` 时走真实前缀命中模拟（历史默认）。
+    pub cache_ratio_policy: super::cache_metering::CacheRatioPolicy,
     /// meteringEvent 上报的 credit 计费量（上游真实下发）
     pub credits: f64,
     /// 复读熔断：最近一次作为文本吐出的「尾行」内容（去空白）。
@@ -1404,7 +1407,12 @@ impl StreamContext {
     /// `input_tokens`；再由 [`CacheUsage::split_against_total`] 做互斥分摊。
     pub fn resolved_usage(&self) -> (i32, i32, i32) {
         let total_real = self.context_input_tokens.unwrap_or(self.input_tokens);
-        self.cache_usage.split_against_total(total_real)
+        if self.cache_ratio_policy.is_off() {
+            self.cache_usage.split_against_total(total_real)
+        } else {
+            self.cache_usage
+                .split_with_policy(total_real, self.cache_ratio_policy)
+        }
     }
 
     /// 工具调用 JSON 错误信息（非法 / 半截）。上层据此把本次请求记为 error、
@@ -1443,6 +1451,7 @@ impl StreamContext {
             text_block_index: None,
             strip_thinking_leading_newline: false,
             cache_usage: super::cache_metering::CacheUsage::default(),
+            cache_ratio_policy: super::cache_metering::CacheRatioPolicy::default(),
             credits: 0.0,
             repeat_guard_last_line: String::new(),
             repeat_guard_run: 0,
@@ -2528,6 +2537,11 @@ impl BufferedStreamContext {
     /// 注入由 CacheMeter 计算的缓存覆盖情况（estimate 口径），最终上报时分摊。
     pub fn set_cache_usage(&mut self, cache_usage: super::cache_metering::CacheUsage) {
         self.inner.cache_usage = cache_usage;
+    }
+
+    /// 注入自定义缓存比例策略（全局默认或 per-client-key 覆盖）。
+    pub fn set_cache_ratio_policy(&mut self, policy: super::cache_metering::CacheRatioPolicy) {
+        self.inner.cache_ratio_policy = policy;
     }
 
     /// 处理 Kiro 事件并缓冲结果

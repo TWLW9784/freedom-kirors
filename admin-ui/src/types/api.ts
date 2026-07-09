@@ -420,6 +420,10 @@ export interface ClientKeyItem {
   tokenLimit?: number
   /** Credit 上限（未设置为 undefined） */
   creditLimit?: number
+  /** per-key 缓存比例模式覆盖（off/override/scale，未覆盖为 undefined） */
+  cacheRatioMode?: string
+  cacheReadRatio?: number
+  cacheCreationRatio?: number
   /** 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换） */
   isSystem: boolean
 }
@@ -455,6 +459,10 @@ export interface UpdateClientKeyRequest {
   tokenLimit?: number | null
   /** Credit 上限：缺省=不改；null/0=清除；>0=设置 */
   creditLimit?: number | null
+  /** per-key 缓存比例模式：缺省=不改；null/空=清除覆盖；off/override/scale */
+  cacheRatioMode?: string | null
+  cacheReadRatio?: number | null
+  cacheCreationRatio?: number | null
 }
 
 // ============ 用量统计 ============

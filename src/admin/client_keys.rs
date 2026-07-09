@@ -61,6 +61,16 @@ pub struct ClientKey {
     /// None 表示不绑定分组，可使用全部账号（与 master apiKey 行为一致）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// per-key 自定义缓存比例模式覆盖（"off"/"override"/"scale"）。
+    /// None 表示该 Key 不覆盖，沿用全局策略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ratio_mode: Option<String>,
+    /// per-key 缓存读取比例/系数覆盖（含义随 mode）。None = 不覆盖。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_ratio: Option<f64>,
+    /// per-key 缓存写入比例/系数覆盖（含义随 mode）。None = 不覆盖。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_ratio: Option<f64>,
     /// 系统 Key（由 config.json apiKey bootstrap 生成，不可删除 / 不可轮换）。
     /// 老数据无此字段，默认 false。
     #[serde(default, skip_serializing_if = "is_false")]
@@ -202,6 +212,9 @@ impl ClientKeyManager {
             token_limit,
             credit_limit,
             group: group.filter(|g| !g.trim().is_empty()),
+            cache_ratio_mode: None,
+            cache_read_ratio: None,
+            cache_creation_ratio: None,
             is_system: false,
         };
         inner.by_key.insert(plaintext, id);
@@ -277,6 +290,9 @@ impl ClientKeyManager {
                     token_limit: None,
                     credit_limit: None,
                     group: None,
+                    cache_ratio_mode: None,
+                    cache_read_ratio: None,
+                    cache_creation_ratio: None,
                     is_system: true,
                 };
                 inner.by_key.insert(plaintext, id);
@@ -328,6 +344,9 @@ impl ClientKeyManager {
         group: Option<Option<String>>,
         token_limit: Option<Option<u64>>,
         credit_limit: Option<Option<f64>>,
+        cache_ratio_mode: Option<Option<String>>,
+        cache_read_ratio: Option<Option<f64>>,
+        cache_creation_ratio: Option<Option<f64>>,
     ) -> bool {
         let mut inner = self.inner.write();
         let updated = match inner.entries.get_mut(&id) {
@@ -347,6 +366,15 @@ impl ClientKeyManager {
                 if let Some(cl) = credit_limit {
                     e.credit_limit = cl;
                 }
+                if let Some(m) = cache_ratio_mode {
+                    e.cache_ratio_mode = m.filter(|s| !s.trim().is_empty());
+                }
+                if let Some(r) = cache_read_ratio {
+                    e.cache_read_ratio = r;
+                }
+                if let Some(c) = cache_creation_ratio {
+                    e.cache_creation_ratio = c;
+                }
                 true
             }
             None => false,
@@ -360,6 +388,23 @@ impl ClientKeyManager {
     /// 返回指定 Key 绑定的分组名（None 表示未绑定或 Key 不存在）
     pub fn group_of(&self, id: u64) -> Option<String> {
         self.inner.read().entries.get(&id).and_then(|e| e.group.clone())
+    }
+
+    /// 返回指定 Key 的 per-key 缓存比例覆盖（mode/read/creation 原样透传）。
+    /// 三元组均为 None 表示该 Key 不覆盖，应回退到全局策略。
+    pub fn cache_ratio_override_of(
+        &self,
+        id: u64,
+    ) -> (Option<String>, Option<f64>, Option<f64>) {
+        let inner = self.inner.read();
+        match inner.entries.get(&id) {
+            Some(e) => (
+                e.cache_ratio_mode.clone(),
+                e.cache_read_ratio,
+                e.cache_creation_ratio,
+            ),
+            None => (None, None, None),
+        }
     }
 
     /// 检查指定 Key 是否已超过配额上限。

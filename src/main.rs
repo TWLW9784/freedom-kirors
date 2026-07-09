@@ -287,6 +287,13 @@ async fn main() {
     )));
     cache_meter.clone().spawn_background();
 
+    // 从配置初始化全局缓存比例策略（运行时可经 Admin 面板热改）。
+    cache_meter.set_ratio_policy(anthropic::cache_metering::CacheRatioPolicy {
+        mode: anthropic::cache_metering::CacheRatioMode::from_str_lenient(&config.cache_ratio_mode),
+        read_ratio: config.cache_read_ratio,
+        creation_ratio: config.cache_creation_ratio,
+    });
+
     let anthropic_app = anthropic::create_router(
         Some(kiro_provider),
         config.extract_thinking,
@@ -325,7 +332,8 @@ async fn main() {
                 usage_aggregator.clone(),
                 admin_trace_store,
                 group_manager.clone(),
-            );
+            )
+            .with_cache_meter(Some(cache_meter.clone()));
 
             // 启动余额后台刷新调度器（每 5 分钟一次，与缓存 TTL 对齐）
             admin_state

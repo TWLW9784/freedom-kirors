@@ -725,6 +725,8 @@ pub async fn post_messages(
         .as_ref()
         .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
         .unwrap_or_default();
+    // 自定义缓存比例策略：per-client-key 覆盖优先，否则回退全局。
+    let cache_policy = resolve_cache_ratio_policy(&state, key_ctx.key_id);
 
     if payload.stream {
         // 流式响应
@@ -746,6 +748,7 @@ pub async fn post_messages(
             known_tool_names,
             hook,
             cache_usage,
+            cache_policy,
             tracer,
             key_ctx.group.clone(),
         )
@@ -771,11 +774,43 @@ pub async fn post_messages(
             known_tool_names,
             hook,
             cache_usage,
+            cache_policy,
             tracer,
             key_ctx.group.clone(),
         )
         .await
     }
+}
+
+/// 解析某客户端 Key 生效的缓存比例策略：per-key 覆盖优先，否则回退全局。
+///
+/// per-key 只要设置了 `cache_ratio_mode`（非空、非 off）即视为覆盖，读取其
+/// read/creation 比例（缺省按 0 处理）。未设置或为 off 时回退到 CacheMeter
+/// 的全局运行时策略。无 cache_meter 时返回 Off（等价历史真实模拟）。
+fn resolve_cache_ratio_policy(
+    state: &AppState,
+    key_id: u64,
+) -> super::cache_metering::CacheRatioPolicy {
+    use super::cache_metering::{CacheRatioMode, CacheRatioPolicy};
+    let global = state
+        .cache_meter
+        .as_ref()
+        .map(|c| c.ratio_policy())
+        .unwrap_or_default();
+    if let Some(mgr) = &state.client_keys {
+        let (mode, read, creation) = mgr.cache_ratio_override_of(key_id);
+        if let Some(mode_str) = mode {
+            let mode = CacheRatioMode::from_str_lenient(&mode_str);
+            if mode != CacheRatioMode::Off {
+                return CacheRatioPolicy {
+                    mode,
+                    read_ratio: read.unwrap_or(0.0),
+                    creation_ratio: creation.unwrap_or(0.0),
+                };
+            }
+        }
+    }
+    global
 }
 
 /// 处理流式请求
@@ -789,6 +824,7 @@ async fn handle_stream_request(
     known_tool_names: std::collections::HashSet<String>,
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
+    cache_policy: super::cache_metering::CacheRatioPolicy,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
 ) -> Response {
@@ -823,6 +859,7 @@ async fn handle_stream_request(
         known_tool_names,
     );
     ctx.cache_usage = cache_usage;
+    ctx.cache_ratio_policy = cache_policy;
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -1023,6 +1060,7 @@ async fn handle_non_stream_request(
     _known_tool_names: std::collections::HashSet<String>,
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
+    cache_policy: super::cache_metering::CacheRatioPolicy,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
 ) -> Response {
@@ -1218,9 +1256,13 @@ async fn handle_non_stream_request(
 
     // 输入 tokens：contextUsage 真实值优先，否则用客户端估算
     let total_input_tokens = resolve_usage_input_tokens(input_tokens, context_input_tokens);
-    // 互斥分摊：input + cache_creation + cache_read == total
+    // 互斥分摊：input + cache_creation + cache_read == total（自定义比例策略优先）
     let (final_input_tokens, cache_creation_tokens, cache_read_tokens) =
-        cache_usage.split_against_total(total_input_tokens);
+        if cache_policy.is_off() {
+            cache_usage.split_against_total(total_input_tokens)
+        } else {
+            cache_usage.split_with_policy(total_input_tokens, cache_policy)
+        };
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -1534,6 +1576,8 @@ pub async fn post_messages_cc(
         .as_ref()
         .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
         .unwrap_or_default();
+    // 自定义缓存比例策略：per-client-key 覆盖优先，否则回退全局。
+    let cache_policy = resolve_cache_ratio_policy(&state, key_ctx.key_id);
 
     if payload.stream {
         // 流式响应（缓冲模式）
@@ -1555,6 +1599,7 @@ pub async fn post_messages_cc(
             hook,
             total_input_tokens,
             cache_usage,
+            cache_policy,
             tracer,
             key_ctx.group.clone(),
         )
@@ -1580,6 +1625,7 @@ pub async fn post_messages_cc(
             known_tool_names,
             hook,
             cache_usage,
+            cache_policy,
             tracer,
             key_ctx.group.clone(),
         )
@@ -1601,6 +1647,7 @@ async fn handle_stream_request_buffered(
     hook: UsageRecordHook,
     fallback_input_tokens: i32,
     cache_usage: super::cache_metering::CacheUsage,
+    cache_policy: super::cache_metering::CacheRatioPolicy,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
 ) -> Response {
@@ -1634,6 +1681,7 @@ async fn handle_stream_request_buffered(
         known_tool_names,
     );
     ctx.set_cache_usage(cache_usage);
+    ctx.set_cache_ratio_policy(cache_policy);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx, hook, credential_id, tracer);

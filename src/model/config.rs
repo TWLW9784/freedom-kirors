@@ -221,6 +221,21 @@ pub struct Config {
     #[serde(default = "default_rpm_burst_enabled")]
     pub rpm_burst_enabled: bool,
 
+    /// 全局自定义缓存比例模式：off（默认、真实前缀命中模拟）/
+    /// override（强制按固定比例拆 total）/ scale（在真实命中上乘系数）。
+    /// 控制下发给下游的 cache_creation_input_tokens / cache_read_input_tokens 口径。
+    #[serde(default = "default_cache_ratio_mode")]
+    pub cache_ratio_mode: String,
+
+    /// 全局缓存读取比例/系数（含义随 cache_ratio_mode）。
+    /// override：占 total 比例；scale：真实 read 的乘数。
+    #[serde(default)]
+    pub cache_read_ratio: f64,
+
+    /// 全局缓存写入比例/系数（含义随 cache_ratio_mode）。
+    #[serde(default)]
+    pub cache_creation_ratio: f64,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -365,6 +380,10 @@ fn default_rpm_burst_enabled() -> bool {
     false
 }
 
+fn default_cache_ratio_mode() -> String {
+    "off".to_string()
+}
+
 fn default_update_auto_apply_time() -> String {
     "03:00".to_string()
 }
@@ -432,6 +451,9 @@ impl Default for Config {
             tier_min_interval_ms_basic: default_tier_min_interval_basic(),
             adaptive_concurrency_enabled: default_adaptive_concurrency_enabled(),
             rpm_burst_enabled: default_rpm_burst_enabled(),
+            cache_ratio_mode: default_cache_ratio_mode(),
+            cache_read_ratio: 0.0,
+            cache_creation_ratio: 0.0,
             extract_thinking: default_extract_thinking(),
             tool_compatibility_mode: default_tool_compatibility_mode(),
             default_endpoint: default_endpoint(),

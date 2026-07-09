@@ -105,6 +105,8 @@ impl CacheUsage {
     ///
     /// 无缓存覆盖（`cache_covered_est == 0`）或基准缺失时，直接返回
     /// `(total_real, 0, 0)`——全部计入 input，不凭空造缓存计数。
+    ///
+    /// 这是 `Off`（默认真实模拟）语义的分摊。自定义比例走 [`Self::split_with_policy`]。
     pub fn split_against_total(&self, total_real: i32) -> (i32, i32, i32) {
         let total = total_real.max(0);
         if self.cache_covered_est <= 0 || self.prompt_total_est <= 0 {
@@ -126,12 +128,130 @@ impl CacheUsage {
         let input = total - cache_total;
         (input, creation, read)
     }
+
+    /// 按给定策略做互斥分摊，返回 `(input_tokens, cache_creation, cache_read)`，
+    /// 三者恒满足 `input + creation + read == total_real`（total 为负时归零）。
+    ///
+    /// 三种模式：
+    /// - [`CacheRatioMode::Off`]：真实前缀命中模拟，等价 [`Self::split_against_total`]。
+    /// - [`CacheRatioMode::Override`]：**不看真实命中**，直接按 `read_ratio` / `creation_ratio`
+    ///   把 total 拆成 read / creation，剩余入 input（`read_ratio + creation_ratio` 已在配置
+    ///   层校验 ≤ 1，此处再 clamp 兜底）。适合人为设定下游看到的缓存占比。
+    /// - [`CacheRatioMode::Scale`]：先按真实命中算出 read / creation，再分别乘 `read_ratio` /
+    ///   `creation_ratio` 系数（>1 放大、<1 缩小、真实为 0 仍为 0），缩放后从 total 里扣出
+    ///   对应量、剩余入 input。适合在真实基础上微调。
+    pub fn split_with_policy(&self, total_real: i32, policy: CacheRatioPolicy) -> (i32, i32, i32) {
+        let total = total_real.max(0);
+        match policy.mode {
+            CacheRatioMode::Off => self.split_against_total(total),
+            CacheRatioMode::Override => {
+                if total == 0 {
+                    return (0, 0, 0);
+                }
+                let read_r = policy.read_ratio.clamp(0.0, 1.0);
+                let creation_r = policy.creation_ratio.clamp(0.0, 1.0);
+                // 兜底：两比例之和越界时按比例压回 [0,1]，避免 read+creation > total。
+                let sum = read_r + creation_r;
+                let (read_r, creation_r) = if sum > 1.0 {
+                    (read_r / sum, creation_r / sum)
+                } else {
+                    (read_r, creation_r)
+                };
+                let read = ((total as f64) * read_r).round() as i32;
+                let read = read.clamp(0, total);
+                let creation = ((total as f64) * creation_r).round() as i32;
+                let creation = creation.clamp(0, total - read);
+                let input = total - read - creation;
+                (input, creation, read)
+            }
+            CacheRatioMode::Scale => {
+                // 真实命中口径分摊出的基准 read / creation。
+                let (base_input, base_creation, base_read) = self.split_against_total(total);
+                let _ = base_input;
+                let read_r = policy.read_ratio.max(0.0);
+                let creation_r = policy.creation_ratio.max(0.0);
+                let read = ((base_read as f64) * read_r).round() as i32;
+                let read = read.clamp(0, total);
+                let creation = ((base_creation as f64) * creation_r).round() as i32;
+                let creation = creation.clamp(0, total - read);
+                let input = total - read - creation;
+                (input, creation, read)
+            }
+        }
+    }
+}
+
+/// 自定义缓存比例的三种语义。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CacheRatioMode {
+    /// 关闭自定义：沿用真实前缀命中模拟（历史默认行为）。
+    #[default]
+    Off,
+    /// 强制固定比例：忽略真实命中，直接按比例把 total 拆成 read/creation/input。
+    Override,
+    /// 系数缩放：在真实命中基础上对 read/creation 分别乘系数。
+    Scale,
+}
+
+impl CacheRatioMode {
+    /// 解析配置字符串（大小写不敏感）。未知值回退 `Off`。
+    pub fn from_str_lenient(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "override" | "fixed" => CacheRatioMode::Override,
+            "scale" | "scaled" => CacheRatioMode::Scale,
+            _ => CacheRatioMode::Off,
+        }
+    }
+
+    /// 序列化为配置字符串。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CacheRatioMode::Off => "off",
+            CacheRatioMode::Override => "override",
+            CacheRatioMode::Scale => "scale",
+        }
+    }
+}
+
+/// 一次分摊要用的自定义缓存比例策略（Copy，随请求下传）。
+///
+/// `read_ratio` / `creation_ratio` 含义随 `mode` 变化：
+/// - `Override`：占 total 的比例，二者之和应 ≤ 1（配置层校验，运行时再 clamp）。
+/// - `Scale`：真实命中量的乘数系数（1.0 = 不变）。
+/// - `Off`：忽略。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CacheRatioPolicy {
+    pub mode: CacheRatioMode,
+    pub read_ratio: f64,
+    pub creation_ratio: f64,
+}
+
+impl Default for CacheRatioPolicy {
+    fn default() -> Self {
+        Self {
+            mode: CacheRatioMode::Off,
+            read_ratio: 0.0,
+            creation_ratio: 0.0,
+        }
+    }
+}
+
+impl CacheRatioPolicy {
+    /// 是否为关闭态（等价历史默认，可跳过策略分摊直接走真实模拟）。
+    pub fn is_off(&self) -> bool {
+        self.mode == CacheRatioMode::Off
+    }
 }
 
 /// 进程内提示词缓存
 pub struct CacheMeter {
     inner: Mutex<Inner>,
     persist_path: Option<PathBuf>,
+    /// 全局自定义缓存比例策略（运行时可热改，Admin 面板/配置驱动）。
+    /// 编码：mode(u8 原子) + read/creation 比例（各存 f64.to_bits 的 u64 原子）。
+    ratio_mode: std::sync::atomic::AtomicU8,
+    ratio_read_bits: std::sync::atomic::AtomicU64,
+    ratio_creation_bits: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Default)]
@@ -165,7 +285,40 @@ impl CacheMeter {
         Self {
             inner: Mutex::new(inner),
             persist_path,
+            ratio_mode: std::sync::atomic::AtomicU8::new(0),
+            ratio_read_bits: std::sync::atomic::AtomicU64::new(0),
+            ratio_creation_bits: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// 读取当前全局缓存比例策略（运行时热值）。
+    pub fn ratio_policy(&self) -> CacheRatioPolicy {
+        use std::sync::atomic::Ordering;
+        let mode = match self.ratio_mode.load(Ordering::Relaxed) {
+            1 => CacheRatioMode::Override,
+            2 => CacheRatioMode::Scale,
+            _ => CacheRatioMode::Off,
+        };
+        CacheRatioPolicy {
+            mode,
+            read_ratio: f64::from_bits(self.ratio_read_bits.load(Ordering::Relaxed)),
+            creation_ratio: f64::from_bits(self.ratio_creation_bits.load(Ordering::Relaxed)),
+        }
+    }
+
+    /// 设置全局缓存比例策略（Admin/配置调用，线程安全热更新）。
+    pub fn set_ratio_policy(&self, policy: CacheRatioPolicy) {
+        use std::sync::atomic::Ordering;
+        let mode: u8 = match policy.mode {
+            CacheRatioMode::Off => 0,
+            CacheRatioMode::Override => 1,
+            CacheRatioMode::Scale => 2,
+        };
+        self.ratio_read_bits
+            .store(policy.read_ratio.to_bits(), Ordering::Relaxed);
+        self.ratio_creation_bits
+            .store(policy.creation_ratio.to_bits(), Ordering::Relaxed);
+        self.ratio_mode.store(mode, Ordering::Relaxed);
     }
 
     /// 查询一组前缀段哈希，返回每段命中情况；命中段会刷新 last_hit_at。
@@ -723,6 +876,98 @@ fn image_source_parts(v: &serde_json::Value) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_policy_off_equals_split_against_total() {
+        let cu = CacheUsage {
+            cache_read: 300,
+            cache_covered_est: 600,
+            prompt_total_est: 1000,
+        };
+        let a = cu.split_against_total(2000);
+        let b = cu.split_with_policy(2000, CacheRatioPolicy::default());
+        assert_eq!(a, b);
+        // 互斥和为 total。
+        assert_eq!(a.0 + a.1 + a.2, 2000);
+    }
+
+    #[test]
+    fn split_policy_override_fixed_ratio() {
+        // 不看真实命中，直接按比例拆。
+        let cu = CacheUsage::default();
+        let policy = CacheRatioPolicy {
+            mode: CacheRatioMode::Override,
+            read_ratio: 0.9,
+            creation_ratio: 0.05,
+        };
+        let (input, creation, read) = cu.split_with_policy(1000, policy);
+        assert_eq!(read, 900);
+        assert_eq!(creation, 50);
+        assert_eq!(input, 50);
+        assert_eq!(input + creation + read, 1000);
+    }
+
+    #[test]
+    fn split_policy_override_sum_over_one_normalized() {
+        let cu = CacheUsage::default();
+        let policy = CacheRatioPolicy {
+            mode: CacheRatioMode::Override,
+            read_ratio: 1.5,
+            creation_ratio: 1.5,
+        };
+        let (input, creation, read) = cu.split_with_policy(1000, policy);
+        // 归一化后各 0.5。
+        assert_eq!(input + creation + read, 1000);
+        assert_eq!(read, 500);
+        assert_eq!(creation, 500);
+        assert_eq!(input, 0);
+    }
+
+    #[test]
+    fn split_policy_scale_multiplies_real_hit() {
+        // 真实命中：covered 600 / total_est 1000, read 300 → 对 total=1000 拆出 read=300 creation=300 input=400。
+        let cu = CacheUsage {
+            cache_read: 300,
+            cache_covered_est: 600,
+            prompt_total_est: 1000,
+        };
+        let base = cu.split_against_total(1000);
+        assert_eq!(base, (400, 300, 300));
+        // scale read x1.0, creation x0.0 → read 不变、creation 归零。
+        let policy = CacheRatioPolicy {
+            mode: CacheRatioMode::Scale,
+            read_ratio: 1.0,
+            creation_ratio: 0.0,
+        };
+        let (input, creation, read) = cu.split_with_policy(1000, policy);
+        assert_eq!(read, 300);
+        assert_eq!(creation, 0);
+        assert_eq!(input, 700);
+        assert_eq!(input + creation + read, 1000);
+    }
+
+    #[test]
+    fn ratio_policy_roundtrip_on_cache_meter() {
+        let cache = CacheMeter::new(None);
+        assert!(cache.ratio_policy().is_off());
+        cache.set_ratio_policy(CacheRatioPolicy {
+            mode: CacheRatioMode::Scale,
+            read_ratio: 1.25,
+            creation_ratio: 0.5,
+        });
+        let p = cache.ratio_policy();
+        assert_eq!(p.mode, CacheRatioMode::Scale);
+        assert!((p.read_ratio - 1.25).abs() < 1e-9);
+        assert!((p.creation_ratio - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cache_ratio_mode_parse() {
+        assert_eq!(CacheRatioMode::from_str_lenient("override"), CacheRatioMode::Override);
+        assert_eq!(CacheRatioMode::from_str_lenient("SCALE"), CacheRatioMode::Scale);
+        assert_eq!(CacheRatioMode::from_str_lenient("off"), CacheRatioMode::Off);
+        assert_eq!(CacheRatioMode::from_str_lenient("garbage"), CacheRatioMode::Off);
+    }
 
     /// 测试专用：以 min_tokens=0 调用，保持加阈值前的原有判定行为。
     fn cu(cache: &CacheMeter, req: &MessagesRequest, key_id: u64) -> CacheUsage {

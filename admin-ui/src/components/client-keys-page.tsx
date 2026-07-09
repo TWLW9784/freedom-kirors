@@ -82,6 +82,9 @@ export function ClientKeysPage() {
   const [editGroup, setEditGroup] = useState('')
   const [editTokenLimit, setEditTokenLimit] = useState('')
   const [editCreditLimit, setEditCreditLimit] = useState('')
+  const [editCacheMode, setEditCacheMode] = useState('')
+  const [editCacheRead, setEditCacheRead] = useState('')
+  const [editCacheCreation, setEditCacheCreation] = useState('')
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -188,6 +191,11 @@ export function ClientKeysPage() {
     setEditGroup(item.group ?? '')
     setEditTokenLimit(item.tokenLimit != null ? String(item.tokenLimit) : '')
     setEditCreditLimit(item.creditLimit != null ? String(item.creditLimit) : '')
+    setEditCacheMode(item.cacheRatioMode ?? '')
+    setEditCacheRead(item.cacheReadRatio != null ? String(item.cacheReadRatio) : '')
+    setEditCacheCreation(
+      item.cacheCreationRatio != null ? String(item.cacheCreationRatio) : '',
+    )
     setEditOpen(true)
   }
 
@@ -204,6 +212,12 @@ export function ClientKeysPage() {
           // 空字符串 = 清除限额（传 null）；有值 = 设置
           tokenLimit: editTokenLimit.trim() ? Number(editTokenLimit) : null,
           creditLimit: editCreditLimit.trim() ? Number(editCreditLimit) : null,
+          // 缓存比例覆盖：空/off 清除覆盖（null）；否则设定 mode + 比例
+          cacheRatioMode: editCacheMode.trim() ? editCacheMode.trim() : null,
+          cacheReadRatio: editCacheRead.trim() ? Number(editCacheRead) : null,
+          cacheCreationRatio: editCacheCreation.trim()
+            ? Number(editCacheCreation)
+            : null,
         },
       })
       toast.success('已更新')
@@ -599,6 +613,55 @@ export function ClientKeysPage() {
                 />
               </div>
             </div>
+            <div>
+              <label className="text-[12px] text-muted-foreground">缓存比例覆盖</label>
+              <select
+                className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm"
+                value={editCacheMode}
+                onChange={(e) => setEditCacheMode(e.target.value)}
+                disabled={updateKey.isPending}
+              >
+                <option value="">跟随全局（不覆盖）</option>
+                <option value="off">关闭（真实命中模拟）</option>
+                <option value="override">固定比例覆盖</option>
+                <option value="scale">系数缩放</option>
+              </select>
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                选「跟随全局」清除本 Key 覆盖，用全局缓存比例策略。override：占 total 比例（两者和 ≤ 1）；scale：真实命中的乘数。
+              </p>
+            </div>
+            {editCacheMode && editCacheMode !== 'off' && (
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-[12px] text-muted-foreground">
+                    缓存读取{editCacheMode === 'override' ? '比例' : '系数'}
+                  </label>
+                  <Input
+                    type="number"
+                    min="0"
+                    step={editCacheMode === 'override' ? '0.05' : '0.1'}
+                    placeholder="0"
+                    value={editCacheRead}
+                    onChange={(e) => setEditCacheRead(e.target.value)}
+                    disabled={updateKey.isPending}
+                  />
+                </div>
+                <div>
+                  <label className="text-[12px] text-muted-foreground">
+                    缓存写入{editCacheMode === 'override' ? '比例' : '系数'}
+                  </label>
+                  <Input
+                    type="number"
+                    min="0"
+                    step={editCacheMode === 'override' ? '0.05' : '0.1'}
+                    placeholder="0"
+                    value={editCacheCreation}
+                    onChange={(e) => setEditCacheCreation(e.target.value)}
+                    disabled={updateKey.isPending}
+                  />
+                </div>
+              </div>
+            )}
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setEditOpen(false)}>取消</Button>
               <Button type="submit" disabled={updateKey.isPending}>

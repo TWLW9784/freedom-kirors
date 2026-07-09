@@ -620,6 +620,112 @@ pub async fn set_concurrency_config(
     }
 }
 
+/// GET /api/admin/config/cache-ratio
+/// 获取全局自定义缓存比例策略。
+pub async fn get_cache_ratio_config(State(state): State<AdminState>) -> impl IntoResponse {
+    use super::types::CacheRatioConfigResponse;
+    let policy = state
+        .cache_meter
+        .as_ref()
+        .map(|c| c.ratio_policy())
+        .unwrap_or_default();
+    Json(CacheRatioConfigResponse {
+        mode: policy.mode.as_str().to_string(),
+        read_ratio: policy.read_ratio,
+        creation_ratio: policy.creation_ratio,
+    })
+}
+
+/// PUT /api/admin/config/cache-ratio
+/// 设置全局自定义缓存比例策略（运行时即时生效并持久化 config.json）。
+pub async fn set_cache_ratio_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<super::types::SetCacheRatioConfigRequest>,
+) -> impl IntoResponse {
+    use crate::anthropic::cache_metering::{CacheRatioMode, CacheRatioPolicy};
+    use crate::model::config::Config;
+    use axum::http::StatusCode;
+
+    let Some(cache_meter) = state.cache_meter.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(super::types::AdminErrorResponse::not_found(
+                "缓存计量未启用".to_string(),
+            )),
+        )
+            .into_response();
+    };
+
+    // 以当前策略为基准，缺省字段不改。
+    let prev = cache_meter.ratio_policy();
+    let mode = match payload.mode {
+        Some(ref m) => CacheRatioMode::from_str_lenient(m),
+        None => prev.mode,
+    };
+    let read_ratio = payload.read_ratio.unwrap_or(prev.read_ratio);
+    let creation_ratio = payload.creation_ratio.unwrap_or(prev.creation_ratio);
+
+    // override 模式下两比例之和不得 >1（否则 read+creation 会超 total）。
+    if mode == CacheRatioMode::Override && read_ratio + creation_ratio > 1.0 + f64::EPSILON {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(super::types::AdminErrorResponse::not_found(format!(
+                "override 模式下 read_ratio + creation_ratio 必须 ≤ 1，当前 {}",
+                read_ratio + creation_ratio
+            ))),
+        )
+            .into_response();
+    }
+    if read_ratio < 0.0 || creation_ratio < 0.0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(super::types::AdminErrorResponse::not_found(
+                "缓存比例不得为负".to_string(),
+            )),
+        )
+            .into_response();
+    }
+
+    let policy = CacheRatioPolicy {
+        mode,
+        read_ratio,
+        creation_ratio,
+    };
+    // 运行时即时生效。
+    cache_meter.set_ratio_policy(policy);
+
+    // 持久化到 config.json（路径未知时仅当前进程生效）。
+    if let Some(path) = state.service.token_manager().config().config_path() {
+        let path = path.to_path_buf();
+        let mode_str = mode.as_str().to_string();
+        if let Err(e) = Config::persist_update(&path, |config| {
+            config.cache_ratio_mode = mode_str.clone();
+            config.cache_read_ratio = read_ratio;
+            config.cache_creation_ratio = creation_ratio;
+        }) {
+            // 回滚运行时值，保持与磁盘一致。
+            cache_meter.set_ratio_policy(prev);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(super::types::AdminErrorResponse::not_found(format!(
+                    "持久化缓存比例配置失败: {}",
+                    e
+                ))),
+            )
+                .into_response();
+        }
+    } else {
+        tracing::warn!("配置文件路径未知，缓存比例配置仅在当前进程生效");
+    }
+
+    Json(super::types::CacheRatioConfigResponse {
+        mode: mode.as_str().to_string(),
+        read_ratio,
+        creation_ratio,
+    })
+    .into_response()
+}
+
 /// GET /api/admin/config/log-governance
 /// 获取日志治理配置（trace 开关 / trace 保留 / usage 保留）
 pub async fn get_log_governance_config(State(state): State<AdminState>) -> impl IntoResponse {
@@ -919,6 +1025,9 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
         group: k.group.clone(),
         token_limit: k.token_limit,
         credit_limit: k.credit_limit,
+        cache_ratio_mode: k.cache_ratio_mode.clone(),
+        cache_read_ratio: k.cache_read_ratio,
+        cache_creation_ratio: k.cache_creation_ratio,
         is_system: k.is_system,
     }
 }
@@ -1025,6 +1134,9 @@ pub async fn update_client_key(
         group,
         payload.token_limit,
         payload.credit_limit,
+        payload.cache_ratio_mode,
+        payload.cache_read_ratio,
+        payload.cache_creation_ratio,
     ) {
         Json(SuccessResponse::new(format!("Key #{} 已更新", id))).into_response()
     } else {

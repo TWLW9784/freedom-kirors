@@ -13,13 +13,15 @@ use super::{
         complete_social_relogin, create_client_key, create_group, delete_client_key,
         delete_credential, delete_group, delete_proxy, disable_quota_exceeded, enable_overage_all,
         expand_credential_profiles, export_credentials, force_refresh_token,
-        get_account_throttle_config, get_all_credentials, get_concurrency_config,
+        get_account_throttle_config, get_all_credentials, get_cache_ratio_config,
+        get_concurrency_config,
         get_credential_balance, get_credential_models, get_global_proxy, get_load_balancing_mode,
         get_log_governance_config, get_proxy_pool, get_update_config, limiter_snapshots,
         list_client_keys, list_groups, list_traces, poll_idc_login, poll_idc_relogin,
         poll_social_login, poll_social_relogin, pull_update_image, reset_all_success_count,
         reset_client_key_stats, reset_failure_count, reset_success_count, rollback_image_update,
-        rotate_client_key, set_account_throttle_config, set_client_key_disabled,
+        rotate_client_key, set_account_throttle_config, set_cache_ratio_config,
+        set_client_key_disabled,
         set_concurrency_config, set_credential_disabled, set_credential_max_in_flight,
         set_credential_overage, set_credential_priority, set_credential_weight, set_global_proxy,
         set_load_balancing_mode, set_log_governance_config, set_proxy_enabled, set_update_config,
@@ -112,6 +114,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/concurrency",
             get(get_concurrency_config).put(set_concurrency_config),
+        )
+        .route(
+            "/config/cache-ratio",
+            get(get_cache_ratio_config).put(set_cache_ratio_config),
         )
         .route(
             "/config/log-governance",
