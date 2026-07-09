@@ -1463,7 +1463,19 @@ impl StreamContext {
     }
 
     /// 生成 message_start 事件
+    ///
+    /// 实时流式下 message_start 先发估算值（此时还没拿到上游 contextUsage 的
+    /// total 真值）。若启用了自定义缓存比例（override/scale），同步把估算 total
+    /// 按策略拆分后下发。否则下游计费（如 NewAPI）会取 message_start 里未经
+    /// override 的原始 input、再配 message_delta 的缓存字段，导致口径不一致、
+    /// input 虚高、缓存占比被稀释。
     pub fn create_message_start_event(&self) -> serde_json::Value {
+        let (input_tokens, cache_creation, cache_read) = if self.cache_ratio_policy.is_off() {
+            (self.input_tokens, 0, 0)
+        } else {
+            self.cache_usage
+                .split_with_policy(self.input_tokens, self.cache_ratio_policy)
+        };
         json!({
             "type": "message_start",
             "message": {
@@ -1475,10 +1487,10 @@ impl StreamContext {
                 "stop_reason": null,
                 "stop_sequence": null,
                 "usage": {
-                    "input_tokens": self.input_tokens,
+                    "input_tokens": input_tokens,
                     "output_tokens": 1,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
+                    "cache_creation_input_tokens": cache_creation,
+                    "cache_read_input_tokens": cache_read
                 }
             }
         })
