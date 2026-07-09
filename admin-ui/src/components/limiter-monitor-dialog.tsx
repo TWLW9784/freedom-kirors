@@ -103,19 +103,41 @@ type Health = {
   desc: string
 }
 
-/** 综合 gradient / 429 / 有无流量，给一句白话状态。 */
+/**
+ * 综合「是否被压到基准以下 + 延迟梯度 + 有无流量」给一句白话状态。
+ *
+ * ⚠️ 关键修复：不再用 **累计** throttleCount>0 当作当前状态。throttleCount 是历史累计
+ * 429 次数，只要历史上出现过一次，旧逻辑就会把通道**永久**标成「已降速」，即使早已恢复。
+ * 当前是否处于降速，用「自适应并发是否被压到起步基准以下」(currentLimit < configured) 判断——
+ * 这是控制器退避(429/软错误/延迟劣化)后仍未恢复的真实信号，会随恢复自动消失。
+ */
 function healthOf(s: LimiterSnapshot): Health {
   const hasTraffic = s.successCount > 0 || s.throttleCount > 0 || s.softErrorCount > 0 || s.inFlight > 0
-  if (s.throttleCount > 0) {
-    return { emoji: '⚠️', label: '被上游限流，已降速', tone: 'bad', desc: '触发过 429，系统已自动收紧并发等待恢复。' }
-  }
-  if (!hasTraffic || s.gradient == null) {
+  if (!hasTraffic) {
     return { emoji: '💤', label: '空闲（暂无流量）', tone: 'idle', desc: '近期没有请求经过这个通道，保持基准并发待命。' }
   }
-  if (s.gradient >= 0.9) {
+  // 被自适应控制器压到起步基准以下 = 近期触发过退避且尚未恢复。
+  const backedOff = s.currentLimit < s.configured
+  const g = s.gradient
+  if (backedOff) {
+    if (g != null && g >= 0.9) {
+      return {
+        emoji: '↗️', label: '限流后恢复中，准备提速', tone: 'warn',
+        desc: '之前被限流或明显变慢压低了并发，现在上游已恢复，系统正逐步把并发提回去。',
+      }
+    }
+    return {
+      emoji: '⚠️', label: '已降速保护上游', tone: 'bad',
+      desc: '近期触发过限流或明显变慢，系统已把并发压到起步值以下，等待上游恢复。',
+    }
+  }
+  if (g == null) {
+    return { emoji: '⏳', label: '稳住并发（样本不足）', tone: 'warn', desc: '还在采集上游响应样本，暂不调整并发。' }
+  }
+  if (g >= 0.9) {
     return { emoji: '✅', label: '健康，可继续提速', tone: 'ok', desc: '上游响应很快，系统可向上探测更高并发。' }
   }
-  if (s.gradient >= 0.72) {
+  if (g >= 0.72) {
     return { emoji: '⏳', label: '上游变慢，稳住并发', tone: 'warn', desc: '响应比最快时慢了一些，系统暂不提速以免压垮上游。' }
   }
   return { emoji: '🐢', label: '上游明显变慢，正在收敛', tone: 'bad', desc: '响应明显变慢，系统正在主动减少并发给上游喘息。' }
@@ -165,9 +187,9 @@ function LimiterRow({ snapshot: s }: { snapshot: LimiterSnapshot }) {
               <HelpCircle className="h-3 w-3 opacity-50" />
             </span>
           </Hint>
-          <Hint text={`系统起步并发为 ${s.configured}，最高可向上探测到 ${s.probeCap}。当前自动调到 ${s.currentLimit}。`}>
+          <Hint text={`系统起步并发为 ${s.configured}，被限流/变慢时最低可收缩到 1，健康时最高向上探测到 ${s.probeCap}。当前自动调到 ${s.currentLimit}。`}>
             <span className="inline-flex items-center gap-1">
-              可伸缩范围 {s.configured} ~ {s.probeCap}
+              可伸缩范围 {Math.min(s.configured, s.currentLimit)} ~ {s.probeCap}
               <HelpCircle className="h-3 w-3 opacity-50" />
             </span>
           </Hint>
