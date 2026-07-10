@@ -5,7 +5,14 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
 
-## [0.6.21] - 2026-07-10
+## [0.6.22] - 2026-07-10
+
+主题：**补齐凭据编辑的「并发上限」字段**。
+
+### 修复
+
+- **凭据编辑对话框新增「并发上限」输入框**：后端早已支持凭据级 `maxInFlight` 覆盖（`POST /credentials/{id}/max-in-flight`），但前端编辑界面缺失入口，只能在卡片上只读查看生效值。现在可在编辑对话框直接设置/清除单凭据并发上限：留空回退账号档位默认，填写正整数则覆盖（优先于全局档位），改动即时生效并持久化。
+
 
 主题：**自适应并发限流器重构 + 可配置缓存读/写比例**。
 

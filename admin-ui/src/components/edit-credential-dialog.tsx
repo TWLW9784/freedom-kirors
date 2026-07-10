@@ -19,7 +19,7 @@ import {
   SelectItem,
 } from '@/components/ui/select'
 import { Input } from '@/components/ui/input'
-import { useUpdateCredential } from '@/hooks/use-credentials'
+import { useUpdateCredential, useSetMaxInFlight } from '@/hooks/use-credentials'
 import { useGroupOptions } from '@/hooks/use-groups'
 import { getProxyPool } from '@/api/credentials'
 import { extractErrorMessage, maskProxyUrl } from '@/lib/utils'
@@ -44,6 +44,9 @@ export function EditCredentialDialog({
   const [profileArn, setProfileArn] = useState(credential.profileArn ?? '')
   const [groups, setGroups] = useState<string[]>(credential.groups ?? [])
   const [sourceChannel, setSourceChannel] = useState(credential.sourceChannel ?? '')
+  const [maxInFlight, setMaxInFlight] = useState<string>(
+    credential.maxInFlight != null ? String(credential.maxInFlight) : ''
+  )
   const [manualMode, setManualMode] = useState(false)
 
   const groupOptions = useGroupOptions()
@@ -64,14 +67,31 @@ export function EditCredentialDialog({
       setProfileArn(credential.profileArn ?? '')
       setGroups(credential.groups ?? [])
       setSourceChannel(credential.sourceChannel ?? '')
+      setMaxInFlight(credential.maxInFlight != null ? String(credential.maxInFlight) : '')
       setManualMode(false)
     }
   }, [open, credential])
 
   const { mutate, isPending } = useUpdateCredential()
+  const { mutateAsync: setMaxInFlightAsync, isPending: isSavingMif } = useSetMaxInFlight()
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
+
+    // 解析并发上限输入：空 = 清除覆盖（回退档位默认，传 null）；否则须为正整数。
+    const trimmedMif = maxInFlight.trim()
+    let parsedMif: number | null = null
+    if (trimmedMif !== '') {
+      const n = Number(trimmedMif)
+      if (!Number.isInteger(n) || n < 1) {
+        toast.error('并发上限须为 ≥1 的整数，或留空回退档位默认')
+        return
+      }
+      parsedMif = n
+    }
+    // 仅当值相对当前凭据发生变化时才调并发接口（该接口独立于更新凭据）。
+    const currentMif = credential.maxInFlight ?? null
+    const mifChanged = parsedMif !== currentMif
 
     mutate(
       {
@@ -87,7 +107,15 @@ export function EditCredentialDialog({
         },
       },
       {
-        onSuccess: (data) => {
+        onSuccess: async (data) => {
+          if (mifChanged) {
+            try {
+              await setMaxInFlightAsync({ id: credential.id, maxInFlight: parsedMif })
+            } catch (error: unknown) {
+              toast.error(`并发上限保存失败: ${extractErrorMessage(error)}`)
+              return
+            }
+          }
           toast.success(data.message)
           onOpenChange(false)
         },
@@ -187,6 +215,26 @@ export function EditCredentialDialog({
               </p>
             </div>
 
+            {/* 并发上限（凭据级覆盖） */}
+            <div className="space-y-2">
+              <label htmlFor="maxInFlight" className="text-sm font-medium">
+                并发上限（覆盖账号档位默认）
+              </label>
+              <Input
+                id="maxInFlight"
+                type="number"
+                min={1}
+                step={1}
+                placeholder={`留空回退档位默认${credential.effectiveMaxInFlight != null ? `（当前生效 ${credential.effectiveMaxInFlight}）` : ''}`}
+                value={maxInFlight}
+                onChange={(e) => setMaxInFlight(e.target.value)}
+                disabled={isPending || isSavingMif}
+              />
+              <p className="text-xs text-muted-foreground">
+                这个凭据同时允许的最大在途请求数，优先于全局并发档位默认。留空则按账号档位回退。改动即时生效并持久化，无需重启。
+              </p>
+            </div>
+
             {/* 代理配置 */}
             <div className="space-y-2">
               <label className="text-sm font-medium">代理配置</label>
@@ -265,12 +313,12 @@ export function EditCredentialDialog({
               type="button"
               variant="outline"
               onClick={() => onOpenChange(false)}
-              disabled={isPending}
+              disabled={isPending || isSavingMif}
             >
               取消
             </Button>
-            <Button type="submit" disabled={isPending}>
-              {isPending ? '保存中...' : '保存'}
+            <Button type="submit" disabled={isPending || isSavingMif}>
+              {isPending || isSavingMif ? '保存中...' : '保存'}
             </Button>
           </DialogFooter>
         </form>
