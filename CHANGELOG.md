@@ -4,6 +4,13 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.23] - 2026-07-11
+
+主题：**融合上游 v0.6.10：放宽 Admin API 请求体上限修复批量导入 413**。合并 upstream `ZyphrZero/kiro.rs` v0.6.10（PR #34，[@l-spaces](https://github.com/l-spaces)）。本地二开分支已远超上游版本号，故以合并 commit 形式吸纳上游该修复，保留全部本地生产能力（自适应限流器、压测、延迟感知路由、缓存比例、M365 凭据、原子写等）。
+
+### 🔧 修复 — Admin 批量导入 413（吸纳上游）
+
+- **Admin 路由请求体上限提升至 50MB**：为 Admin router 增加 `DefaultBodyLimit::max(50 * 1024 * 1024)`，覆盖 `POST /credentials/batch-import` 等 Admin API，避免批量导入凭据时因默认 2MB body limit 被 axum 提前拒绝（HTTP 413），与 Anthropic 路由保持一致。本地 router 的 limiter / stress-test / traces 等自研路由全部保留。
 
 ## [0.6.22] - 2026-07-10
 
