@@ -9,7 +9,7 @@ import {
   Tooltip, TooltipContent, TooltipProvider, TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { useLimiterSnapshots } from '@/hooks/use-traces'
-import type { LimiterSnapshot } from '@/types/api'
+import type { LimiterSnapshot, LimiterState } from '@/types/api'
 
 /**
  * 自包含状态的限流监控入口按钮（常驻图标，所有屏宽都显示）。
@@ -96,54 +96,57 @@ function friendlyKey(key: string): { name: string; sub: string } {
   return { name: key, sub: key }
 }
 
+type Tone = 'ok' | 'warn' | 'bad' | 'idle'
+
 type Health = {
   label: string
   emoji: string
-  tone: 'ok' | 'warn' | 'bad' | 'idle'
+  tone: Tone
   desc: string
 }
 
 /**
- * 综合「是否被压到基准以下 + 延迟梯度 + 有无流量」给一句白话状态。
- *
- * ⚠️ 关键修复：不再用 **累计** throttleCount>0 当作当前状态。throttleCount 是历史累计
- * 429 次数，只要历史上出现过一次，旧逻辑就会把通道**永久**标成「已降速」，即使早已恢复。
- * 当前是否处于降速，用「自适应并发是否被压到起步基准以下」(currentLimit < configured) 判断——
- * 这是控制器退避(429/软错误/延迟劣化)后仍未恢复的真实信号，会随恢复自动消失。
+ * 直接读后端下发的 state 状态机，前端不再用累计计数瞎猜（根除“永久已降速”）。
+ * 映射严格按规格：idle💤灰 / healthy✅绿 / probing🚀绿 / holding⏳琥珀 /
+ * backing_off⚠️红「被限流，降速保护中」/ recovering↗️琥珀「限流后恢复中」。
  */
-function healthOf(s: LimiterSnapshot): Health {
-  const hasTraffic = s.successCount > 0 || s.throttleCount > 0 || s.softErrorCount > 0 || s.inFlight > 0
-  if (!hasTraffic) {
-    return { emoji: '💤', label: '空闲（暂无流量）', tone: 'idle', desc: '近期没有请求经过这个通道，保持基准并发待命。' }
-  }
-  // 被自适应控制器压到起步基准以下 = 近期触发过退避且尚未恢复。
-  const backedOff = s.currentLimit < s.configured
-  const g = s.gradient
-  if (backedOff) {
-    if (g != null && g >= 0.9) {
+function healthOf(state: LimiterState): Health {
+  switch (state) {
+    case 'idle':
       return {
-        emoji: '↗️', label: '限流后恢复中，准备提速', tone: 'warn',
-        desc: '之前被限流或明显变慢压低了并发，现在上游已恢复，系统正逐步把并发提回去。',
+        emoji: '💤', label: '空闲（暂无流量）', tone: 'idle',
+        desc: '近期没有请求经过这个通道，保持基准并发待命。',
       }
-    }
-    return {
-      emoji: '⚠️', label: '已降速保护上游', tone: 'bad',
-      desc: '近期触发过限流或明显变慢，系统已把并发压到起步值以下，等待上游恢复。',
-    }
+    case 'backing_off':
+      return {
+        emoji: '⚠️', label: '被限流，降速保护中', tone: 'bad',
+        desc: '近期触发过限流或明显变慢，系统已把并发压到起步值以下，正处于退避静默期保护上游。',
+      }
+    case 'recovering':
+      return {
+        emoji: '↗️', label: '限流后恢复中', tone: 'warn',
+        desc: '之前被限流压低了并发，静默期已过，系统正随时间/成功逐步把并发提回基准。',
+      }
+    case 'holding':
+      return {
+        emoji: '⏳', label: '稳住并发（上游偏慢）', tone: 'warn',
+        desc: '响应比最快时慢了一些（延迟闸门压着），系统暂不提速以免压垮上游。',
+      }
+    case 'probing':
+      return {
+        emoji: '🚀', label: '探测更高并发', tone: 'ok',
+        desc: '上游很通畅，系统正在向上探测超过基准的真实容量。',
+      }
+    case 'healthy':
+    default:
+      return {
+        emoji: '✅', label: '健康', tone: 'ok',
+        desc: '上游响应正常，并发维持在基准附近，可随时向上探测。',
+      }
   }
-  if (g == null) {
-    return { emoji: '⏳', label: '稳住并发（样本不足）', tone: 'warn', desc: '还在采集上游响应样本，暂不调整并发。' }
-  }
-  if (g >= 0.9) {
-    return { emoji: '✅', label: '健康，可继续提速', tone: 'ok', desc: '上游响应很快，系统可向上探测更高并发。' }
-  }
-  if (g >= 0.72) {
-    return { emoji: '⏳', label: '上游变慢，稳住并发', tone: 'warn', desc: '响应比最快时慢了一些，系统暂不提速以免压垮上游。' }
-  }
-  return { emoji: '🐢', label: '上游明显变慢，正在收敛', tone: 'bad', desc: '响应明显变慢，系统正在主动减少并发给上游喘息。' }
 }
 
-function toneText(tone: Health['tone']): string {
+function toneText(tone: Tone): string {
   switch (tone) {
     case 'ok': return 'text-emerald-600'
     case 'warn': return 'text-amber-600'
@@ -154,9 +157,14 @@ function toneText(tone: Health['tone']): string {
 
 function LimiterRow({ snapshot: s }: { snapshot: LimiterSnapshot }) {
   const { name, sub } = friendlyKey(s.key)
-  const h = healthOf(s)
+  const h = healthOf(s.state)
   const limit = Math.max(s.currentLimit, 1)
   const usagePct = Math.min(100, Math.round((s.inFlight / limit) * 100))
+  // 累计计数是生涯累计值：仅当当前 state==backing_off 时标红（正处于降速保护），
+  // 否则中性调色——表示“历史发生过但已恢复”，避免健康通道被永久标红。
+  const active = s.state === 'backing_off'
+  const throttleTone: Tone | undefined = s.throttleCount > 0 ? (active ? 'bad' : 'warn') : undefined
+  const softErrTone: Tone | undefined = s.softErrorCount > 0 ? (active ? 'bad' : 'warn') : undefined
 
   return (
     <div className="rounded-lg border border-border/60 bg-secondary/30 px-3 py-2.5">
@@ -187,9 +195,9 @@ function LimiterRow({ snapshot: s }: { snapshot: LimiterSnapshot }) {
               <HelpCircle className="h-3 w-3 opacity-50" />
             </span>
           </Hint>
-          <Hint text={`系统起步并发为 ${s.configured}，被限流/变慢时最低可收缩到 1，健康时最高向上探测到 ${s.probeCap}。当前自动调到 ${s.currentLimit}。`}>
+          <Hint text={`系统起步并发为 ${s.baseline}，被限流/变慢时最低可收缩到 ${s.floor}，健康时最高向上探测到 ${s.ceiling}。当前自动调到 ${s.currentLimit}。`}>
             <span className="inline-flex items-center gap-1">
-              可伸缩范围 {Math.min(s.configured, s.currentLimit)} ~ {s.probeCap}
+              可伸缩范围 {s.floor} ~ {s.ceiling}
               <HelpCircle className="h-3 w-3 opacity-50" />
             </span>
           </Hint>
@@ -205,11 +213,20 @@ function LimiterRow({ snapshot: s }: { snapshot: LimiterSnapshot }) {
             tone={h.tone === 'idle' ? undefined : h.tone}
           />
         </Hint>
-        <Hint text="成功完成的请求数（近期窗口）。">
+        <Hint text="成功完成的请求数（生涯累计）。">
           <Metric label="成功" value={`${s.successCount}`} tone={s.successCount > 0 ? 'ok' : undefined} />
         </Hint>
-        <Hint text="被上游限流（429）的次数。出现就会触发自动降速。">
-          <Metric label="被限流" value={`${s.throttleCount}`} tone={s.throttleCount > 0 ? 'bad' : undefined} />
+        <Hint text="最近 60 秒滑动窗口内被限流（429）的比例。达到阈值才触发自动降速，吸收瞬时抖动。">
+          <Metric label="近期 429 率" value={formatPct(s.throttleRate)} tone={s.throttleRate > 0 ? (active ? 'bad' : 'warn') : undefined} />
+        </Hint>
+        <Hint text="距离上一次触发降速退避的时间。“—”表示从未退避过。">
+          <Metric label="上次退避" value={formatAgo(s.lastBackoffAgoMs)} tone={active ? 'bad' : undefined} />
+        </Hint>
+        <Hint text="被上游限流（429）的累计次数。达率才触发降速；变灰表示历史发生过但当前已恢复。">
+          <Metric label="被限流" value={`${s.throttleCount}`} tone={throttleTone} />
+        </Hint>
+        <Hint text="软错误（上游 5xx/524 服务端错误）累计次数。会触发自动降速；变灰表示历史发生过但当前已恢复。">
+          <Metric label="软错误" value={`${s.softErrorCount}`} tone={softErrTone} />
         </Hint>
       </div>
     </div>
@@ -223,7 +240,7 @@ function Metric({
 }: {
   label: string
   value: string
-  tone?: 'ok' | 'warn' | 'bad'
+  tone?: Tone
 }) {
   const toneClass =
     tone === 'ok'
@@ -257,4 +274,24 @@ function formatRtt(current: number | null, min: number | null): string {
   const fmt = (v: number | null) => (v == null ? '—' : v >= 1000 ? `${(v / 1000).toFixed(1)}s` : `${Math.round(v)}ms`)
   if (current == null && min == null) return '暂无样本'
   return `${fmt(current)} / 最快 ${fmt(min)}`
+}
+
+/** 滑动窗口 429 率 0.0-1.0 → 百分比。 */
+function formatPct(rate: number): string {
+  if (rate == null || Number.isNaN(rate)) return '—'
+  if (rate <= 0) return '0%'
+  const pct = rate * 100
+  return pct < 1 ? `${pct.toFixed(1)}%` : `${Math.round(pct)}%`
+}
+
+/** 距上次退避毫秒 → "Xs前"/"Xm前"/"—"。 */
+function formatAgo(ms: number | null): string {
+  if (ms == null) return '—'
+  if (ms < 0) return '—'
+  const secs = Math.round(ms / 1000)
+  if (secs < 60) return `${secs}s前`
+  const mins = Math.floor(secs / 60)
+  if (mins < 60) return `${mins}m前`
+  const hrs = Math.floor(mins / 60)
+  return `${hrs}h前`
 }

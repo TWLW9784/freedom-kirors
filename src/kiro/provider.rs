@@ -275,13 +275,23 @@ impl KiroProvider {
         }
     }
 
-    /// timeout / 524 / read error / 5xx 等软错误：该 account key 乘性退避。
+    /// 上游 5xx / 524 等账号级软错误（明确来自上游服务端）：该 account key 乘性退避。
     fn report_account_soft_error_to_limiter(&self, key: &str) {
         if !self.token_manager.adaptive_concurrency_enabled() {
             return;
         }
         if let Some(limiter) = self.account_limiters.get(key) {
-            limiter.on_soft_error();
+            limiter.on_account_soft_error();
+        }
+    }
+
+    /// reqwest timeout / connect / read 等链路层错误：**不动账号 limit**，仅累加展示计数。
+    fn report_account_link_error_to_limiter(&self, key: &str) {
+        if !self.token_manager.adaptive_concurrency_enabled() {
+            return;
+        }
+        if let Some(limiter) = self.account_limiters.get(key) {
+            limiter.note_link_error();
         }
     }
 
@@ -663,11 +673,9 @@ impl KiroProvider {
                         Some(&e.to_string()),
                         attempt_start,
                     );
-                    // timeout/read error 是压过容量拐点时最早出现的软拥塞信号，纳入限流器退避；
-                    // connect 失败更可能是代理/链路不可达，避免把它当成官方容量信号。
-                    if e.is_timeout() || !e.is_connect() {
-                        self.report_account_soft_error_to_limiter(&account_key);
-                    }
+                    // reqwest timeout/connect/read 都是链路（代理/网络）层信号，
+                    // 不是官方容量信号：仅记录展示计数，不砍账号 limit。
+                    self.report_account_link_error_to_limiter(&account_key);
                     // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
                     // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
                     last_error = Some(e.into());

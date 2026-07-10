@@ -42,7 +42,7 @@ export function useRecentStats() {
   })
 }
 
-/** 自适应限流器实时快照（按 account key）：limit/gradient/RTT/退避计数 */
+/** 自适应限流器实时快照（按 account key）：state/limit/RTT/429率/退避计数 */
 export function useLimiterSnapshots(enabled = true) {
   return useQuery({
     queryKey: ['limiter', 'snapshots'],

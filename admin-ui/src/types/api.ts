@@ -632,19 +632,41 @@ export type FailureStatsMap = Record<string, FailureStats>
 /** credentialId(字符串) → 最近调用概况 */
 export type RecentStatsMap = Record<string, RecentStats>
 
-/** 单个 account key 的自适应限流器实时状态 */
+/** 限流器状态机（后端计算下发，前端直接展示，不再用累计计数推断） */
+export type LimiterState =
+  | 'idle'
+  | 'backing_off'
+  | 'recovering'
+  | 'holding'
+  | 'probing'
+  | 'healthy'
+
+/** 单个 account key 的自适应限流器实时状态（冻结契约 v1，camelCase） */
 export interface LimiterSnapshot {
   key: string
+  /** 当前在途 */
   inFlight: number
-  configured: number
+  /** 起步基准并发（原 configured） */
+  baseline: number
+  /** 当前自适应上限 */
   currentLimit: number
-  probeCap: number
-  rttMinMs: number | null
+  /** 退避硬下限（通常 1） */
+  floor: number
+  /** 探测硬上限（原 probeCap） */
+  ceiling: number
+  /** 后端算好的状态机取值 */
+  state: LimiterState
+  /** 滑动窗口 429 率 0.0-1.0 */
+  throttleRate: number
+  /** 当前上游响应（仅展示） */
   rttCurrentMs: number | null
-  gradient: number | null
+  /** 历史最快响应（仅展示） */
+  rttMinMs: number | null
   successCount: number
   throttleCount: number
   softErrorCount: number
+  /** 距上次退避毫秒，null=从未退避 */
+  lastBackoffAgoMs: number | null
 }
 
 // ============ 账号分组（独立实体）============

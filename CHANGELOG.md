@@ -5,7 +5,24 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
 
-## [0.6.20] - 2026-07-07
+## [0.6.21] - 2026-07-10
+
+主题：**自适应并发限流器重构 + 可配置缓存读/写比例**。
+
+### 新增
+
+- **可配置缓存读/写比例**：下发给下游的 `cache_creation_input_tokens` / `cache_read_input_tokens` 计费口径可自定义，支持 off/override/scale 三种模式，全局（config.json `cacheRatioMode/cacheReadRatio/cacheCreationRatio`）+ per-client-key 两级控制，Admin API `GET/PUT /api/admin/config/cache-ratio` 热改热持久化，前端新增「缓存比例」配置对话框。
+
+### 修复 / 重构
+
+- **自适应并发限流器重构（冻结契约 v1）**：修复三大缺陷——
+  - **延迟误降速**：RTT 延迟只作提速闸门，永不主动降速；降速只信硬信号（429 滑动窗口率阈值触发、上游 5xx/524 软退避）。
+  - **闲置账号卡死**：新增时间驱动自愈 `maybe_recover`，被打到 floor 的闲置账号随时间无条件回爬到 baseline，解死锁。
+  - **configured 语义重载**：拆成 `baseline`/`floor`/`ceiling` 三个独立字段，消除监控矛盾。
+  - 链路层错误（timeout/connect/read）只记展示计数，不动账号 limit。
+  - 快照新增 `state` 状态机（idle/backing_off/recovering/holding/probing/healthy）、滑动窗口 429 率、距上次退避时间，前端徽章直接读 state，根除「永久已降速」误显示。
+- **流式 message_start 缓存比例修复**：实时流式 `/v1/messages` 的 message_start 事件补套缓存比例 policy，修复下游计费缓存占比被稀释、override 省钱效果打折的问题。
+
 
 主题：**压测模块专业化：支持大上下文、完整响应计时、全局聚合统计与计费护栏**。
 
