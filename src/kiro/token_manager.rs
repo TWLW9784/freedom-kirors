@@ -970,6 +970,8 @@ enum DisabledReason {
     InvalidRefreshToken,
     /// 凭据配置无效（如 authMethod=api_key 但缺少 kiroApiKey）
     InvalidConfig,
+    /// 账号级 429 风控（USER_REQUEST_RATE_EXCEEDED / suspicious activity）
+    AccountThrottled,
 }
 
 /// 统计数据持久化条目
@@ -2520,6 +2522,7 @@ impl MultiTokenManager {
                             DisabledReason::QuotaExceeded => "QuotaExceeded",
                             DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
                             DisabledReason::InvalidConfig => "InvalidConfig",
+                            DisabledReason::AccountThrottled => "AccountThrottled",
                         }
                         .to_string()
                     }),
@@ -2572,44 +2575,40 @@ impl MultiTokenManager {
         Ok(())
     }
 
-    /// 标记凭据进入临时冷却期（账号级 429 风控触发）
+    /// 标记凭据触发账号级 429 风控。
     ///
-    /// 与 `report_failure` 不同：不计入永久禁用，到期自动恢复，可用于"`suspicious activity` 429"
-    /// 这种短期账号级风控——当前凭据先冷却 N 分钟，故障转移到其它凭据。
+    /// 这类响应（USER_REQUEST_RATE_EXCEEDED / suspicious activity）在生产池里通常表示该
+    /// AWS 账号已被临时调查/限频；继续自动恢复容易反复撞风控，也会在重启后丢失内存冷却状态。
+    /// 因此直接自动禁用并持久化，等待人工检查后再手动启用。
     ///
-    /// 返回剩余可用凭据数（已排除冷却中的）。
-    pub fn report_account_throttled(&self, id: u64, cooldown: StdDuration) -> usize {
-        let now = Instant::now();
-        {
+    /// 返回剩余可用凭据数（已排除禁用/冷却中的）。
+    pub fn report_account_throttled(&self, id: u64, _cooldown: StdDuration) -> usize {
+        let remaining = {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                let until = now + cooldown;
-                // 取较晚的到期时间（多次触发时延长冷却）
-                entry.throttled_until = Some(match entry.throttled_until {
-                    Some(prev) if prev > until => prev,
-                    _ => until,
-                });
-                // 计入累计失败（账号风控不动连续 failure_count，避免冷却结束后误禁用）
+                entry.disabled = true;
+                entry.disabled_reason = Some(DisabledReason::AccountThrottled);
+                entry.throttled_until = None;
                 entry.total_failure_count += 1;
-                tracing::warn!(
-                    "凭据 #{} 触发账号级风控，冷却 {} 秒",
-                    id,
-                    cooldown.as_secs()
-                );
+                tracing::warn!("凭据 #{} 触发账号级风控，已自动禁用", id);
             }
 
-            let throttled_now = Instant::now();
+            let now = Instant::now();
             entries
                 .iter()
                 .filter(|e| {
                     !e.disabled
                         && !e
                             .throttled_until
-                            .map(|t| t > throttled_now)
+                            .map(|t| t > now)
                             .unwrap_or(false)
                 })
                 .count()
+        };
+        if let Err(e) = self.persist_credentials() {
+            tracing::error!("账号级风控自动禁用凭据 #{} 后持久化失败: {}", id, e);
         }
+        remaining
     }
 
     /// 手动解除指定凭据的临时冷却（Admin API）

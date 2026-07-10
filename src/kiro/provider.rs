@@ -842,9 +842,8 @@ impl KiroProvider {
                     .unwrap_or(0);
                 self.report_account_throttle_to_limiter(&account_key, observed_in_flight);
                 tracing::warn!(
-                    "API 请求失败（账号级风控，凭据 #{} 冷却 {}s 并切换，触发时并发 {}，尝试 {}/{}）: {}",
+                    "API 请求失败（账号级风控，凭据 #{} 自动禁用并切换，触发时并发 {}，尝试 {}/{}）: {}",
                     ctx.id,
-                    cooldown_secs,
                     observed_in_flight,
                     attempt + 1,
                     max_retries,
@@ -865,20 +864,19 @@ impl KiroProvider {
                     attempt_start,
                 );
                 last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败（账号级风控，凭据 #{} 已冷却 {} 分钟）: {} {}",
+                    "{} API 请求失败（账号级风控，凭据 #{} 已自动禁用）: {} {}",
                     api_type,
                     ctx.id,
-                    cooldown_secs / 60,
                     status,
                     body
                 ));
 
                 if remaining == 0 {
                     anyhow::bail!(
-                        "{} API 请求失败：所有凭据都处于账号风控冷却或已禁用状态。\
+                        "{} API 请求失败：所有可用凭据都已因账号风控被自动禁用或原本禁用。\
                          上游对凭据 #{} 的账号触发了 \"suspicious activity\" 临时限速，\
                          建议：(1) 增加更多不同 AWS 账号的凭据；\
-                         (2) 在管理面板降低冷却时长或手动解除冷却以重试；\
+                         (2) 在管理面板检查 AccountThrottled 凭据并人工确认后再启用；\
                          (3) 提交 AWS Support 申诉解封该账号。原始响应: {} {}",
                         api_type,
                         ctx.id,

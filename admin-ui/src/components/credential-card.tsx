@@ -183,6 +183,8 @@ function getDisabledReasonStyle(reason?: string | null): {
       return { label: "Token 失效", variant: "destructive" };
     case "InvalidConfig":
       return { label: "配置无效", variant: "destructive" };
+    case "AccountThrottled":
+      return { label: "账号风控", variant: "destructive" };
     case "Manual":
       return { label: "手动禁用", variant: "secondary" };
     default:
