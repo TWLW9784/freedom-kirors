@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
+use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::kiro_version::USAGE_API_KIRO_VERSION;
 use crate::kiro::machine_id;
 use crate::kiro::model::available_models::ListAvailableModelsResponse;
@@ -212,8 +213,14 @@ async fn refresh_social_token(
         .await?;
 
     let status = response.status();
+    let rate_limit_error = (status.as_u16() == 429)
+        .then(|| UpstreamRateLimitError::from_headers(response.headers()));
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
+
+        if let Some(error) = rate_limit_error {
+            return Err(error.into());
+        }
 
         // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
         if status.as_u16() == 400
@@ -309,8 +316,14 @@ async fn refresh_idc_token(
         .await?;
 
     let status = response.status();
+    let rate_limit_error = (status.as_u16() == 429)
+        .then(|| UpstreamRateLimitError::from_headers(response.headers()));
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
+
+        if let Some(error) = rate_limit_error {
+            return Err(error.into());
+        }
 
         // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
         if status.as_u16() == 400
@@ -405,8 +418,14 @@ async fn refresh_external_idp_token(
         .await?;
 
     let status = response.status();
+    let rate_limit_error = (status.as_u16() == 429)
+        .then(|| UpstreamRateLimitError::from_headers(response.headers()));
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
+
+        if let Some(error) = rate_limit_error {
+            return Err(error.into());
+        }
 
         // invalid_grant → refreshToken 永久失效（Azure 返回
         // {"error":"invalid_grant","error_description":"..."}）
@@ -499,6 +518,19 @@ fn rest_api_region_candidates_for_credentials(
     rest_api_region_candidates(credentials.effective_auth_region(config))
 }
 
+fn usage_limits_url(host: &str, _credentials: &KiroCredentials) -> String {
+    // Kiro 0.9.2 accepts these REST calls without profileArn. A resolved ARN is
+    // only for the streaming endpoint and makes this legacy request malformed.
+    format!(
+        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
+        host
+    )
+}
+
+fn available_models_url(host: &str, _credentials: &KiroCredentials) -> String {
+    format!("https://{}/ListAvailableModels?origin=AI_EDITOR", host)
+}
+
 /// 获取使用额度信息
 pub(crate) async fn get_usage_limits(
     credentials: &KiroCredentials,
@@ -514,11 +546,9 @@ pub(crate) async fn get_usage_limits(
     let os_name = &config.system_version;
     let node_version = &config.node_version;
 
-    // 真实 profileArn 只放 header，不放 query。
-    // 实测 eu-central-1 + CLI 可用 profile 若使用 ?profileArn=... 会返回 400/403；
-    // x-amzn-kiro-profile-arn header 可正常刷新额度。
-    let profile_arn_header = credentials.effective_profile_arn().map(str::to_string);
-
+    // 旧版 REST GET 不携带 profileArn（上游修复）：Kiro 0.9.2 兼容协议下真实 ARN
+    // 仅用于流式端点，在 getUsageLimits / ListAvailableModels 上会被判为格式错误。
+    // 构建 User-Agent headers
     let user_agent = format!(
         "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
         os_name, node_version, kiro_version, machine_id
@@ -530,10 +560,7 @@ pub(crate) async fn get_usage_limits(
     let mut last_error: Option<String> = None;
     for (idx, region) in candidates.iter().enumerate() {
         let host = format!("q.{}.amazonaws.com", region);
-        let url = format!(
-            "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
-            host
-        );
+        let url = usage_limits_url(&host, credentials);
 
         let mut request = client
             .get(&url)
@@ -545,21 +572,25 @@ pub(crate) async fn get_usage_limits(
             .header("Authorization", format!("Bearer {}", token))
             .header("Connection", "close");
 
-        if let Some(arn) = profile_arn_header.as_deref() {
-            request = request.header("x-amzn-kiro-profile-arn", arn);
-        }
         if let Some(token_type) = credentials.token_type_header() {
             request = request.header("tokentype", token_type);
         }
 
         let response = request.send().await?;
         let status = response.status();
+        let rate_limit_error = (status.as_u16() == 429)
+            .then(|| UpstreamRateLimitError::from_headers(response.headers()));
         if status.is_success() {
             let data: UsageLimitsResponse = response.json().await?;
             return Ok(data);
         }
 
         let body_text = response.text().await.unwrap_or_default();
+        if let Some(error) = rate_limit_error {
+            return Err(error.into());
+        }
+
+        // 403 且仍有备用端点时，尝试下一个区域端点（Enterprise/IdC 跨区兼容）
         if status.as_u16() == 403 && idx + 1 < candidates.len() {
             tracing::debug!(
                 "getUsageLimits 在 {} 返回 403，尝试备用端点 {}",
@@ -604,8 +635,9 @@ pub(crate) async fn get_available_models(
     let kiro_version = USAGE_API_KIRO_VERSION;
     let os_name = &config.system_version;
     let node_version = &config.node_version;
-    let profile_arn_header = credentials.effective_profile_arn().map(str::to_string);
 
+    // 旧版 REST GET 不携带 profileArn（上游修复），与 get_usage_limits 保持一致。
+    // 构建 User-Agent headers（与 get_usage_limits 保持一致）
     let user_agent = format!(
         "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
         os_name, node_version, kiro_version, machine_id
@@ -617,7 +649,7 @@ pub(crate) async fn get_available_models(
     let mut last_error: Option<String> = None;
     for (idx, region) in candidates.iter().enumerate() {
         let host = format!("q.{}.amazonaws.com", region);
-        let url = format!("https://{}/ListAvailableModels?origin=AI_EDITOR", host);
+        let url = available_models_url(&host, credentials);
 
         let mut request = client
             .get(&url)
@@ -629,21 +661,25 @@ pub(crate) async fn get_available_models(
             .header("Authorization", format!("Bearer {}", token))
             .header("Connection", "close");
 
-        if let Some(arn) = profile_arn_header.as_deref() {
-            request = request.header("x-amzn-kiro-profile-arn", arn);
-        }
         if let Some(token_type) = credentials.token_type_header() {
             request = request.header("tokentype", token_type);
         }
 
         let response = request.send().await?;
         let status = response.status();
+        let rate_limit_error = (status.as_u16() == 429)
+            .then(|| UpstreamRateLimitError::from_headers(response.headers()));
         if status.is_success() {
             let data: ListAvailableModelsResponse = response.json().await?;
             return Ok(data);
         }
 
         let body_text = response.text().await.unwrap_or_default();
+        if let Some(error) = rate_limit_error {
+            return Err(error.into());
+        }
+
+        // 403 且仍有备用端点时，尝试下一个区域端点（Enterprise/IdC 跨区兼容）
         if status.as_u16() == 403 && idx + 1 < candidates.len() {
             tracing::debug!(
                 "ListAvailableModels 在 {} 返回 403，尝试备用端点 {}",
@@ -749,6 +785,8 @@ pub(crate) async fn list_available_profiles(
 
             let response = request.send().await?;
             let status = response.status();
+            let rate_limit_error = (status.as_u16() == 429)
+                .then(|| UpstreamRateLimitError::from_headers(response.headers()));
 
             if status.is_success() {
                 let data: ListAvailableProfilesResponse = response.json().await?;
@@ -778,6 +816,11 @@ pub(crate) async fn list_available_profiles(
             }
 
             let body_text = response.text().await.unwrap_or_default();
+            // 上游 429：停止后续模型请求并原样传播 Retry-After，
+            // 不再吞掉限流后继续使用缺失或占位 profileArn。
+            if let Some(error) = rate_limit_error {
+                return Err(error.into());
+            }
             last_error = Some(format!("{} {}", status, body_text));
             tracing::debug!(
                 "ListAvailableProfiles 在 {} 返回 {}，继续尝试其它候选端点",
@@ -872,11 +915,16 @@ pub(crate) async fn set_user_preference(
         let response = request.send().await?;
 
         let status = response.status();
+        let rate_limit_error = (status.as_u16() == 429)
+            .then(|| UpstreamRateLimitError::from_headers(response.headers()));
         if status.is_success() {
             return Ok(());
         }
 
         let body_text = response.text().await.unwrap_or_default();
+        if let Some(error) = rate_limit_error {
+            return Err(error.into());
+        }
 
         // 403 且仍有备用端点时，尝试下一个区域端点（Enterprise/IdC 跨区兼容）
         if status.as_u16() == 403 && idx + 1 < candidates.len() {
@@ -1455,6 +1503,30 @@ impl MultiTokenManager {
             .count()
     }
 
+    /// 获取当前请求范围内的可用凭据数量。
+    ///
+    /// 与全局 [`Self::available_count`] 不同，这里同时应用模型能力和客户端 Key
+    /// 绑定的分组过滤，供严格隔离场景判断是否还能故障转移。
+    pub fn available_count_for_request(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> usize {
+        let now = Instant::now();
+        self.entries
+            .lock()
+            .iter()
+            .filter(|entry| {
+                !entry.disabled
+                    && !entry
+                        .throttled_until
+                        .map(|until| until > now)
+                        .unwrap_or(false)
+                    && credential_matches_request(&entry.credentials, model, group)
+            })
+            .count()
+    }
+
     /// 根据负载均衡模式选择下一个凭据
     ///
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
@@ -1647,17 +1719,9 @@ impl MultiTokenManager {
                     return Ok(ctx);
                 }
                 Err(e) => {
-                    let has_available = if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
-                        // 先尝试从源文件重新加载（适用于 IDE 退出后 token rotation 导致失效的场景）
-                        if self.try_reload_credential_from_file(id) {
-                            // 找到新 Token，不计入失败次数，直接重试
-                            continue;
-                        }
-                        tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
-                        self.report_refresh_token_invalid(id)
-                    } else {
-                        tracing::warn!("凭据 #{} Token 刷新失败: {}", id, e);
-                        self.report_refresh_failure(id)
+                    let Some(has_available) = self.handle_token_refresh_error(id, e)? else {
+                        // 从源文件加载到了轮换后的 Token，不计失败次数，直接重试。
+                        continue;
                     };
                     attempt_count += 1;
                     if !has_available {
@@ -1665,6 +1729,34 @@ impl MultiTokenManager {
                     }
                 }
             }
+        }
+    }
+
+    /// 分类并记录一次 Token 刷新错误。
+    ///
+    /// 上游 429 是临时流控，不代表凭据失效，因此直接保留类型化错误返回，绝不增加
+    /// `refresh_failure_count`。`Ok(None)` 表示已从源文件加载到轮换后的 Token，调用方
+    /// 应使用同一凭据立即重试；`Ok(Some(_))` 返回记录失败后是否仍有可用凭据。
+    fn handle_token_refresh_error(
+        &self,
+        id: u64,
+        error: anyhow::Error,
+    ) -> anyhow::Result<Option<bool>> {
+        if error.downcast_ref::<UpstreamRateLimitError>().is_some() {
+            tracing::warn!("凭据 #{} Token 刷新被上游限流", id);
+            return Err(error);
+        }
+
+        if error.downcast_ref::<RefreshTokenInvalidError>().is_some() {
+            // 先尝试从源文件重新加载（适用于 IDE 退出后 token rotation 导致失效的场景）。
+            if self.try_reload_credential_from_file(id) {
+                return Ok(None);
+            }
+            tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, error);
+            Ok(Some(self.report_refresh_token_invalid(id)))
+        } else {
+            tracing::warn!("凭据 #{} Token 刷新失败: {}", id, error);
+            Ok(Some(self.report_refresh_failure(id)))
         }
     }
 
@@ -2581,8 +2673,17 @@ impl MultiTokenManager {
     /// AWS 账号已被临时调查/限频；继续自动恢复容易反复撞风控，也会在重启后丢失内存冷却状态。
     /// 因此直接自动禁用并持久化，等待人工检查后再手动启用。
     ///
-    /// 返回剩余可用凭据数（已排除禁用/冷却中的）。
-    pub fn report_account_throttled(&self, id: u64, _cooldown: StdDuration) -> usize {
+    /// 保留本地生产语义：账号级 429 风控直接自动禁用并持久化，等待人工检查后再手动
+    /// 启用（避免自动恢复反复撞风控）；同时采用上游新增的模型/分组感知计数，
+    /// 在同一锁临界区内返回当前请求范围的剩余可用凭据数。`cooldown` 仅用于
+    /// provider 层向客户端给出 Retry-After，本地仍以自动禁用为准。
+    pub fn report_account_throttled_for_request(
+        &self,
+        id: u64,
+        _cooldown: StdDuration,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> usize {
         let remaining = {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
@@ -2598,10 +2699,8 @@ impl MultiTokenManager {
                 .iter()
                 .filter(|e| {
                     !e.disabled
-                        && !e
-                            .throttled_until
-                            .map(|t| t > now)
-                            .unwrap_or(false)
+                        && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                        && credential_matches_request(&e.credentials, model, group)
                 })
                 .count()
         };
@@ -4893,6 +4992,30 @@ mod tests {
     }
 
     #[test]
+    fn refresh_rate_limit_does_not_disable_or_increment_failure_count() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let error = anyhow::Error::new(UpstreamRateLimitError::new(Some("30".to_string())));
+        let returned = manager
+            .handle_token_refresh_error(1, error)
+            .expect_err("429 应立即返回给调用方");
+
+        assert!(returned.downcast_ref::<UpstreamRateLimitError>().is_some());
+        let snapshot = manager.snapshot();
+        let entry = &snapshot.entries[0];
+        assert_eq!(entry.refresh_failure_count, 0);
+        assert!(!entry.disabled);
+        assert_eq!(entry.disabled_reason, None);
+    }
+
+    #[test]
     fn test_multi_token_manager_switch_to_next() {
         let config = Config::default();
         let mut cred1 = KiroCredentials::default();
@@ -5262,6 +5385,26 @@ mod tests {
         assert_eq!(
             rest_api_region_candidates(sso_region),
             ["us-east-1", "eu-central-1"]
+        );
+    }
+
+    #[test]
+    fn test_usage_rest_urls_omit_resolved_profile_arn() {
+        let credentials = KiroCredentials {
+            profile_arn: Some(
+                "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123".to_string(),
+            ),
+            ..Default::default()
+        };
+        let host = "q.us-east-1.amazonaws.com";
+
+        assert_eq!(
+            usage_limits_url(host, &credentials),
+            "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true"
+        );
+        assert_eq!(
+            available_models_url(host, &credentials),
+            "https://q.us-east-1.amazonaws.com/ListAvailableModels?origin=AI_EDITOR"
         );
     }
 
@@ -5762,6 +5905,35 @@ mod tests {
         assert_eq!(manager.total_count_in_group(Some("g2")), 1); // B
         assert_eq!(manager.total_count_in_group(None), 3); // 全部
         assert_eq!(manager.total_count_in_group(Some("none")), 0);
+    }
+
+    #[test]
+    fn test_available_count_for_request_respects_group_throttle() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                grouped_cred("a", &["g1"]),
+                grouped_cred("b", &["g2"]),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(manager.available_count_for_request(None, Some("g1")), 1);
+        // g1 的唯一凭据进入冷却后，即使全局还有 g2，g1 也必须视为无可用账号。
+        assert_eq!(
+            manager.report_account_throttled_for_request(
+                1,
+                StdDuration::from_secs(60),
+                None,
+                Some("g1"),
+            ),
+            0
+        );
+        assert_eq!(manager.available_count_for_request(None, Some("g1")), 0);
+        assert_eq!(manager.available_count_for_request(None, Some("g2")), 1);
     }
 
     #[test]

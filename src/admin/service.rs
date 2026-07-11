@@ -14,6 +14,7 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::auth::idc::{self, BUILDER_ID_START_URL};
 use crate::kiro::auth::social;
 use crate::kiro::endpoint::{CliEndpoint, IdeEndpoint, KiroEndpoint, RequestContext};
+use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::credentials::{
@@ -2930,6 +2931,9 @@ impl AdminService {
 
     /// 分类简单操作错误（set_disabled, set_priority, reset_and_enable）
     fn classify_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
+        if let Some(error) = classify_rate_limit(&e) {
+            return error;
+        }
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
@@ -2940,6 +2944,9 @@ impl AdminService {
 
     /// 分类余额查询错误（可能涉及上游 API 调用）
     fn classify_balance_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
+        if let Some(error) = classify_rate_limit(&e) {
+            return error;
+        }
         let msg = e.to_string();
 
         // 1. 凭据不存在
@@ -2962,6 +2969,8 @@ impl AdminService {
 
         // 3. 上游服务错误特征：HTTP 响应错误或网络错误
         let is_upstream_error = msg.contains("获取使用额度失败") ||
+            msg.contains("获取可用模型失败") ||
+            msg.contains("设置用户偏好失败") ||
             // HTTP 响应错误（来自 refresh_*_token 的错误消息）
             msg.contains("凭证已过期或无效") ||
             msg.contains("权限不足") ||
@@ -2991,6 +3000,9 @@ impl AdminService {
 
     /// 分类添加凭据错误
     fn classify_add_error(&self, e: anyhow::Error) -> AdminServiceError {
+        if let Some(error) = classify_rate_limit(&e) {
+            return error;
+        }
         let msg = e.to_string();
 
         // 凭据验证失败（refreshToken 无效、格式错误等）
@@ -3619,9 +3631,30 @@ impl AdminService {
     }
 }
 
+fn classify_rate_limit(error: &anyhow::Error) -> Option<AdminServiceError> {
+    error
+        .downcast_ref::<UpstreamRateLimitError>()
+        .map(|rate_limit| AdminServiceError::RateLimited {
+            retry_after: rate_limit.retry_after().map(str::to_string),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_upstream_rate_limit_is_classified_without_losing_retry_after() {
+        let error = anyhow::Error::new(UpstreamRateLimitError::new(Some("120".to_string())));
+        let classified = classify_rate_limit(&error).expect("应识别类型化上游 429");
+
+        match classified {
+            AdminServiceError::RateLimited { retry_after } => {
+                assert_eq!(retry_after.as_deref(), Some("120"));
+            }
+            other => panic!("预期 RateLimited，实际为 {other:?}"),
+        }
+    }
 
     #[test]
     fn semver_compares_correctly() {

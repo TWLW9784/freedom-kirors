@@ -82,7 +82,7 @@ pub async fn set_credential_disabled(
             let action = if payload.disabled { "禁用" } else { "启用" };
             Json(SuccessResponse::new(format!("凭据 #{} 已{}", id, action))).into_response()
         }
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -99,7 +99,7 @@ pub async fn set_credential_priority(
             id, payload.priority
         )))
         .into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -150,7 +150,7 @@ pub async fn reset_failure_count(
             id
         )))
         .into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -187,7 +187,7 @@ pub async fn get_credential_balance(
 ) -> impl IntoResponse {
     match state.service.get_balance(id).await {
         Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -199,7 +199,7 @@ pub async fn get_credential_models(
 ) -> impl IntoResponse {
     match state.service.get_available_models(id).await {
         Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -236,7 +236,7 @@ pub async fn set_credential_overage(
             if payload.enabled { "开启" } else { "关闭" }
         )))
         .into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -255,7 +255,7 @@ pub async fn add_credential(
 ) -> impl IntoResponse {
     match state.service.add_credential(payload).await {
         Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -418,7 +418,7 @@ pub async fn force_refresh_token(
             id
         )))
         .into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 

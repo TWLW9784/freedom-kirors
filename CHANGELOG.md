@@ -6,6 +6,30 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [0.6.23] - 2026-07-11
 
+> 融合上游 v0.6.11（企业凭据余额/模型查询修复 + 上游 429 全链路传播，PR #35），保留全部本地生产能力。以下为吸纳的上游修复条目：
+
+主题：**修复 AWS Enterprise / IAM Identity Center 凭据首次模型调用后，Admin 余额与可用模型查询持续返回 400 的问题**。企业凭据会在首次流式模型请求前通过 `ListAvailableProfiles` 解析真实 `profileArn` 并持久化；旧代码随后将该 ARN 复用到固定使用 Kiro 0.9.2 兼容协议的 `getUsageLimits` 与 `ListAvailableModels` REST GET，导致上游返回 `400 Bad Request {"message":"Improperly formed request."}`。本版隔离流式端点与旧版 REST 端点的 ARN 语义，让企业模型调用和 Admin 查询可以同时正常工作。
+
+### 🔧 修复 — AWS Enterprise / IdC 余额与模型列表查询
+
+- **旧版 REST GET 不再携带 `profileArn`**：`getUsageLimits` 与 `ListAvailableModels` 继续使用 Kiro 0.9.2 兼容 User-Agent，但 URL 不再拼接首次模型调用解析出的真实 `profileArn`，避免上游将请求判定为格式错误。
+- **保留企业流式调用所需 ARN**：不删除、不回滚凭据中已经解析并持久化的 `profileArn`；`generateAssistantResponse` / `SendMessageStreaming` 等流式模型请求仍正常注入真实 ARN，Enterprise 的 `tokentype: EXTERNAL_IDP`、IdC Token 刷新与区域回退逻辑保持不变。
+- **覆盖状态迁移回归场景**：新增 URL 构造测试，模拟企业凭据从“刚导入、无真实 ARN”进入“首次模型调用后、已有真实 ARN”的状态，确保余额与模型列表请求始终省略 `profileArn`。
+
+### 🔧 修复 — 上游 429 全链路传播与 WebSearch 一致性
+
+> 合并并扩展 [PR #35](https://github.com/ZyphrZero/kiro.rs/pull/35)：保留类型化上游限流及 `Retry-After`，并补齐 Admin、MCP / WebSearch、Token 刷新和分组隔离链路。
+
+- **429 与 `Retry-After` 不再丢失**：模型、MCP、余额、模型列表、超额开关、凭据添加与强制刷新等链路统一返回 HTTP 429；只转发合法的秒数或 HTTP-date，存在明确等待时间时不再在服务端提前重试。
+- **WebSearch 正确传播失败**：纯 WebSearch 不再把 MCP 429 吞成空搜索结果和 HTTP 200；`stream: false` 返回普通 JSON，`stream: true` 保持 SSE。
+- **客户端 Key 分组隔离**：纯 WebSearch 与混合 WebSearch 的 MCP 调用沿用客户端 Key 对应的凭据组，不会越组选择或统计凭据。
+- **并发冷却保留原始 429**：请求已收到类型化 429 后，即使并发冷却使下一次凭据选择失败，也优先返回原始限流，而不是退化为通用 502。
+- **刷新限流不再误伤凭据**：Social、AWS IdC 与 External IdP 刷新端点的 429 不计入 Token 刷新失败次数；自动刷新与 401/403 触发的强制刷新均会立即保留类型化 429，不会重复撞刷新端点或因临时限流永久禁用有效凭据。
+- **Enterprise profile 发现保留限流**：`ListAvailableProfiles` 返回 429 时停止后续模型请求并原样传播合法 `Retry-After`，不再吞掉限流后继续使用缺失或占位 `profileArn`。
+- **隐藏上游敏感错误正文**：通用 502 对客户端使用稳定错误消息，AWS 账号、请求标识等原始响应仅保留在服务端日志中。
+
+## [0.6.10] - 2026-07-10
+
 主题：**融合上游 v0.6.10：放宽 Admin API 请求体上限修复批量导入 413**。合并 upstream `ZyphrZero/kiro.rs` v0.6.10（PR #34，[@l-spaces](https://github.com/l-spaces)）。本地二开分支已远超上游版本号，故以合并 commit 形式吸纳上游该修复，保留全部本地生产能力（自适应限流器、压测、延迟感知路由、缓存比例、M365 凭据、原子写等）。
 
 ### 🔧 修复 — Admin 批量导入 413（吸纳上游）
