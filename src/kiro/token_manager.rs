@@ -1477,12 +1477,7 @@ impl MultiTokenManager {
         *self.proxy.lock() = proxy;
     }
 
-    /// 获取凭据总数
-    pub fn total_count(&self) -> usize {
-        self.entries.lock().len()
-    }
-
-    /// 获取指定分组的凭据总数（group=None 时等于 total_count）
+    /// 获取指定分组的凭据总数（group=None 时返回全部凭据数）
     ///
     /// 用于按分组计算 failover 重试预算，避免小分组按全局账号数获得过多无效重试。
     pub fn total_count_in_group(&self, group: Option<&str>) -> usize {
@@ -1500,30 +1495,6 @@ impl MultiTokenManager {
             .lock()
             .iter()
             .filter(|e| !e.disabled && !e.throttled_until.map(|t| t > now).unwrap_or(false))
-            .count()
-    }
-
-    /// 获取当前请求范围内的可用凭据数量。
-    ///
-    /// 与全局 [`Self::available_count`] 不同，这里同时应用模型能力和客户端 Key
-    /// 绑定的分组过滤，供严格隔离场景判断是否还能故障转移。
-    pub fn available_count_for_request(
-        &self,
-        model: Option<&str>,
-        group: Option<&str>,
-    ) -> usize {
-        let now = Instant::now();
-        self.entries
-            .lock()
-            .iter()
-            .filter(|entry| {
-                !entry.disabled
-                    && !entry
-                        .throttled_until
-                        .map(|until| until > now)
-                        .unwrap_or(false)
-                    && credential_matches_request(&entry.credentials, model, group)
-            })
             .count()
     }
 
@@ -4660,7 +4631,7 @@ mod tests {
         assert!(result.is_ok());
         let id = result.unwrap();
         assert!(id > 0);
-        assert_eq!(manager.total_count(), 1);
+        assert_eq!(manager.snapshot().total, 1);
         assert_eq!(manager.available_count(), 1);
     }
 
@@ -4864,7 +4835,7 @@ mod tests {
 
         let result = manager.add_credential(api_key_cred).await;
         assert!(result.is_ok());
-        assert_eq!(manager.total_count(), 2);
+        assert_eq!(manager.snapshot().total, 2);
         assert_eq!(manager.available_count(), 2);
     }
 
@@ -4880,7 +4851,7 @@ mod tests {
 
         let manager =
             MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
-        assert_eq!(manager.total_count(), 2);
+        assert_eq!(manager.snapshot().total, 2);
         assert_eq!(manager.available_count(), 2);
     }
 
@@ -4891,7 +4862,7 @@ mod tests {
         // 支持 0 个凭据启动（可通过管理面板添加）
         assert!(result.is_ok());
         let manager = result.unwrap();
-        assert_eq!(manager.total_count(), 0);
+        assert_eq!(manager.snapshot().total, 0);
         assert_eq!(manager.available_count(), 0);
     }
 
@@ -4927,7 +4898,7 @@ mod tests {
 
         let manager =
             MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
-        assert_eq!(manager.total_count(), 2);
+        assert_eq!(manager.snapshot().total, 2);
         assert_eq!(manager.available_count(), 1); // bad_cred 被禁用，只剩 1 个可用
     }
 
@@ -4941,7 +4912,7 @@ mod tests {
         cred.kiro_api_key = Some("ksk_test123".to_string());
 
         let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
-        assert_eq!(manager.total_count(), 1);
+        assert_eq!(manager.snapshot().total, 1);
         assert_eq!(manager.available_count(), 1);
     }
 
@@ -5921,7 +5892,12 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(manager.available_count_for_request(None, Some("g1")), 1);
+        assert_eq!(
+            manager
+                .select_next_credential(None, Some("g1"))
+                .map(|(id, _)| id),
+            Some(1)
+        );
         // g1 的唯一凭据进入冷却后，即使全局还有 g2，g1 也必须视为无可用账号。
         assert_eq!(
             manager.report_account_throttled_for_request(
@@ -5932,8 +5908,14 @@ mod tests {
             ),
             0
         );
-        assert_eq!(manager.available_count_for_request(None, Some("g1")), 0);
-        assert_eq!(manager.available_count_for_request(None, Some("g2")), 1);
+        assert!(manager.select_next_credential(None, Some("g1")).is_none());
+        assert_eq!(
+            manager
+                .select_next_credential(None, Some("g2"))
+                .map(|(id, _)| id),
+            Some(2)
+        );
+        assert_eq!(manager.snapshot().available, 1);
     }
 
     #[test]
