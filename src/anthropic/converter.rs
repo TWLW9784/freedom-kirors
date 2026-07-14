@@ -222,6 +222,34 @@ Complete all chunked operations without commentary.";
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
 
+    // --- 非 Claude 上游模型（Kiro ListAvailableModels 2026-07 实测支持）---
+    // 这些模型 ID 直接透传给上游；reasoning/output_config 由
+    // `model_supports_native_reasoning` 白名单单独 opt-in，此处不涉及。
+    if model_lower.contains("gpt") {
+        // OpenAI GPT 5.6 系（272k 上下文）：sol / terra / luna 三个变体。
+        return if model_lower.contains("terra") {
+            Some("gpt-5.6-terra".to_string())
+        } else if model_lower.contains("luna") {
+            Some("gpt-5.6-luna".to_string())
+        } else {
+            // sol 为默认（含裸 "gpt" / "gpt-5.6" / "gpt-5.6-sol"）
+            Some("gpt-5.6-sol".to_string())
+        };
+    } else if model_lower.contains("deepseek") {
+        return Some("deepseek-3.2".to_string());
+    } else if model_lower.contains("minimax") {
+        return if model_lower.contains("2.1") || model_lower.contains("2-1") {
+            Some("minimax-m2.1".to_string())
+        } else {
+            // m2.5 为默认（含裸 "minimax" / "minimax-m2.5"）
+            Some("minimax-m2.5".to_string())
+        };
+    } else if model_lower.contains("glm") {
+        return Some("glm-5".to_string());
+    } else if model_lower.contains("qwen") {
+        return Some("qwen3-coder-next".to_string());
+    }
+
     if model_lower.contains("fable") {
         // Fable 5：与 Mythos 5 同底座；目前仅 5 代
         Some("claude-fable-5".to_string())
@@ -238,6 +266,9 @@ pub fn map_model(model: &str) -> Option<String> {
         {
             // 精确匹配 5 代，避免命中 legacy claude-3-5-sonnet
             Some("claude-sonnet-5".to_string())
+        } else if model_lower.contains("sonnet-4") || model_lower.contains("sonnet4") {
+            // 裸 4 代（无 4-5/4-6/4-8 小版本号）→ claude-sonnet-4
+            Some("claude-sonnet-4".to_string())
         } else {
             None
         }
@@ -279,6 +310,12 @@ pub fn get_context_window_size(model: &str) -> i32 {
         {
             1_000_000
         }
+        // 非 Claude 上游模型：按各自 maxInputTokens
+        Some(mapped) if mapped.starts_with("gpt-5.6") => 272_000,
+        Some(mapped) if mapped == "qwen3-coder-next" => 256_000,
+        Some(mapped) if mapped == "minimax-m2.5" || mapped == "minimax-m2.1" => 196_000,
+        Some(mapped) if mapped == "deepseek-3.2" => 164_000,
+        // glm-5 / claude-sonnet-4 / 其余 → 200k
         _ => 200_000,
     }
 }
@@ -1835,6 +1872,45 @@ mod tests {
     }
 
     #[test]
+    fn test_map_model_non_claude() {
+        // GPT 5.6 系
+        assert_eq!(map_model("gpt-5.6-sol"), Some("gpt-5.6-sol".to_string()));
+        assert_eq!(map_model("gpt"), Some("gpt-5.6-sol".to_string()));
+        assert_eq!(map_model("gpt-5.6-terra"), Some("gpt-5.6-terra".to_string()));
+        assert_eq!(map_model("GPT-5.6-Luna"), Some("gpt-5.6-luna".to_string()));
+        // Deepseek
+        assert_eq!(map_model("deepseek-3.2"), Some("deepseek-3.2".to_string()));
+        assert_eq!(map_model("deepseek-chat"), Some("deepseek-3.2".to_string()));
+        // MiniMax
+        assert_eq!(map_model("minimax-m2.5"), Some("minimax-m2.5".to_string()));
+        assert_eq!(map_model("minimax"), Some("minimax-m2.5".to_string()));
+        assert_eq!(map_model("minimax-m2.1"), Some("minimax-m2.1".to_string()));
+        // GLM
+        assert_eq!(map_model("glm-5"), Some("glm-5".to_string()));
+        assert_eq!(map_model("GLM-4.6"), Some("glm-5".to_string()));
+        // Qwen
+        assert_eq!(
+            map_model("qwen3-coder-next"),
+            Some("qwen3-coder-next".to_string())
+        );
+        assert_eq!(map_model("qwen"), Some("qwen3-coder-next".to_string()));
+        // 裸 sonnet-4
+        assert_eq!(map_model("claude-sonnet-4"), Some("claude-sonnet-4".to_string()));
+    }
+
+    #[test]
+    fn test_context_window_non_claude() {
+        assert_eq!(get_context_window_size("gpt-5.6-sol"), 272_000);
+        assert_eq!(get_context_window_size("gpt-5.6-terra"), 272_000);
+        assert_eq!(get_context_window_size("qwen3-coder-next"), 256_000);
+        assert_eq!(get_context_window_size("minimax-m2.5"), 196_000);
+        assert_eq!(get_context_window_size("minimax-m2.1"), 196_000);
+        assert_eq!(get_context_window_size("deepseek-3.2"), 164_000);
+        assert_eq!(get_context_window_size("glm-5"), 200_000);
+        assert_eq!(get_context_window_size("claude-sonnet-4"), 200_000);
+    }
+
+    #[test]
     fn test_map_model_opus_4_7() {
         assert_eq!(
             map_model("claude-opus-4-7"),
@@ -1917,7 +1993,10 @@ mod tests {
 
     #[test]
     fn test_map_model_unsupported() {
-        assert!(map_model("gpt-4").is_none());
+        // 真正无法识别的模型才返回 None（gpt/deepseek/minimax/glm/qwen 现已支持）
+        assert!(map_model("llama-3").is_none());
+        assert!(map_model("gemini-2.5-pro").is_none());
+        assert!(map_model("").is_none());
     }
 
     #[test]
