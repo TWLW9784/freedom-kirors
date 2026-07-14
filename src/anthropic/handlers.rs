@@ -392,24 +392,6 @@ fn resolve_usage_input_tokens(
 fn available_models() -> Vec<Model> {
     vec![
         Model {
-            id: "claude-fable-5".to_string(),
-            object: "model".to_string(),
-            created: 1781481600, // Jun 15, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Fable 5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-fable-5-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1781481600, // Jun 15, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Fable 5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
             id: "claude-sonnet-5".to_string(),
             object: "model".to_string(),
             created: 1781481600, // Jun 15, 2026
@@ -442,24 +424,6 @@ fn available_models() -> Vec<Model> {
             created: 1779897600, // May 28, 2026
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.8 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-8".to_string(),
-            object: "model".to_string(),
-            created: 1779897600, // May 28, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.8".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-8-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1779897600, // May 28, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.8 (Thinking)".to_string(),
             model_type: "chat".to_string(),
             max_tokens: 64000,
         },
@@ -658,32 +622,11 @@ fn available_models() -> Vec<Model> {
 
 /// GET /v1/models
 ///
-/// 返回可用模型列表。仅返回当前启用凭据上游真实支持的模型：
-/// 把静态目录中每个模型经 `map_model` 映射到上游 ID，只保留上游
-/// `ListAvailableModels` 并集里存在的条目（thinking 变体与基座同进同出）。
-/// 若上游探测不可用（无凭据 / 全部失败且无缓存），保底返回完整目录。
-pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
+/// 返回可用的模型列表
+pub async fn get_models() -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
 
-    let catalog = available_models();
-
-    let supported = match &state.kiro_provider {
-        Some(provider) => provider.token_manager().supported_upstream_model_ids().await,
-        None => None,
-    };
-
-    let models = match supported {
-        Some(set) if !set.is_empty() => catalog
-            .into_iter()
-            .filter(|m| {
-                super::converter::map_model(&m.id)
-                    .map(|upstream| set.contains(&upstream.to_ascii_lowercase()))
-                    .unwrap_or(false)
-            })
-            .collect(),
-        // 无法探测时保底返回完整目录，避免误将列表清空。
-        _ => catalog,
-    };
+    let models = available_models();
 
     Json(ModelsResponse {
         object: "list".to_string(),
@@ -2166,7 +2109,11 @@ mod tests {
 
         assert!(ids.contains(&"claude-opus-4-8"));
         assert!(ids.contains(&"claude-opus-4-8-thinking"));
-        assert!(ids.contains(&"claude-sonnet-4-8"));
-        assert!(ids.contains(&"claude-sonnet-4-8-thinking"));
+        // 号池凭据不提供 claude-sonnet-4-8，已从静态列表移除（v0.6.26）。
+        assert!(!ids.contains(&"claude-sonnet-4-8"));
+        assert!(!ids.contains(&"claude-sonnet-4-8-thinking"));
+        // fable-5 同样不再暴露。
+        assert!(!ids.contains(&"claude-fable-5"));
+        assert!(!ids.contains(&"claude-fable-5-thinking"));
     }
 }

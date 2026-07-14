@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.26] - 2026-07-14
+
+### ↩️ 回退 — `/v1/models` 恢复为固定静态列表
+
+撤销 0.6.25 的「按凭据实时探测上游可用模型」逻辑（按上游 `ListAvailableModels` 动态过滤）。改回固定静态列表：`/v1/models` 直接返回内置目录，不再实时请求凭据。
+
+- **移除不存在的模型**：删除当前号池凭据不提供的 `claude-fable-5` / `claude-fable-5-thinking` 与 `claude-sonnet-4-8` / `claude-sonnet-4-8-thinking`。
+- **固定当前号池支持的模型**：`/v1/models` 固定返回 25 个模型（17 个基座 + 8 个 Claude thinking 变体），与号池凭据实际支持一致。
+- **不再实时探测**：后续新增模型手动维护静态列表，不再读凭据。同时回退 0.6.25 引入的 `MultiTokenManager::supported_upstream_model_ids` 与 `KiroProvider::token_manager()` 探测代码。
+
 ## [0.6.25] - 2026-07-14
 
 ### ✨ 新增 — `/v1/models` 只返回当前凭据真实支持的模型
