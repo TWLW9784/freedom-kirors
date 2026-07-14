@@ -176,6 +176,11 @@ impl KiroProvider {
         Arc::clone(&self.account_limiters)
     }
 
+    /// 返回多凭据 Token 管理器的共享句柄（供 `/v1/models` 等查上游可用模型）。
+    pub fn token_manager(&self) -> Arc<MultiTokenManager> {
+        Arc::clone(&self.token_manager)
+    }
+
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
     fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
         let effective = credentials.effective_proxy(self.global_proxy.as_ref());

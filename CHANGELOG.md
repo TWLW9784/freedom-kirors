@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.25] - 2026-07-14
+
+### ✨ 新增 — `/v1/models` 只返回当前凭据真实支持的模型
+
+之前 `/v1/models` 返回的是一份静态目录，里面可能包含当前凭据并不提供的模型（例如 `claude-fable-5`），客户端能看到却调不通。本版改为按上游实际可用情况动态过滤，只向下游暴露真正能用的模型。
+
+- **按凭据能力过滤**：`/v1/models` 把静态目录中每个模型经 `map_model` 映射到上游 ID，只保留上游 `ListAvailableModels` 并集里存在的条目。thinking 变体与其基座模型同进同出。
+- **多凭据并集**：探测若干个已启用、未被限流的凭据，取其可用模型的并集（同组内任一凭据支持即视为下游可用，与请求故障转移语义一致），单次最多探测 5 个凭据。
+- **TTL 缓存 + 保底**：上游查询结果缓存 5 分钟，避免每次 `/v1/models` 都打上游；当全部探测失败且无缓存（或未配置凭据）时，保底返回完整静态目录，不会误将列表清空。
+
 ## [0.6.24] - 2026-07-14
 
 ### ✨ 新增 — 适配 GPT / Deepseek / MiniMax / GLM / Qwen 等非 Claude 上游模型

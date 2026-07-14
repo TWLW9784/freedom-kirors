@@ -1198,6 +1198,10 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    /// `/v1/models` 下游可用模型过滤缓存：聚合各启用凭据上游
+    /// `ListAvailableModels` 的并集（上游原始 modelId，小写），带 TTL。
+    /// `None` 表示尚未成功查过。
+    supported_models_cache: Mutex<Option<(Instant, std::collections::HashSet<String>)>>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -1429,6 +1433,7 @@ impl MultiTokenManager {
             rpm_burst_enabled: AtomicBool::new(rpm_burst),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
+            supported_models_cache: Mutex::new(None),
         };
 
         // 单凭据格式自动迁移：升级为数组格式，确保 token rotation 能写盘
@@ -3268,6 +3273,74 @@ impl MultiTokenManager {
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
         get_available_models(&credentials, &self.config, &token, effective_proxy.as_ref()).await
+    }
+
+    /// 供 `/v1/models` 下游过滤：返回当前启用凭据上游真实支持的模型 ID 集合
+    /// （上游原始 modelId，统一小写），带 TTL 缓存。
+    ///
+    /// 为兼顾准确与开销：探测若干个「已启用、未被限流」的凭据，取其
+    /// `ListAvailableModels` 结果的并集（同组内任一凭据支持即视为下游可用，
+    /// 与请求故障转移语义一致）。任一凭据查询成功即刷新缓存；全部失败时
+    /// 沿用旧缓存（若有），避免上游抖动导致下游模型列表瞬间清空。
+    pub async fn supported_upstream_model_ids(&self) -> Option<std::collections::HashSet<String>> {
+        const TTL: StdDuration = StdDuration::from_secs(300);
+        // 单次最多探测的凭据数，避免凭据很多时 fan-out 过大。
+        const MAX_PROBE: usize = 5;
+
+        // 命中未过期缓存直接返回。
+        {
+            let guard = self.supported_models_cache.lock();
+            if let Some((at, set)) = guard.as_ref()
+                && at.elapsed() < TTL
+            {
+                return Some(set.clone());
+            }
+        }
+
+        // 选取候选凭据：启用且未处于限流冷却的，按 id 稳定排序。
+        let candidate_ids: Vec<u64> = {
+            let now = Instant::now();
+            let entries = self.entries.lock();
+            let mut ids: Vec<u64> = entries
+                .iter()
+                .filter(|e| {
+                    !e.disabled && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                })
+                .map(|e| e.id)
+                .collect();
+            ids.sort_unstable();
+            ids.truncate(MAX_PROBE);
+            ids
+        };
+
+        let mut union: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut any_ok = false;
+        for id in candidate_ids {
+            match self.get_available_models_for(id).await {
+                Ok(resp) => {
+                    any_ok = true;
+                    for m in resp.models {
+                        let mid = m.model_id.trim().to_ascii_lowercase();
+                        if !mid.is_empty() && mid != "auto" {
+                            union.insert(mid);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(credential_id = id, error = %e, "探测上游可用模型失败，跳过该凭据");
+                }
+            }
+        }
+
+        if any_ok {
+            let mut guard = self.supported_models_cache.lock();
+            *guard = Some((Instant::now(), union.clone()));
+            Some(union)
+        } else {
+            // 全部探测失败：回退到旧缓存（可能已过期），拿不到就返回 None。
+            let guard = self.supported_models_cache.lock();
+            guard.as_ref().map(|(_, set)| set.clone())
+        }
     }
 
     /// 设置用户偏好（开启/关闭超额）— Admin API

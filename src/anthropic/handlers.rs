@@ -658,11 +658,32 @@ fn available_models() -> Vec<Model> {
 
 /// GET /v1/models
 ///
-/// 返回可用的模型列表
-pub async fn get_models() -> impl IntoResponse {
+/// 返回可用模型列表。仅返回当前启用凭据上游真实支持的模型：
+/// 把静态目录中每个模型经 `map_model` 映射到上游 ID，只保留上游
+/// `ListAvailableModels` 并集里存在的条目（thinking 变体与基座同进同出）。
+/// 若上游探测不可用（无凭据 / 全部失败且无缓存），保底返回完整目录。
+pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
 
-    let models = available_models();
+    let catalog = available_models();
+
+    let supported = match &state.kiro_provider {
+        Some(provider) => provider.token_manager().supported_upstream_model_ids().await,
+        None => None,
+    };
+
+    let models = match supported {
+        Some(set) if !set.is_empty() => catalog
+            .into_iter()
+            .filter(|m| {
+                super::converter::map_model(&m.id)
+                    .map(|upstream| set.contains(&upstream.to_ascii_lowercase()))
+                    .unwrap_or(false)
+            })
+            .collect(),
+        // 无法探测时保底返回完整目录，避免误将列表清空。
+        _ => catalog,
+    };
 
     Json(ModelsResponse {
         object: "list".to_string(),
