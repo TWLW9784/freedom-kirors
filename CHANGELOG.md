@@ -6,15 +6,16 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [0.6.24] - 2026-07-14
 
-### ✨ 新增 — 适配更多上游模型（非 Claude 系）
+### ✨ 新增 — 适配 GPT / Deepseek / MiniMax / GLM / Qwen 等非 Claude 上游模型
 
-主题：**kiro-rs 此前仅映射 Claude 系模型，现扩展 `map_model` 覆盖上游凭据实测支持的全部模型族**。上游 `ListAvailableModels` 返回的可用模型除 Claude 外还包含 OpenAI GPT 5.6、Deepseek、MiniMax、GLM、Qwen 等；由于 `map_model` 未映射，这些模型请求会直接被判为 `UnsupportedModel`。本次将其全部接入。
+此前 kiro-rs 的 `map_model` 只映射了 Claude 与 Fable 系模型。但上游凭据通过 `ListAvailableModels` 实际提供的可用模型远不止这些，还包括 OpenAI GPT 5.6、Deepseek、MiniMax、GLM、Qwen 等。由于这些模型没有对应映射，向它们发起的请求会被直接拒绝为 `UnsupportedModel`。本版将上游凭据支持的全部模型族一次性接入。
 
-- **`map_model` 扩展**：新增 `gpt-5.6-sol/terra/luna`、`deepseek-3.2`、`minimax-m2.5/m2.1`、`glm-5`、`qwen3-coder-next` 映射，并补齐裸 `claude-sonnet-4`。模型 ID 直接透传上游。
-- **上下文窗口**：`get_context_window_size` 按各模型真实 `maxInputTokens` 返回（GPT 系 272k、Qwen 256k、MiniMax 196k、Deepseek 164k，其余 200k）。
-- **`/v1/models` 列表**：`available_models()` 增补 9 个新模型条目，客户端可发现。
-- **reasoning 安全默认**：非 Claude 模型不在 `model_supports_native_reasoning` 白名单内，不会下发 `additionalModelRequestFields.output_config`，避免上游 400；行为保持 opt-in、向后兼容。
-- **测试**：新增 `test_map_model_non_claude` / `test_context_window_non_claude`，更新过时的 `test_map_model_unsupported`（gpt-4 现已支持）。9 个新模型经真实凭据端到端验证均 200 正常。
+- **扩展模型映射**：`map_model` 新增 `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna`、`deepseek-3.2`、`minimax-m2.5` / `minimax-m2.1`、`glm-5`、`qwen3-coder-next`，并补上此前遗漏的 `claude-sonnet-4`。映射后的模型 ID 直接透传给上游。
+- **上下文窗口按模型区分**：`get_context_window_size` 改为返回每个模型的真实上限——GPT 5.6 系 272k、Qwen 256k、MiniMax 196k、Deepseek 164k，其余 200k。
+- **模型列表可发现**：`available_models()`（即 `/v1/models`）补齐上述 9 个新模型，客户端可直接列出并选用。
+- **reasoning 字段保持安全默认**：非 Claude 模型不在 `model_supports_native_reasoning` 白名单内，因此不会向其下发 `additionalModelRequestFields.output_config`，避免触发上游 400。该行为为 opt-in，完全向后兼容。
+- **测试**：新增 `test_map_model_non_claude` 与 `test_context_window_non_claude`；`gpt-4` 现已可映射，相应更新了过时的 `test_map_model_unsupported`。9 个新模型均通过真实凭据端到端验证，返回 200。
+
 
 ## [0.6.23] - 2026-07-11
 
