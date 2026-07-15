@@ -424,7 +424,7 @@ export interface ClientKeyItem {
   cacheRatioMode?: string
   cacheReadRatio?: number
   cacheCreationRatio?: number
-  /** 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换） */
+  /** 是否系统密钥（由 config.json apiKey 同步，不可删除；本地保留不可轮换保护） */
   isSystem: boolean
 }
 
