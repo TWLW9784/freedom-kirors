@@ -9,12 +9,26 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 主题：**增强生产凭据池稳定性，并让批量导入支持直接粘贴 Kiro Server Key**。
 
-### ✨ 新功能
+### ⬆️ 包含官方 v0.7.1 更新
+
+本版基于官方 `v0.7.1` 合并后发布，除了本仓库的小版本修复，也包含官方 `0.7.1` 的完整更新：
+
+- **Codex CLI 完整工具桥接**：支持从 Responses 请求中收集 `function` / `custom` / `namespace` 工具声明，并转换为 Anthropic 兼容工具；响应时按工具类型正确返回 `function_call` 或 `custom_tool_call`。
+- **custom 自由文本工具支持**：将 Codex 的自由文本工具包装为 Anthropic schema，并在响应时解包为原始 input，适配 `apply_patch` / code-mode exec 等工具。
+- **Namespace 工具分组支持**：将 Codex namespace 工具展平转发，上游响应后再还原 `name` + `namespace`。
+- **Codex Agentic Loop 增强**：Codex 工具与原生 `web_search_20250305` 可共存，搜索由 kiro-rs 内部处理，其它 client 工具原样透传。
+- **Developer 角色映射**：Codex `role: developer` message item 会映射为 Anthropic system 消息，保证 AGENTS.md / user instructions / environment context 生效。
+- **推理摘要与搜索展示**：支持将上游 thinking 汇总为 Responses `reasoning` item，并把内部 web_search 渲染为 `web_search_call` 展示项。
+- **Responses SSE 事件补齐**：补齐 `reasoning`、`custom_tool_call`、`web_search_call` 的 output item added / delta / done 事件序列。
+- **工具结果后空响应修复**：修复上游在 `tool_result` 后返回空助手回合时，Codex 误判任务完成的问题；现在会重试一次，仍为空则返回 502。
+- **README / 文档同步**：更新 OpenAI Chat Completions / Responses、Codex CLI、GPT-5.6 模型族、流式格式和部署示例等说明。
+
+### ✨ 本仓库新增
 
 - **批量导入支持纯 `ksk_` Key 列表**：管理后台「批量导入」现在可直接粘贴一行一个 `ksk_...` Kiro Server Key，前端会自动识别并转换为 `authMethod=api_key` / `kiroApiKey` 凭据；原有 OAuth、API Key JSON 与 Enterprise SSO JSON 导入格式保持兼容。
 - **账号安全封禁识别**：新增 `TEMPORARILY_SUSPENDED` / security suspended 响应识别；命中后立即持久化禁用对应凭据并切换到其它可用凭据，避免继续重试污染凭据池。
 
-### 🔧 修复
+### 🔧 本仓库修复
 
 - **502 / Bad Gateway 坏号处理**：普通 502 不再无限当作瞬态错误重试；会记录凭据失败并故障转移，连续达到阈值后以 `BadGateway` 原因自动禁用。
 - **封禁响应兼容 502 包装**：部分网关会把上游账号封禁包装成 502，本版会先检测响应体中的封禁特征，再决定是否永久禁用凭据。
