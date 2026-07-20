@@ -826,6 +826,32 @@ impl KiroProvider {
                     attempt_start,
                 );
 
+                // 403 + TEMPORARILY_SUSPENDED/security suspended：账号已进入安全封禁/身份验证状态。
+                // 生产凭据池里继续重试没有意义，立即禁用该凭据并故障转移。
+                if status.as_u16() == 403 && endpoint.is_account_suspended(&body) {
+                    let remaining = self.token_manager.report_account_suspended_for_request(
+                        ctx.id,
+                        model.as_deref(),
+                        group,
+                    );
+                    if remaining == 0 {
+                        anyhow::bail!(
+                            "{} API 请求失败（账号安全封禁，所有凭据已用尽）: {} {}",
+                            api_type,
+                            status,
+                            body
+                        );
+                    }
+
+                    last_error = Some(anyhow::anyhow!(
+                        "{} API 请求失败（账号安全封禁，凭据已禁用）: {} {}",
+                        api_type,
+                        status,
+                        body
+                    ));
+                    continue;
+                }
+
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
@@ -917,6 +943,78 @@ impl KiroProvider {
                     return Err(rate_limit_error.into());
                 }
                 last_error = Some(rate_limit_error.into());
+                continue;
+            }
+
+            // 502 + TEMPORARILY_SUSPENDED/security suspended：部分网关会把上游账号封禁包装成 502。
+            // 只要响应体命中账号安全封禁特征，就按永久不可用凭据处理，不进入 5xx 瞬态重试。
+            if status.as_u16() == 502 && endpoint.is_account_suspended(&body) {
+                let remaining = self.token_manager.report_account_suspended_for_request(
+                    ctx.id,
+                    model.as_deref(),
+                    group,
+                );
+                Self::emit_attempt(
+                    sink,
+                    attempt,
+                    ctx.id,
+                    endpoint_name,
+                    Some(status.as_u16()),
+                    outcome::AUTH_FAILED,
+                    Some(&body),
+                    attempt_start,
+                );
+                if remaining == 0 {
+                    anyhow::bail!(
+                        "{} API 请求失败（账号安全封禁，所有凭据已用尽）: {} {}",
+                        api_type,
+                        status,
+                        body
+                    );
+                }
+
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败（账号安全封禁，凭据已禁用）: {} {}",
+                    api_type,
+                    status,
+                    body
+                ));
+                continue;
+            }
+
+            // 普通 502 / Bad Gateway：Kiro 生产池里通常是死号/坏号表现。
+            // 不是立刻误杀：先计入该凭据失败次数并切换；连续达到阈值后永久禁用。
+            if status.as_u16() == 502 {
+                let remaining = self.token_manager.report_bad_gateway_for_request(
+                    ctx.id,
+                    model.as_deref(),
+                    group,
+                );
+                Self::emit_attempt(
+                    sink,
+                    attempt,
+                    ctx.id,
+                    endpoint_name,
+                    Some(status.as_u16()),
+                    outcome::TRANSIENT,
+                    Some(&body),
+                    attempt_start,
+                );
+                if remaining == 0 {
+                    anyhow::bail!(
+                        "{} API 请求失败（502/Bad Gateway，无其它可用凭据）: {} {}",
+                        api_type,
+                        status,
+                        body
+                    );
+                }
+
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败（502/Bad Gateway，已切换凭据）: {} {}",
+                    api_type,
+                    status,
+                    body
+                ));
                 continue;
             }
 

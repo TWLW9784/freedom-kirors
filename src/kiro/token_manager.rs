@@ -1020,6 +1020,10 @@ enum DisabledReason {
     InvalidConfig,
     /// 账号级 429 风控（USER_REQUEST_RATE_EXCEEDED / suspicious activity）
     AccountThrottled,
+    /// 账号安全封禁/暂停（TEMPORARILY_SUSPENDED / security suspended）
+    AccountSuspended,
+    /// 连续 502 / Bad Gateway，生产上通常表示账号不可恢复
+    BadGateway,
 }
 
 /// 统计数据持久化条目
@@ -2586,6 +2590,8 @@ impl MultiTokenManager {
                             DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
                             DisabledReason::InvalidConfig => "InvalidConfig",
                             DisabledReason::AccountThrottled => "AccountThrottled",
+                            DisabledReason::AccountSuspended => "AccountSuspended",
+                            DisabledReason::BadGateway => "BadGateway",
                         }
                         .to_string()
                     }),
@@ -2636,6 +2642,108 @@ impl MultiTokenManager {
         // 持久化更改
         self.persist_credentials()?;
         Ok(())
+    }
+
+    /// 报告指定凭据 502/Bad Gateway 失败。
+    ///
+    /// 普通 502 在 Kiro 生产池里多数是死号/坏号表现，但仍保留少量容错：
+    /// 每次 502 立即切换凭据；连续达到阈值后以 BadGateway 原因持久化禁用。
+    /// 返回当前请求模型/分组范围内剩余可用凭据数。
+    pub fn report_bad_gateway_for_request(
+        &self,
+        id: u64,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> usize {
+        let mut disabled_now = false;
+        let remaining = {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                if !entry.disabled {
+                    entry.failure_count += 1;
+                    entry.total_failure_count += 1;
+                    entry.last_used_at = Some(Utc::now().to_rfc3339());
+                    let failure_count = entry.failure_count;
+                    tracing::warn!(
+                        "凭据 #{} 触发 502/Bad Gateway（{}/{}），立即切换凭据",
+                        id,
+                        failure_count,
+                        MAX_FAILURES_PER_CREDENTIAL
+                    );
+
+                    if failure_count >= MAX_FAILURES_PER_CREDENTIAL {
+                        entry.disabled = true;
+                        entry.disabled_reason = Some(DisabledReason::BadGateway);
+                        entry.throttled_until = None;
+                        disabled_now = true;
+                        tracing::error!(
+                            "凭据 #{} 连续 502/Bad Gateway 达到 {} 次，已永久禁用",
+                            id,
+                            failure_count
+                        );
+                    }
+                }
+            }
+
+            let now = Instant::now();
+            entries
+                .iter()
+                .filter(|e| {
+                    !e.disabled
+                        && e.id != id
+                        && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                        && credential_matches_request(&e.credentials, model, group)
+                })
+                .count()
+        };
+        if disabled_now {
+            if let Err(e) = self.persist_credentials() {
+                tracing::error!("502 自动禁用凭据 #{} 后持久化失败: {}", id, e);
+            }
+        }
+        self.save_stats_debounced();
+        remaining
+    }
+
+    /// 报告指定凭据账号已被安全封禁/暂停。
+    ///
+    /// 这类 403（TEMPORARILY_SUSPENDED / security suspended）生产上等同账号永久不可用：
+    /// 立即禁用并持久化，不走普通连续失败阈值，也不做临时冷却自动恢复。
+    /// 返回当前请求模型/分组范围内剩余可用凭据数。
+    pub fn report_account_suspended_for_request(
+        &self,
+        id: u64,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> usize {
+        let remaining = {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                if !entry.disabled {
+                    entry.disabled = true;
+                    entry.disabled_reason = Some(DisabledReason::AccountSuspended);
+                    entry.throttled_until = None;
+                    entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
+                    entry.total_failure_count += 1;
+                    entry.last_used_at = Some(Utc::now().to_rfc3339());
+                    tracing::error!("凭据 #{} 账号已被安全封禁/暂停，已立即禁用", id);
+                }
+            }
+
+            let now = Instant::now();
+            entries
+                .iter()
+                .filter(|e| {
+                    !e.disabled
+                        && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                        && credential_matches_request(&e.credentials, model, group)
+                })
+                .count()
+        };
+        if let Err(e) = self.persist_credentials() {
+            tracing::error!("账号安全封禁自动禁用凭据 #{} 后持久化失败: {}", id, e);
+        }
+        remaining
     }
 
     /// 标记凭据触发账号级 429 风控。

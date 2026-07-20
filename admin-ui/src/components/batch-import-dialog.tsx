@@ -58,7 +58,28 @@ interface VerificationResult {
   rollbackError?: string
 }
 
+const KIRO_API_KEY_PATTERN = /\bksk_[A-Za-z0-9_-]+\b/g
 
+function parseBatchImportInput(input: string): CredentialInput[] {
+  const trimmed = input.trim()
+  if (!trimmed) return []
+
+  // 原有 JSON 导入格式保持不变：支持单个对象或数组。
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    const parsed = JSON.parse(trimmed)
+    return Array.isArray(parsed) ? parsed : [parsed]
+  }
+
+  // 便捷格式：直接粘贴一行一个 Kiro Server Key（ksk_...），自动转为 API Key 凭据。
+  // 用全局匹配而不是按行严格切分，允许用户从表格/聊天记录里复制带空格、逗号或项目符号的文本。
+  const keys = Array.from(trimmed.matchAll(KIRO_API_KEY_PATTERN), m => m[0])
+  if (keys.length > 0) {
+    return keys.map(kiroApiKey => ({ authMethod: 'api_key', kiroApiKey }))
+  }
+
+  // 既不是 JSON，也没有可识别的 ksk_ Key，让调用方按格式错误提示处理。
+  throw new Error('不是有效 JSON，也没有识别到 ksk_ 开头的 Kiro API Key')
+}
 
 export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps) {
   const [jsonInput, setJsonInput] = useState('')
@@ -95,13 +116,12 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
   }
 
   const handleBatchImport = async (verify: boolean) => {
-    // 先单独解析 JSON，给出精准的错误提示
+    // 先单独解析输入，给出精准的错误提示。兼容 JSON 与纯 ksk_ Key 列表。
     let credentials: CredentialInput[]
     try {
-      const parsed = JSON.parse(jsonInput)
-      credentials = Array.isArray(parsed) ? parsed : [parsed]
+      credentials = parseBatchImportInput(jsonInput)
     } catch (error) {
-      toast.error('JSON 格式错误: ' + extractErrorMessage(error))
+      toast.error('导入格式错误: ' + extractErrorMessage(error))
       return
     }
 
@@ -404,17 +424,17 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
         <div className="flex-1 overflow-y-auto space-y-4 py-4">
           <div className="space-y-2">
             <label className="text-sm font-medium">
-              JSON 格式凭据
+              凭据内容
             </label>
             <textarea
-              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n企业 SSO: [{"authMethod":"external_idp","refreshToken":"...","clientId":"...","tokenEndpoint":"https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token","scopes":"...","region":"eu-central-1"}]\n\n支持 region 字段自动映射为 authRegion'}
+              placeholder={'粘贴凭据，支持 JSON 或直接一行一个 ksk_ Key\n\n直接粘贴 Key:\nksk_xxx\nksk_yyy\n\nOAuth JSON: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key JSON: [{"kiroApiKey":"ksk_xxx"}]\n企业 SSO: [{"authMethod":"external_idp","refreshToken":"...","clientId":"...","tokenEndpoint":"https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token","scopes":"...","region":"eu-central-1"}]\n\n支持 region 字段自动映射为 authRegion'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}
               className="flex min-h-[200px] w-full rounded-xl border border-input bg-background/60 px-3.5 py-2.5 text-sm transition-[border-color,background-color,box-shadow] duration-150 ease-apple placeholder:text-muted-foreground/70 hover:border-border focus-visible:outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/30 focus-visible:bg-background disabled:cursor-not-allowed disabled:opacity-50 font-mono"
             />
             <p className="text-xs text-muted-foreground">
-              💡 "开始导入并验活"会校验余额、失败自动排除；"直接导入"只落库不验活（更快）。两种模式均支持中途"停止"。
+              💡 可直接粘贴多行 ksk_ Key；"开始导入并验活"会校验余额、失败自动排除；"直接导入"只落库不验活（更快）。两种模式均支持中途"停止"。
             </p>
           </div>
 

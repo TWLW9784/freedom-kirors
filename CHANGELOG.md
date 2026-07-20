@@ -5,6 +5,26 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
 
+## [0.7.2] - 2026-07-21
+
+主题：**增强生产凭据池稳定性，并让批量导入支持直接粘贴 Kiro Server Key**。
+
+### ✨ 新功能
+
+- **批量导入支持纯 `ksk_` Key 列表**：管理后台「批量导入」现在可直接粘贴一行一个 `ksk_...` Kiro Server Key，前端会自动识别并转换为 `authMethod=api_key` / `kiroApiKey` 凭据；原有 OAuth、API Key JSON 与 Enterprise SSO JSON 导入格式保持兼容。
+- **账号安全封禁识别**：新增 `TEMPORARILY_SUSPENDED` / security suspended 响应识别；命中后立即持久化禁用对应凭据并切换到其它可用凭据，避免继续重试污染凭据池。
+
+### 🔧 修复
+
+- **502 / Bad Gateway 坏号处理**：普通 502 不再无限当作瞬态错误重试；会记录凭据失败并故障转移，连续达到阈值后以 `BadGateway` 原因自动禁用。
+- **封禁响应兼容 502 包装**：部分网关会把上游账号封禁包装成 502，本版会先检测响应体中的封禁特征，再决定是否永久禁用凭据。
+
+### 🧪 验证
+
+- `admin-ui npm run build` 通过。
+- `cargo build --release` 通过。
+
+
 ## [0.7.1] - 2026-07-15
 
 主题：**打通 Codex CLI 完整工具链——桥接 function / custom / namespace 工具到 Anthropic 模型，并修复工具结果后空响应导致任务误标记完成的问题**。0.7.0 引入了 Responses 端点使 Codex CLI 能连接 kiro-rs，但此前仅支持纯聊天与 Web 搜索——Codex 的真实工具（shell / apply_patch / view_image / MCP 等）被全部剥离，导致 Codex 无法读写文件、执行命令或编辑代码。本版补全工具桥接的全链路：从 Codex 的工具声明收集、到 Anthropic 模型侧的 schema 翻译、再到响应侧按声明类型正确生成 `function_call` 或 `custom_tool_call`——实现 Codex CLI 与 kiro-rs 的完整能力对齐。

@@ -70,6 +70,15 @@ pub trait KiroEndpoint: Send + Sync {
         default_is_account_throttled(body)
     }
 
+    /// 判断响应体是否表示"账号已被安全封禁/暂停"。
+    ///
+    /// Kiro/AWS 文案里可能叫 `TEMPORARILY_SUSPENDED`，但生产凭据池语义上这类
+    /// 403 已经需要人工验证身份，继续重试只会污染池子并增加风控风险，应该立即
+    /// 持久化禁用当前凭据，而不是进入普通失败计数或临时冷却。
+    fn is_account_suspended(&self, body: &str) -> bool {
+        default_is_account_suspended(body)
+    }
+
     /// 判断响应体是否表示"客户端请求格式错误"（messages 数组本身违反协议）
     ///
     /// 这类错误（tool_use↔tool_result 不配对、消息序列非法等）的根因是调用方的
@@ -151,6 +160,36 @@ pub fn default_is_bearer_token_invalid(body: &str) -> bool {
 /// 提到 "suspicious activity" 与具体账号 ID。
 pub fn default_is_account_throttled(body: &str) -> bool {
     body.contains("suspicious activity") && body.contains("temporary limits")
+}
+
+/// 默认的账号安全封禁判断逻辑。
+///
+/// 典型响应：
+/// `{"message":"Your User ID is temporarily suspended. We detected unusual user activity and locked it as a security precaution...","reason":"TEMPORARILY_SUSPENDED"}`
+///
+/// 先优先识别结构化 reason，兼容无结构化 JSON/纯文本时再看足够特异的消息短语。
+pub fn default_is_account_suspended(body: &str) -> bool {
+    if body.contains("TEMPORARILY_SUSPENDED") {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+            let top = value.get("reason").and_then(|v| v.as_str());
+            let nested = value.pointer("/error/reason").and_then(|v| v.as_str());
+            if [top, nested]
+                .into_iter()
+                .flatten()
+                .any(|r| r == "TEMPORARILY_SUSPENDED")
+            {
+                return true;
+            }
+        } else {
+            return true;
+        }
+    }
+
+    let lower = body.to_ascii_lowercase();
+    (lower.contains("temporarily suspended")
+        && lower.contains("unusual user activity")
+        && lower.contains("security precaution"))
+        || lower.contains("security suspended")
 }
 
 /// 默认的上游网关超时判断逻辑。
@@ -267,6 +306,28 @@ mod tests {
         // 仅有一半关键词时也不命中
         assert!(!default_is_account_throttled(
             "suspicious activity detected"
+        ));
+    }
+
+    #[test]
+    fn test_default_is_account_suspended_detects_reason() {
+        let body = r#"{"message":"Your User ID is temporarily suspended. We detected unusual user activity and locked it as a security precaution. To restore access, please contact our support team to verify your identity: https://support.aws.amazon.com/#/contacts/kiro","reason":"TEMPORARILY_SUSPENDED"}"#;
+        assert!(default_is_account_suspended(body));
+    }
+
+    #[test]
+    fn test_default_is_account_suspended_nested_reason() {
+        let body = r#"{"error":{"reason":"TEMPORARILY_SUSPENDED"}}"#;
+        assert!(default_is_account_suspended(body));
+    }
+
+    #[test]
+    fn test_default_is_account_suspended_does_not_false_match() {
+        assert!(!default_is_account_suspended(
+            r#"{"message":"ordinary 403","reason":"ACCESS_DENIED"}"#
+        ));
+        assert!(!default_is_account_suspended(
+            r#"{"message":"TEMPORARILY_SUSPENDED appears in message only","reason":"OTHER"}"#
         ));
     }
 
