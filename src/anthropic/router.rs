@@ -15,7 +15,7 @@ use crate::model::config::ToolCompatibilityMode;
 
 use super::{
     cache_metering::SharedCacheMeter,
-    handlers::{count_tokens, get_models, post_messages, post_messages_cc},
+    handlers::{count_tokens, get_model, get_models, post_messages, post_messages_cc},
     middleware::{AppState, auth_middleware, cors_layer},
     openai::post_chat_completions,
     responses::post_responses,
@@ -68,6 +68,7 @@ pub fn create_router(
     // 需要认证的 /v1 路由
     let v1_routes = Router::new()
         .route("/models", get(get_models))
+        .route("/models/{model}", get(get_model))
         .route("/messages", post(post_messages))
         .route("/messages/count_tokens", post(count_tokens))
         .route("/chat/completions", post(post_chat_completions))

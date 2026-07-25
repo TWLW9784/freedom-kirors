@@ -652,6 +652,28 @@ pub async fn get_models() -> impl IntoResponse {
     })
 }
 
+/// GET /v1/models/{model}
+///
+/// 返回单个模型的信息。上下文窗口字段由 `Model` 的序列化实现统一补充。
+pub async fn get_model(axum::extract::Path(model_id): axum::extract::Path<String>) -> Response {
+    tracing::info!(model = %model_id, "Received GET /v1/models/:model request");
+
+    match available_models()
+        .into_iter()
+        .find(|model| model.id == model_id)
+    {
+        Some(model) => Json(model).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                "not_found_error",
+                format!("Model '{}' was not found.", model_id),
+            )),
+        )
+            .into_response(),
+    }
+}
+
 /// POST /v1/messages
 ///
 /// 创建消息（对话）
@@ -2135,5 +2157,30 @@ mod tests {
         // fable-5 同样不再暴露。
         assert!(!ids.contains(&"claude-fable-5"));
         assert!(!ids.contains(&"claude-fable-5-thinking"));
+    }
+
+    #[test]
+    fn model_discovery_exposes_context_window_separately_from_output_limit() {
+        let models = available_models();
+        let opus5 = models
+            .iter()
+            .find(|model| model.id == "claude-opus-5")
+            .expect("Opus 5 应存在于模型列表");
+        let opus45 = models
+            .iter()
+            .find(|model| model.id == "claude-opus-4-5-20251101")
+            .expect("Opus 4.5 应存在于模型列表");
+
+        let opus5_json = serde_json::to_value(opus5).unwrap();
+        assert_eq!(opus5_json["max_tokens"], 64_000);
+        assert_eq!(opus5_json["context_window"], 1_000_000);
+        assert_eq!(opus5_json["max_input_tokens"], 1_000_000);
+        assert_eq!(opus5_json["context_length"], 1_000_000);
+
+        let opus45_json = serde_json::to_value(opus45).unwrap();
+        assert_eq!(opus45_json["max_tokens"], 64_000);
+        assert_eq!(opus45_json["context_window"], 200_000);
+        assert_eq!(opus45_json["max_input_tokens"], 200_000);
+        assert_eq!(opus45_json["context_length"], 200_000);
     }
 }
