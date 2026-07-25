@@ -1,6 +1,6 @@
 //! Anthropic API 类型定义
 
-use serde::{Deserialize, Serialize, ser::SerializeStruct};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 // === 错误响应 ===
@@ -44,38 +44,16 @@ impl ErrorResponse {
 // === Models 端点类型 ===
 
 /// 模型信息
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct Model {
     pub id: String,
     pub object: String,
     pub created: i64,
     pub owned_by: String,
     pub display_name: String,
+    #[serde(rename = "type")]
     pub model_type: String,
-    /// 最大输出 token 数；不是上下文窗口。
     pub max_tokens: i32,
-}
-
-impl Serialize for Model {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        // 同时返回常见客户端使用的上下文字段，避免字段缺失时回退到 200K。
-        let context_window = super::converter::get_context_window_size(&self.id);
-        let mut state = serializer.serialize_struct("Model", 10)?;
-        state.serialize_field("id", &self.id)?;
-        state.serialize_field("object", &self.object)?;
-        state.serialize_field("created", &self.created)?;
-        state.serialize_field("owned_by", &self.owned_by)?;
-        state.serialize_field("display_name", &self.display_name)?;
-        state.serialize_field("type", &self.model_type)?;
-        state.serialize_field("max_tokens", &self.max_tokens)?;
-        state.serialize_field("context_window", &context_window)?;
-        state.serialize_field("max_input_tokens", &context_window)?;
-        state.serialize_field("context_length", &context_window)?;
-        state.end()
-    }
 }
 
 /// 模型列表响应
