@@ -4,7 +4,6 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-
 ## [0.7.3] - 2026-07-25
 
 ### Added
@@ -13,6 +12,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - Added `claude-opus-5-thinking` as a client-facing compatibility alias. The `-thinking` suffix enables the existing thinking configuration and is not forwarded as a separate upstream model identifier.
 - Added normalization for common Opus 5 name variants, including `opus-5`, `opus5`, and `opus.5`.
 - Added Opus 5 and its compatibility alias to the `/v1/models` response.
+- 融合官方 0.7.2：`config.json` 新增 `customModels` 配置驱动的自定义模型映射（来源 [PR #46](https://github.com/ZyphrZero/kiro.rs/pull/46)，@bestK）。别名→Kiro 后端 ID，可声明 `displayName`/`contextWindow`/`maxTokens`/`supportsReasoning`/`ownedBy`；按 id 大小写不敏感精确匹配、优先于内置模糊映射，缺同名精确条目时自动剥离 `-thinking` 后缀回退，追加到 `/v1/models` 尾部，默认空数组向后兼容。
+- 融合官方 0.7.2：把上游 meteringEvent 的 `usage`/`unit`/`unitPlural` 透传到 Anthropic 与 OpenAI 响应 usage 对象（`credit_usage`/`credit_unit`/`credit_unit_plural`），来源 [PR #47](https://github.com/ZyphrZero/kiro.rs/pull/47)（@childe）。非流式 handler、流式 stream、OpenAI、websearch_loop 四条出口一并接线，仅在收到 meteringEvent 时追加。
 
 ### Compatibility
 
@@ -59,7 +60,6 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 - `admin-ui npm run build` 通过。
 - `cargo build --release` 通过。
-
 
 ## [0.7.1] - 2026-07-15
 

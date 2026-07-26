@@ -180,6 +180,9 @@ async fn main() {
     // 取 account 限流器共享句柄，供 admin 可观测读取实时限流状态（provider 随后被 move 进路由）。
     let account_limiters_handle = kiro_provider.account_limiters();
 
+    // 初始化自定义模型注册表（启动时装载一次，运行期只读）
+    model::custom_models::init(config.custom_models.clone());
+
     // 初始化 count_tokens 配置
     token::init_config(token::CountTokensConfig {
         api_url: config.count_tokens_api_url.clone(),
