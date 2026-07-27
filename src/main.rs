@@ -171,13 +171,14 @@ async fn main() {
         std::process::exit(1);
     });
     let token_manager = Arc::new(token_manager);
-    let kiro_provider = KiroProvider::with_proxy(
+    token_manager.start_model_cache_warmer();
+    let kiro_provider = Arc::new(KiroProvider::with_proxy(
         token_manager.clone(),
         proxy_config.clone(),
         endpoints,
         config.default_endpoint.clone(),
-    );
-    // 取 account 限流器共享句柄，供 admin 可观测读取实时限流状态（provider 随后被 move 进路由）。
+    ));
+    // 取 account 限流器共享句柄，供 admin 可观测读取实时限流状态。
     let account_limiters_handle = kiro_provider.account_limiters();
 
     // 初始化自定义模型注册表（启动时装载一次，运行期只读）
@@ -226,12 +227,11 @@ async fn main() {
     // 启动时若文件不存在则首次创建，并把现有凭据 / 客户端 Key 的 groups 字段反向迁移进去，
     // 保证老用户升级后所有已用分组都自动注册，不会因为本次改造而消失。
     let groups_path = admin::groups::default_path_in(&cache_dir);
-    let group_manager = std::sync::Arc::new(
-        admin::GroupManager::load(&groups_path).unwrap_or_else(|e| {
+    let group_manager =
+        std::sync::Arc::new(admin::GroupManager::load(&groups_path).unwrap_or_else(|e| {
             tracing::warn!("加载分组注册表失败 ({}): {}", groups_path.display(), e);
             admin::GroupManager::new()
-        }),
-    );
+        }));
     {
         let mut all_used: Vec<String> = token_manager.list_credential_groups();
         all_used.extend(client_key_manager.used_group_names());
@@ -293,8 +293,8 @@ async fn main() {
         creation_ratio: config.cache_creation_ratio,
     });
 
-    let anthropic_app = anthropic::create_router(
-        Some(kiro_provider),
+    let anthropic_app = anthropic::create_router_with_shared_provider(
+        Some(kiro_provider.clone()),
         config.extract_thinking,
         config.tool_compatibility_mode,
         Some(client_key_manager.clone()),
@@ -319,6 +319,7 @@ async fn main() {
             });
             let admin_service =
                 admin::AdminService::new(token_manager.clone(), endpoint_names.clone())
+                    .with_kiro_provider(kiro_provider.clone())
                     .with_log_governance(
                         Some(admin_trace_store.clone()),
                         Some(usage_recorder.clone()),

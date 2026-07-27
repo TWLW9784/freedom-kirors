@@ -1,8 +1,9 @@
 //! Admin API 路由配置
 
 use axum::{
-    Router, middleware,
+    Router,
     extract::DefaultBodyLimit,
+    middleware,
     routing::{delete, get, post, put},
 };
 
@@ -16,7 +17,8 @@ use super::{
         expand_credential_profiles, export_credentials, force_refresh_token,
         get_account_throttle_config, get_all_credentials, get_cache_ratio_config,
         get_concurrency_config,
-        get_credential_balance, get_credential_models, get_global_proxy, get_load_balancing_mode,
+        get_credential_balance, get_credential_models, get_current_models, get_global_proxy,
+        get_load_balancing_mode,
         get_log_governance_config, get_proxy_pool, get_update_config, limiter_snapshots,
         list_client_keys, list_groups, list_traces, poll_idc_login, poll_idc_relogin,
         poll_social_login, poll_social_relogin, pull_update_image, reset_all_success_count,
@@ -29,7 +31,8 @@ use super::{
         start_idc_login, start_idc_relogin, start_social_login,
         start_social_relogin, start_stress_test, stats_by_credential, stats_by_model,
         stats_overview, stats_timeseries, stop_stress_test, stress_test_status,
-        test_credential_model, trace_failure_stats, trace_recent_stats, update_admin_key,
+        test_credential_model, test_model, trace_failure_stats, trace_recent_stats,
+        update_admin_key,
         update_client_key, update_credential, update_group, update_refresh_token,
     },
     middleware::{AdminState, admin_auth_middleware},
@@ -100,6 +103,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/refresh-token", put(update_refresh_token))
         .route("/credentials/{id}/balance", get(get_credential_balance))
         .route("/credentials/{id}/models", get(get_credential_models))
+        .route("/models", get(get_current_models))
+        .route("/models/test", post(test_model))
         .route("/credentials/{id}/proxy", post(assign_proxy_to_credential))
         .route("/proxy-pool", get(get_proxy_pool).post(add_proxy))
         .route("/proxy-pool/batch", post(batch_add_proxies))

@@ -273,6 +273,10 @@ pub struct Config {
     #[serde(default)]
     pub cache_creation_ratio: f64,
 
+    /// 按凭据缓存上游可用模型列表的 TTL（秒，默认 3600）。
+    #[serde(default = "default_model_cache_ttl_secs")]
+    pub model_cache_ttl_secs: u64,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -429,6 +433,10 @@ fn default_cache_ratio_mode() -> String {
     "off".to_string()
 }
 
+fn default_model_cache_ttl_secs() -> u64 {
+    60 * 60
+}
+
 fn default_update_auto_apply_time() -> String {
     "03:00".to_string()
 }
@@ -499,6 +507,7 @@ impl Default for Config {
             cache_ratio_mode: default_cache_ratio_mode(),
             cache_read_ratio: 0.0,
             cache_creation_ratio: 0.0,
+            model_cache_ttl_secs: default_model_cache_ttl_secs(),
             extract_thinking: default_extract_thinking(),
             tool_compatibility_mode: default_tool_compatibility_mode(),
             default_endpoint: default_endpoint(),
@@ -601,5 +610,23 @@ impl Config {
             .save()
             .with_context(|| format!("持久化配置失败: {}", config_path.display()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn model_cache_ttl_defaults_for_existing_configs() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.model_cache_ttl_secs, 3600);
+        assert_eq!(Config::default().model_cache_ttl_secs, 3600);
+    }
+
+    #[test]
+    fn model_cache_ttl_accepts_explicit_value() {
+        let config: Config = serde_json::from_str(r#"{"modelCacheTtlSecs":120}"#).unwrap();
+        assert_eq!(config.model_cache_ttl_secs, 120);
     }
 }

@@ -10,6 +10,8 @@ import {
   clearThrottle,
   getCredentialBalance,
   getCredentialModels,
+  getCurrentCredentialModels,
+  testModel,
   addCredential,
   deleteCredential,
   updateCredential,
@@ -60,6 +62,23 @@ export function useCredentialModels(id: number | null) {
     gcTime: 30 * 60 * 1000,
     refetchOnWindowFocus: false,
     refetchOnMount: false,
+  })
+}
+
+// 使用账号池当前选中的可用凭据查询模型列表
+export function useCurrentCredentialModels(enabled: boolean) {
+  return useQuery({
+    queryKey: ['current-credential-models'],
+    queryFn: getCurrentCredentialModels,
+    enabled,
+    retry: false,
+  })
+}
+
+// 对模型发送真实请求
+export function useTestModel() {
+  return useMutation({
+    mutationFn: testModel,
   })
 }
 
@@ -227,6 +246,8 @@ export function useSetLoadBalancingMode() {
     mutationFn: setLoadBalancingMode,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      queryClient.invalidateQueries({ queryKey: ['current-credential-models'] })
     },
   })
 }

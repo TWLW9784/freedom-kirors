@@ -217,9 +217,95 @@ Never suggest bypassing these limits via alternative tools. \
 Never ask the user whether to switch approaches. \
 Complete all chunked operations without commentary.";
 
-/// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
-/// 严格对照版本号
+const MAX_MODEL_ID_LEN: usize = 256;
+
+fn invalid_model_reason(model: &str) -> Option<&'static str> {
+    if model.trim().is_empty() {
+        Some("模型 ID 不能为空")
+    } else if model.len() > MAX_MODEL_ID_LEN {
+        Some("模型 ID 过长")
+    } else if model.chars().any(char::is_control) {
+        Some("模型 ID 不能包含控制字符")
+    } else {
+        None
+    }
+}
+
+fn canonical_version(parts: &[&str]) -> Option<String> {
+    let first = *parts.first()?;
+    if parts.len() == 1
+        && first.contains('.')
+        && first
+            .split('.')
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+    {
+        return Some(first.to_string());
+    }
+    if !first.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    match parts {
+        [_, second] if second.chars().all(|c| c.is_ascii_digit()) => {
+            Some(format!("{}.{}", first, second))
+        }
+        [_] => Some(first.to_string()),
+        _ => None,
+    }
+}
+
+/// 规范化 Anthropic 客户端常见的 Claude ID，同时不猜测非 Claude 模型。
+fn normalize_claude_model(model: &str) -> Option<String> {
+    let mut normalized = model.to_ascii_lowercase();
+    loop {
+        let mut stripped_suffix = false;
+        for suffix in ["-thinking", "-latest"] {
+            if let Some(stripped) = normalized.strip_suffix(suffix) {
+                normalized = stripped.to_string();
+                stripped_suffix = true;
+            }
+        }
+        if !stripped_suffix {
+            break;
+        }
+    }
+    if let Some((base, suffix)) = normalized.rsplit_once('-')
+        && suffix.len() == 8
+        && suffix.chars().all(|c| c.is_ascii_digit())
+    {
+        normalized = base.to_string();
+    }
+
+    let body = normalized.strip_prefix("claude-")?;
+    const FAMILIES: [&str; 5] = ["sonnet", "opus", "haiku", "fable", "mythos"];
+
+    for family in FAMILIES {
+        if let Some(rest) = body.strip_prefix(family) {
+            let rest = rest
+                .strip_prefix('-')
+                .or_else(|| rest.strip_prefix('.'))
+                .unwrap_or(rest);
+            let version_parts: Vec<&str> = rest.split('-').collect();
+            let version = canonical_version(&version_parts)?;
+            return Some(format!("claude-{}-{}", family, version));
+        }
+    }
+
+    // 旧式日期 ID 把系列名放在版本之后，例如 claude-3-5-sonnet-20241022。
+    let parts: Vec<&str> = body.split('-').collect();
+    let family_index = parts.iter().position(|part| FAMILIES.contains(part))?;
+    if family_index == 0 || family_index + 1 != parts.len() {
+        return None;
+    }
+    let version = canonical_version(&parts[..family_index])?;
+    Some(format!("claude-{}-{}", parts[family_index], version))
+}
+
+/// 模型映射：自定义别名优先，已知 Claude 格式规范化，其余合法 ID 原样透传。
 pub fn map_model(model: &str) -> Option<String> {
+    if invalid_model_reason(model).is_some() {
+        return None;
+    }
+
     // 自定义模型表优先（大小写不敏感精确匹配），可新增或覆盖内置映射。
     if let Some(custom) = crate::model::custom_models::lookup(model) {
         return Some(custom.backend_id.clone());
@@ -227,84 +313,87 @@ pub fn map_model(model: &str) -> Option<String> {
 
     let model_lower = model.to_lowercase();
 
-    // --- 非 Claude 上游模型（Kiro ListAvailableModels 2026-07 实测支持）---
-    // 这些模型 ID 直接透传给上游；reasoning/output_config 由
-    // `model_supports_native_reasoning` 白名单单独 opt-in，此处不涉及。
-    if model_lower.contains("gpt") {
-        // OpenAI GPT 5.6 系（272k 上下文）：sol / terra / luna 三个变体。
-        return if model_lower.contains("terra") {
-            Some("gpt-5.6-terra".to_string())
-        } else if model_lower.contains("luna") {
-            Some("gpt-5.6-luna".to_string())
+    // 本地关键词映射：先把常见模糊名称映射为具体上游后端 ID；
+    // 未命中具体映射的模型会在函数尾部回退到官方的开放透传。
+    let local_mapped = {
+        // --- 非 Claude 上游模型（Kiro ListAvailableModels 2026-07 实测支持）---
+        // 这些模型 ID 直接透传给上游；reasoning/output_config 由
+        // `model_supports_native_reasoning` 白名单单独 opt-in，此处不涉及。
+        if model_lower.contains("gpt") {
+            // OpenAI GPT 5.6 系（272k 上下文）：sol / terra / luna 三个变体。
+            if model_lower.contains("terra") {
+                Some("gpt-5.6-terra".to_string())
+            } else if model_lower.contains("luna") {
+                Some("gpt-5.6-luna".to_string())
+            } else {
+                // sol 为默认（含裸 "gpt" / "gpt-5.6" / "gpt-5.6-sol"）
+                Some("gpt-5.6-sol".to_string())
+            }
+        } else if model_lower.contains("deepseek") {
+            Some("deepseek-3.2".to_string())
+        } else if model_lower.contains("minimax") {
+            if model_lower.contains("2.1") || model_lower.contains("2-1") {
+                Some("minimax-m2.1".to_string())
+            } else {
+                // m2.5 为默认（含裸 "minimax" / "minimax-m2.5"）
+                Some("minimax-m2.5".to_string())
+            }
+        } else if model_lower.contains("glm") {
+            Some("glm-5".to_string())
+        } else if model_lower.contains("qwen") {
+            Some("qwen3-coder-next".to_string())
+        } else if model_lower.contains("fable") {
+            // Fable 5：与 Mythos 5 同底座；目前仅 5 代
+            Some("claude-fable-5".to_string())
+        } else if model_lower.contains("sonnet") {
+            if model_lower.contains("4-8") || model_lower.contains("4.8") {
+                Some("claude-sonnet-4.8".to_string())
+            } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
+                Some("claude-sonnet-4.6".to_string())
+            } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
+                Some("claude-sonnet-4.5".to_string())
+            } else if model_lower.contains("sonnet-5")
+                || model_lower.contains("sonnet5")
+                || model_lower.contains("sonnet.5")
+            {
+                // 精确匹配 5 代，避免命中 legacy claude-3-5-sonnet
+                Some("claude-sonnet-5".to_string())
+            } else if model_lower.contains("sonnet-4") || model_lower.contains("sonnet4") {
+                // 裸 4 代（无 4-5/4-6/4-8 小版本号）→ claude-sonnet-4
+                Some("claude-sonnet-4".to_string())
+            } else {
+                None
+            }
+        } else if model_lower.contains("opus") {
+            if model_lower.contains("opus-5")
+                || model_lower.contains("opus5")
+                || model_lower.contains("opus.5")
+            {
+                // 精确匹配 5 代，避免与旧版 Opus 小版本混淆
+                Some("claude-opus-5".to_string())
+            } else if model_lower.contains("4-8") || model_lower.contains("4.8") {
+                Some("claude-opus-4.8".to_string())
+            } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
+                Some("claude-opus-4.7".to_string())
+            } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
+                Some("claude-opus-4.5".to_string())
+            } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
+                Some("claude-opus-4.6".to_string())
+            } else {
+                None
+            }
+        } else if model_lower.contains("haiku") {
+            Some("claude-haiku-4.5".to_string())
         } else {
-            // sol 为默认（含裸 "gpt" / "gpt-5.6" / "gpt-5.6-sol"）
-            Some("gpt-5.6-sol".to_string())
-        };
-    } else if model_lower.contains("deepseek") {
-        return Some("deepseek-3.2".to_string());
-    } else if model_lower.contains("minimax") {
-        return if model_lower.contains("2.1") || model_lower.contains("2-1") {
-            Some("minimax-m2.1".to_string())
-        } else {
-            // m2.5 为默认（含裸 "minimax" / "minimax-m2.5"）
-            Some("minimax-m2.5".to_string())
-        };
-    } else if model_lower.contains("glm") {
-        return Some("glm-5".to_string());
-    } else if model_lower.contains("qwen") {
-        return Some("qwen3-coder-next".to_string());
-    }
+            None
+        }
+    };
 
-    if model_lower.contains("fable") {
-        // Fable 5：与 Mythos 5 同底座；目前仅 5 代
-        Some("claude-fable-5".to_string())
-    } else if model_lower.contains("sonnet") {
-        if model_lower.contains("4-8") || model_lower.contains("4.8") {
-            Some("claude-sonnet-4.8".to_string())
-        } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
-            Some("claude-sonnet-4.6".to_string())
-        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
-            Some("claude-sonnet-4.5".to_string())
-        } else if model_lower.contains("sonnet-5")
-            || model_lower.contains("sonnet5")
-            || model_lower.contains("sonnet.5")
-        {
-            // 精确匹配 5 代，避免命中 legacy claude-3-5-sonnet
-            Some("claude-sonnet-5".to_string())
-        } else if model_lower.contains("sonnet-4") || model_lower.contains("sonnet4") {
-            // 裸 4 代（无 4-5/4-6/4-8 小版本号）→ claude-sonnet-4
-            Some("claude-sonnet-4".to_string())
-        } else {
-            None
-        }
-    } else if model_lower.contains("opus") {
-        if model_lower.contains("opus-5")
-            || model_lower.contains("opus5")
-            || model_lower.contains("opus.5")
-        {
-            // 精确匹配 5 代，避免与旧版 Opus 小版本混淆
-            Some("claude-opus-5".to_string())
-        } else if model_lower.contains("4-8") || model_lower.contains("4.8") {
-            Some("claude-opus-4.8".to_string())
-        } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
-            Some("claude-opus-4.7".to_string())
-        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
-            Some("claude-opus-4.5".to_string())
-        } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
-            Some("claude-opus-4.6".to_string())
-        } else {
-            None
-        }
-    } else if model_lower.contains("haiku") {
-        Some("claude-haiku-4.5".to_string())
-    } else if model_lower.starts_with("gpt-5") {
-        // GPT-5.x models served by the Kiro backend (e.g. gpt-5.6-sol / terra / luna).
-        // Kiro advertises and accepts these ids verbatim, so pass them through unchanged.
-        // Scoped to gpt-5* so legacy ids like "gpt-4" stay unsupported.
-        Some(model_lower)
-    } else {
-        None
-    }
+    // 先用本地具体映射；未命中时采用官方的开放透传：
+    // 先尝试规范化常见 Claude ID，否则将非空合法 ID 原样下发给 Kiro。
+    local_mapped
+        .or_else(|| normalize_claude_model(model))
+        .or_else(|| Some(model.to_string()))
 }
 
 /// 根据模型名称返回对应的上下文窗口大小
@@ -573,7 +662,7 @@ pub struct ConversionResult {
 /// 转换错误
 #[derive(Debug)]
 pub enum ConversionError {
-    UnsupportedModel(String),
+    InvalidModel(String),
     EmptyMessages,
     /// Claude Code 工具无法映射到 Kiro 内置工具（如 Read.pages 无对应、内置缺 schema）。
     UnsupportedToolMapping(String),
@@ -582,7 +671,7 @@ pub enum ConversionError {
 impl std::fmt::Display for ConversionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ConversionError::UnsupportedModel(model) => write!(f, "模型不支持: {}", model),
+            ConversionError::InvalidModel(reason) => write!(f, "无效模型 ID: {}", reason),
             ConversionError::EmptyMessages => write!(f, "消息列表为空"),
             ConversionError::UnsupportedToolMapping(reason) => {
                 write!(f, "工具映射不支持: {}", reason)
@@ -677,8 +766,13 @@ pub fn convert_request_with_mode(
     tool_compatibility_mode: ToolCompatibilityMode,
 ) -> Result<ConversionResult, ConversionError> {
     // 1. 映射模型
-    let model_id = map_model(&req.model)
-        .ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
+    let model_id = map_model(&req.model).ok_or_else(|| {
+        ConversionError::InvalidModel(
+            invalid_model_reason(&req.model)
+                .unwrap_or("模型 ID 无效")
+                .to_string(),
+        )
+    })?;
 
     // 2. 检查消息列表
     if req.messages.is_empty() {
@@ -2011,9 +2105,15 @@ mod tests {
             map_model("claude-sonnet.5"),
             Some("claude-sonnet-5".to_string())
         );
+        assert_eq!(
+            map_model("claude-sonnet5"),
+            Some("claude-sonnet-5".to_string())
+        );
         assert_eq!(get_context_window_size("claude-sonnet-5"), 1_000_000);
-        // 不应误判 legacy claude-3-5-sonnet
-        assert_eq!(map_model("claude-3-5-sonnet-20241022"), None);
+        assert_eq!(
+            map_model("claude-3-5-sonnet-20241022"),
+            Some("claude-sonnet-3.5".to_string())
+        );
     }
 
     #[test]
@@ -2039,11 +2139,45 @@ mod tests {
     }
 
     #[test]
-    fn test_map_model_unsupported() {
-        // 真正无法识别的模型才返回 None（gpt/deepseek/minimax/glm/qwen 现已支持）
-        assert!(map_model("llama-3").is_none());
-        assert!(map_model("gemini-2.5-pro").is_none());
+    fn test_map_model_open_passthrough() {
+        // 未命中本地关键词映射的合法 ID 原样透传（官方开放透传能力）。
+        // 注：本地保留了 gpt/deepseek/minimax/glm/qwen 的关键词别名映射，
+        // 因此此处用不会命中那些别名的 ID 验证纯透传。
+        for model in ["future-model-2030", "llama-4-405b", "mistral-large-3"] {
+            assert_eq!(map_model(model), Some(model.to_string()));
+        }
+    }
+
+    #[test]
+    fn test_map_model_future_claude_formats() {
+        assert_eq!(
+            map_model("claude-opus-5"),
+            Some("claude-opus-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-5-latest"),
+            Some("claude-opus-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-5-20270101-thinking"),
+            Some("claude-opus-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-sonnet-5-2"),
+            Some("claude-sonnet-5.2".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-5-beta"),
+            Some("claude-opus-5-beta".to_string())
+        );
+    }
+
+    #[test]
+    fn test_map_model_rejects_invalid_ids() {
         assert!(map_model("").is_none());
+        assert!(map_model("   ").is_none());
+        assert!(map_model("bad\nmodel").is_none());
+        assert!(map_model(&"x".repeat(MAX_MODEL_ID_LEN + 1)).is_none());
     }
 
     #[test]
@@ -2151,6 +2285,22 @@ mod tests {
         assert!(
             result.additional_model_request_fields.is_none(),
             "sonnet 4.8 rejects additionalModelRequestFields even when the client sends output_config"
+        );
+    }
+
+    #[test]
+    fn test_output_config_does_not_emit_for_unconfirmed_dynamic_model() {
+        let req = minimal_request_with_output_config("glm-5");
+        let result = convert_request(&req).unwrap();
+
+        assert!(result.additional_model_request_fields.is_none());
+        assert_eq!(
+            result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .model_id,
+            "glm-5"
         );
     }
 
