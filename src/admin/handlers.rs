@@ -26,7 +26,8 @@ use super::{
         SetAccountThrottleConfigRequest,
         SetConcurrencyConfigRequest, SetDisabledRequest, SetGlobalProxyRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetMaxInFlightRequest,
-        SetPriorityRequest, SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest,
+        SetPriorityRequest, SetSelfHealConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
+        StartSocialLoginRequest,
         SuccessResponse, TestCredentialModelRequest, UpdateAdminKeyRequest, UpdateClientKeyRequest,
         UpdateCredentialRequest, UpdateRefreshTokenRequest,
     },
@@ -637,6 +638,24 @@ pub async fn set_concurrency_config(
     Json(payload): Json<SetConcurrencyConfigRequest>,
 ) -> impl IntoResponse {
     match state.service.set_concurrency_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/self-heal
+/// 获取自愈治理配置
+pub async fn get_self_heal_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_self_heal_config())
+}
+
+/// PUT /api/admin/config/self-heal
+/// 更新自愈治理配置（运行时生效 + 持久化 config.json）
+pub async fn set_self_heal_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetSelfHealConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_self_heal_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
