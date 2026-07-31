@@ -51,6 +51,12 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - 封禁识别只匹配 `suspended` + `locked your account` 两个高特异短语同时出现的情形，普通 403 仍走既有累计路径，不误伤瞬态 403。
 - 全部新增字段 `serde(default)`，缺省即默认值；如需完全回退旧行为，可将 `suspendedDetectionEnabled` 设为 `false`、`selfHealMinIntervalSecs` 与 `selfHealMaxConsecutiveRounds` 均设为 `0`。
 
+### 🔧 修复 — Web Search MCP 路由加固
+
+> 来源：[PR #57](https://github.com/ZyphrZero/kiro.rs/pull/57)。
+
+- **规范 Web Search MCP 路由**：加固 `websearch_loop` 与 Kiro provider 侧的 MCP 调用路由，避免请求在异常路径下选错凭据组或吞掉失败，提升纯搜索与混合搜索链路的一致性与可诊断性。
+
 ## [0.7.3] - 2026-07-28
 
 主题：**以 Kiro 上游实际返回的模型目录替代本地静态列表，新增按凭据缓存、分组聚合和模型感知路由，并开放未知合法模型 ID 的直接透传**。本次兼容性补丁同时扩展了 Admin 模型面板：可按账号池策略查询模型、查看输入/输出 Token 上限，并发送真实的最小化请求验证模型。已有 `customModels`、`-thinking` 请求方式和静态上下文估算继续兼容。
